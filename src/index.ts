@@ -1,0 +1,69 @@
+import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
+import { z } from "zod";
+import { askCline, ClineRunError } from "./runner.js";
+import { askClineWorkspace } from "./workspace.js";
+
+const server = new McpServer({ name: "cline-local-bridge", version: "1.0.0" });
+
+server.registerTool(
+  "ask_cline",
+  {
+    description: "Ask the locally installed Cline CLI for an analysis/chat response. File edits are not approved.",
+    inputSchema: {
+      prompt: z.string().min(1).max(20_000),
+      cwd: z.string().min(1).optional(),
+      thinking: z.enum(["none", "low", "medium", "high", "xhigh"]).optional(),
+      timeoutSeconds: z.number().int().min(1).max(300).optional(),
+      systemPrompt: z.string().min(1).max(8_000).optional()
+    }
+  },
+  async (input, extra) => {
+    try {
+      const result = await askCline(input, extra.signal);
+      const response = {
+        text: result.text,
+        ...(result.model ? { model: result.model } : {}),
+        durationMs: result.durationMs,
+        ...(result.usage ? { usage: result.usage } : {}),
+        ...(result.cost !== undefined ? { cost: result.cost } : {})
+      };
+      return { content: [{ type: "text", text: JSON.stringify(response, null, 2) }] };
+    } catch (error) {
+      const message = error instanceof ClineRunError ? error.message : "The local Cline bridge failed unexpectedly.";
+      return { content: [{ type: "text", text: message }], isError: true };
+    }
+  }
+);
+
+server.registerTool(
+  "ask_cline_workspace",
+  {
+    description: "Analyze a Git workspace through Cline in a disposable worktree. The worktree is always removed after the request.",
+    inputSchema: {
+      prompt: z.string().min(1).max(20_000),
+      cwd: z.string().min(1),
+      thinking: z.enum(["none", "low", "medium", "high", "xhigh"]).optional(),
+      timeoutSeconds: z.number().int().min(1).max(300).optional()
+    }
+  },
+  async (input, extra) => {
+    try {
+      const result = await askClineWorkspace(input, extra.signal);
+      return {
+        content: [{ type: "text", text: JSON.stringify({
+          text: result.text,
+          ...(result.model ? { model: result.model } : {}),
+          durationMs: result.durationMs,
+          ...(result.usage ? { usage: result.usage } : {}),
+          ...(result.cost !== undefined ? { cost: result.cost } : {})
+        }, null, 2) }]
+      };
+    } catch (error) {
+      const message = error instanceof ClineRunError ? error.message : "The isolated Cline workspace review failed unexpectedly.";
+      return { content: [{ type: "text", text: message }], isError: true };
+    }
+  }
+);
+
+await server.connect(new StdioServerTransport());
