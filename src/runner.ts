@@ -15,7 +15,7 @@ export interface AskClineInput {
 
 export class ClineRunError extends Error {
   constructor(
-    public readonly kind: "timeout" | "cancelled" | "non_zero_exit" | "malformed_json" | "missing_final_result" | "launch_failed" | "workspace_not_git" | "workspace_setup_failed" | "workspace_cleanup_failed",
+    public readonly kind: "timeout" | "cancelled" | "non_zero_exit" | "malformed_json" | "missing_final_result" | "launch_failed" | "workspace_not_git" | "workspace_setup_failed" | "workspace_cleanup_failed" | "commit_created" | "edits_inspection_failed",
     message: string
   ) {
     super(message);

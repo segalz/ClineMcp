@@ -2,6 +2,7 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
 import { askCline, ClineRunError } from "./runner.js";
+import { applyClineEdits, ClineEditsError } from "./edits.js";
 import { askClineWorkspace } from "./workspace.js";
 
 const server = new McpServer({ name: "cline-local-bridge", version: "1.0.0" });
@@ -32,6 +33,53 @@ server.registerTool(
     } catch (error) {
       const message = error instanceof ClineRunError ? error.message : "The local Cline bridge failed unexpectedly.";
       return { content: [{ type: "text", text: message }], isError: true };
+    }
+  }
+);
+
+server.registerTool(
+  "apply_cline_edits",
+  {
+    description: "Have Cline implement a development task directly in the current Git checkout. Files may change, but commits are forbidden and the resulting diff is returned.",
+    inputSchema: {
+      prompt: z.string().min(1).max(20_000),
+      cwd: z.string().min(1),
+      thinking: z.enum(["none", "low", "medium", "high", "xhigh"]).optional(),
+      timeoutSeconds: z.number().int().min(1).max(300).optional()
+    }
+  },
+  async (input, extra) => {
+    try {
+      const result = await applyClineEdits(input, extra.signal);
+      return {
+        content: [{ type: "text", text: JSON.stringify({
+          text: result.text,
+          ...(result.model ? { model: result.model } : {}),
+          durationMs: result.durationMs,
+          ...(result.usage ? { usage: result.usage } : {}),
+          ...(result.cost !== undefined ? { cost: result.cost } : {}),
+          gitDiff: result.gitDiff,
+          status: result.status,
+          headBefore: result.headBefore,
+          headAfter: result.headAfter,
+          commitWasReverted: result.commitWasReverted
+        }, null, 2) }]
+      };
+    } catch (error) {
+      if (error instanceof ClineEditsError) {
+        return {
+          content: [{ type: "text", text: JSON.stringify({
+            kind: error.kind,
+            message: error.message,
+            ...error.evidence
+          }, null, 2) }],
+          isError: true
+        };
+      }
+      const response = error instanceof ClineRunError
+        ? { kind: error.kind, message: error.message }
+        : { kind: "unexpected", message: "The Cline editing request failed unexpectedly." };
+      return { content: [{ type: "text", text: JSON.stringify(response, null, 2) }], isError: true };
     }
   }
 );
