@@ -3,13 +3,21 @@ import os from "node:os";
 import path from "node:path";
 import { randomUUID } from "node:crypto";
 import { spawn } from "node:child_process";
-import { ClineRunError, runCline, type AskClineInput, type ClineResponse } from "./runner.js";
+import {
+  ClineRunError,
+  runCline,
+  type AskClineInput,
+  type ClineInvocationOptions,
+  type ClineResponse
+} from "./runner.js";
 
 export interface AskClineWorkspaceInput {
   prompt: string;
   cwd: string;
   thinking?: AskClineInput["thinking"];
   timeoutSeconds?: number;
+  provider?: string;
+  model?: string;
 }
 
 const WORKTREE_BASE = path.join(os.tmpdir(), "cline-mcp-worktrees");
@@ -56,7 +64,8 @@ async function cleanupWorktree(repositoryRoot: string, worktreePath: string): Pr
 
 export async function askClineWorkspace(
   input: AskClineWorkspaceInput,
-  signal?: AbortSignal
+  signal?: AbortSignal,
+  options: Partial<ClineInvocationOptions> = {}
 ): Promise<ClineResponse> {
   const requestedCwd = path.resolve(input.cwd);
   let repositoryRoot: string;
@@ -80,7 +89,14 @@ export async function askClineWorkspace(
     return await runCline(
       { ...input, cwd: worktreePath },
       signal,
-      { autoApprove: true, cwd: worktreePath, systemPrompt: WORKSPACE_SYSTEM_PROMPT }
+      {
+        ...options,
+        autoApprove: true,
+        cwd: worktreePath,
+        systemPrompt: WORKSPACE_SYSTEM_PROMPT,
+        provider: input.provider,
+        model: input.model
+      }
     );
   } finally {
     await cleanupWorktree(repositoryRoot, worktreePath);

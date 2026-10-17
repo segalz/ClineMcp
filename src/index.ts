@@ -1,11 +1,22 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
-import { askCline, ClineRunError } from "./runner.js";
+import { askCline, ClineRunError, formatErrorAsText } from "./runner.js";
 import { applyClineEdits, ClineEditsError } from "./edits.js";
 import { askClineWorkspace } from "./workspace.js";
+import { PROHIBITED_NAMES } from "./settings.js";
 
 const server = new McpServer({ name: "cline-local-bridge", version: "1.0.0" });
+
+const providerModelSchema = z
+  .string()
+  .regex(/^[A-Za-z0-9._:/@-]{1,120}$/)
+  .refine((val) => !PROHIBITED_NAMES.has(val.toLowerCase()), {
+    message: "Prohibited provider or model name"
+  })
+  .optional();
+
+export { formatErrorAsText };
 
 server.registerTool(
   "ask_cline",
@@ -16,7 +27,9 @@ server.registerTool(
       cwd: z.string().min(1).optional(),
       thinking: z.enum(["none", "low", "medium", "high", "xhigh"]).optional(),
       timeoutSeconds: z.number().int().min(1).max(300).optional(),
-      systemPrompt: z.string().min(1).max(8_000).optional()
+      systemPrompt: z.string().min(1).max(8_000).optional(),
+      provider: providerModelSchema,
+      model: providerModelSchema
     }
   },
   async (input, extra) => {
@@ -27,11 +40,12 @@ server.registerTool(
         ...(result.model ? { model: result.model } : {}),
         durationMs: result.durationMs,
         ...(result.usage ? { usage: result.usage } : {}),
-        ...(result.cost !== undefined ? { cost: result.cost } : {})
+        ...(result.cost !== undefined ? { cost: result.cost } : {}),
+        ...(result.warnings && result.warnings.length > 0 ? { warnings: result.warnings } : {})
       };
       return { content: [{ type: "text", text: JSON.stringify(response, null, 2) }] };
     } catch (error) {
-      const message = error instanceof ClineRunError ? error.message : "The local Cline bridge failed unexpectedly.";
+      const message = formatErrorAsText(error, "The local Cline bridge failed unexpectedly.");
       return { content: [{ type: "text", text: message }], isError: true };
     }
   }
@@ -45,41 +59,76 @@ server.registerTool(
       prompt: z.string().min(1).max(20_000),
       cwd: z.string().min(1),
       thinking: z.enum(["none", "low", "medium", "high", "xhigh"]).optional(),
-      timeoutSeconds: z.number().int().min(1).max(300).optional()
+      timeoutSeconds: z.number().int().min(1).max(300).optional(),
+      provider: providerModelSchema,
+      model: providerModelSchema
     }
   },
   async (input, extra) => {
     try {
       const result = await applyClineEdits(input, extra.signal);
       return {
-        content: [{ type: "text", text: JSON.stringify({
-          text: result.text,
-          ...(result.model ? { model: result.model } : {}),
-          durationMs: result.durationMs,
-          ...(result.usage ? { usage: result.usage } : {}),
-          ...(result.cost !== undefined ? { cost: result.cost } : {}),
-          gitDiff: result.gitDiff,
-          status: result.status,
-          headBefore: result.headBefore,
-          headAfter: result.headAfter,
-          commitWasReverted: result.commitWasReverted
-        }, null, 2) }]
+        content: [{
+          type: "text",
+          text: JSON.stringify({
+            text: result.text,
+            ...(result.model ? { model: result.model } : {}),
+            durationMs: result.durationMs,
+            ...(result.usage ? { usage: result.usage } : {}),
+            ...(result.cost !== undefined ? { cost: result.cost } : {}),
+            gitDiff: result.gitDiff,
+            status: result.status,
+            headBefore: result.headBefore,
+            headAfter: result.headAfter,
+            commitWasReverted: result.commitWasReverted,
+            ...(result.warnings && result.warnings.length > 0 ? { warnings: result.warnings } : {})
+          }, null, 2)
+        }]
       };
     } catch (error) {
       if (error instanceof ClineEditsError) {
         return {
-          content: [{ type: "text", text: JSON.stringify({
-            kind: error.kind,
-            message: error.message,
-            ...error.evidence
-          }, null, 2) }],
+          content: [{
+            type: "text",
+            text: JSON.stringify({
+              kind: error.kind,
+              message: error.message,
+              ...(error.exitCode !== undefined && error.exitCode !== null ? { exitCode: error.exitCode } : {}),
+              ...(error.attempts !== undefined ? { attempts: error.attempts } : {}),
+              ...(error.stderrTail ? { stderrTail: error.stderrTail } : {}),
+              ...(error.stdoutTail ? { stdoutTail: error.stdoutTail } : {}),
+              ...error.evidence
+            }, null, 2)
+          }],
           isError: true
         };
       }
-      const response = error instanceof ClineRunError
-        ? { kind: error.kind, message: error.message }
-        : { kind: "unexpected", message: "The Cline editing request failed unexpectedly." };
-      return { content: [{ type: "text", text: JSON.stringify(response, null, 2) }], isError: true };
+      if (error instanceof ClineRunError) {
+        return {
+          content: [{
+            type: "text",
+            text: JSON.stringify({
+              kind: error.kind,
+              message: error.message,
+              ...(error.exitCode !== undefined && error.exitCode !== null ? { exitCode: error.exitCode } : {}),
+              ...(error.attempts !== undefined ? { attempts: error.attempts } : {}),
+              ...(error.stderrTail ? { stderrTail: error.stderrTail } : {}),
+              ...(error.stdoutTail ? { stdoutTail: error.stdoutTail } : {})
+            }, null, 2)
+          }],
+          isError: true
+        };
+      }
+      return {
+        content: [{
+          type: "text",
+          text: JSON.stringify({
+            kind: "unexpected",
+            message: error instanceof Error ? error.message : "The Cline editing request failed unexpectedly."
+          }, null, 2)
+        }],
+        isError: true
+      };
     }
   }
 );
@@ -92,23 +141,29 @@ server.registerTool(
       prompt: z.string().min(1).max(20_000),
       cwd: z.string().min(1),
       thinking: z.enum(["none", "low", "medium", "high", "xhigh"]).optional(),
-      timeoutSeconds: z.number().int().min(1).max(300).optional()
+      timeoutSeconds: z.number().int().min(1).max(300).optional(),
+      provider: providerModelSchema,
+      model: providerModelSchema
     }
   },
   async (input, extra) => {
     try {
       const result = await askClineWorkspace(input, extra.signal);
       return {
-        content: [{ type: "text", text: JSON.stringify({
-          text: result.text,
-          ...(result.model ? { model: result.model } : {}),
-          durationMs: result.durationMs,
-          ...(result.usage ? { usage: result.usage } : {}),
-          ...(result.cost !== undefined ? { cost: result.cost } : {})
-        }, null, 2) }]
+        content: [{
+          type: "text",
+          text: JSON.stringify({
+            text: result.text,
+            ...(result.model ? { model: result.model } : {}),
+            durationMs: result.durationMs,
+            ...(result.usage ? { usage: result.usage } : {}),
+            ...(result.cost !== undefined ? { cost: result.cost } : {}),
+            ...(result.warnings && result.warnings.length > 0 ? { warnings: result.warnings } : {})
+          }, null, 2)
+        }]
       };
     } catch (error) {
-      const message = error instanceof ClineRunError ? error.message : "The isolated Cline workspace review failed unexpectedly.";
+      const message = formatErrorAsText(error, "The isolated Cline workspace review failed unexpectedly.");
       return { content: [{ type: "text", text: message }], isError: true };
     }
   }

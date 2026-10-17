@@ -1,12 +1,21 @@
 import { spawn } from "node:child_process";
 import path from "node:path";
-import { ClineRunError, runCline, type AskClineInput, type ClineResponse } from "./runner.js";
+import {
+  ClineRunError,
+  hasMadeToolCallsOrModifications,
+  runCline,
+  type AskClineInput,
+  type ClineInvocationOptions,
+  type ClineResponse
+} from "./runner.js";
 
 export interface ApplyClineEditsInput {
   prompt: string;
   cwd: string;
   thinking?: AskClineInput["thinking"];
   timeoutSeconds?: number;
+  provider?: string;
+  model?: string;
 }
 
 export interface ClineEditsResponse extends ClineResponse {
@@ -74,7 +83,8 @@ export function truncateGitDiff(diff: string): string {
 
 export async function applyClineEdits(
   input: ApplyClineEditsInput,
-  signal?: AbortSignal
+  signal?: AbortSignal,
+  options: Partial<ClineInvocationOptions> = {}
 ): Promise<ClineEditsResponse> {
   const requestedCwd = path.resolve(input.cwd);
   let repositoryRoot: string;
@@ -86,10 +96,37 @@ export async function applyClineEdits(
     throw new ClineRunError("workspace_not_git", "The requested cwd must be inside a Git repository with at least one commit.");
   }
 
+  const canRetry = async ({ stdout }: { stdout: string; stderr: string; attempt: number }) => {
+    try {
+      const currentHead = await runGit(repositoryRoot, ["rev-parse", "HEAD"]);
+      if (currentHead !== headBefore) return false;
+      const gitDiff = await runGit(repositoryRoot, ["diff", "--binary", "--no-ext-diff", "HEAD"]);
+      if (gitDiff.trim().length > 0) return false;
+      const status = await runGit(repositoryRoot, ["status", "--short"]);
+      if (status.trim().length > 0) return false;
+    } catch {
+      return false;
+    }
+
+    if (hasMadeToolCallsOrModifications(stdout)) {
+      return false;
+    }
+
+    return true;
+  };
+
   const result = await runCline(
     { ...input, cwd: repositoryRoot },
     signal,
-    { autoApprove: true, cwd: repositoryRoot, systemPrompt: EDIT_SYSTEM_PROMPT }
+    {
+      ...options,
+      autoApprove: true,
+      cwd: repositoryRoot,
+      systemPrompt: EDIT_SYSTEM_PROMPT,
+      provider: input.provider,
+      model: input.model,
+      canRetry
+    }
   );
 
   let headAfter: string | undefined;
