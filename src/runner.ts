@@ -11,7 +11,8 @@ import {
 import {
   PROHIBITED_NAMES,
   resolveProviderSettingsPath,
-  withProviderOverride
+  withProviderOverride,
+  type MutexOptions
 } from "./settings.js";
 
 export type ThinkingLevel = "none" | "low" | "medium" | "high" | "xhigh";
@@ -27,6 +28,8 @@ export interface AskClineInput {
 }
 
 export type ClineErrorKind =
+  | "settings_lock_timeout"
+  | "settings_restore_failed"
   | "timeout"
   | "cancelled"
   | "non_zero_exit"
@@ -73,8 +76,24 @@ export class ClineRunError extends Error {
   }
 }
 
+export type KillTreeFn = (pid: number, signal?: NodeJS.Signals) => void;
+
+export function defaultKillTree(pid: number, signal: NodeJS.Signals = "SIGKILL", platform: NodeJS.Platform = process.platform): void {
+  try {
+    if (platform === "win32") {
+      spawn("taskkill", ["/PID", String(pid), "/T", "/F"], {
+        windowsHide: true,
+        stdio: "ignore"
+      }).on("error", () => {});
+    } else {
+      process.kill(-pid, signal);
+    }
+  } catch {}
+}
+
 export interface ClineDependencies {
   spawn?: typeof spawn;
+  platform?: NodeJS.Platform;
   access?: typeof access;
   entryPath?: string;
   providerSettingsPath?: string;
@@ -82,6 +101,17 @@ export interface ClineDependencies {
   updateBackoffMs?: number;
   timeoutMs?: number;
   closeGracePeriodMs?: number;
+  killGracePeriodMs?: number;
+  settlementDeadlineMs?: number;
+  minRetryBudgetMs?: number;
+  lockTimeoutMs?: number;
+  acquireSettingsMutex?: MutexOptions["acquireSettingsMutex"];
+  sleep?: (ms: number) => Promise<void>;
+  setTimeout?: typeof setTimeout;
+  clearTimeout?: typeof clearTimeout;
+  totalBudgetMs?: number;
+  killTree?: KillTreeFn;
+  now?: () => number;
 }
 
 export interface ClineInvocationOptions {
@@ -108,22 +138,63 @@ export const TAIL_CHARACTERS = 2000;
 
 export function redactSecrets(text: string): string {
   if (!text) return "";
-  return text
-    .replace(
-      /"(apiKey|api_key|accessToken|refreshToken|token|secret|password|key|authorization)"(\s*:\s*)"[^"]*"/gi,
-      '"$1"$2"<redacted>"'
-    )
-    .replace(
-      /'(apiKey|api_key|accessToken|refreshToken|token|secret|password|key|authorization)'(\s*:\s*)'[^']*'/gi,
-      "'$1'$2'<redacted>'"
-    )
-    .replace(
-      /\b([A-Za-z0-9_]*(?:API_KEY|TOKEN|SECRET|PASSWORD|_KEY|KEY)[A-Za-z0-9_]*\s*=\s*)(?:"[^"]*"|'[^']*'|\S+)/gi,
-      "$1<redacted>"
-    )
-    .replace(/\bBearer\s+[A-Za-z0-9._~+/=-]+/gi, "Bearer <redacted>")
-    .replace(/\bsk-[A-Za-z0-9_-]{8,}\b/gi, "<redacted>")
-    .replace(/\bnvapi-[A-Za-z0-9_-]{8,}\b/gi, "<redacted>");
+  let result = text;
+
+  // 1. JSON-style double-quoted keys:
+  result = result.replace(
+    /"(apiKey|api_key|x-api-key|api-key|accessToken|refreshToken|token|secret|password|key|authorization|proxy-authorization|cookie|set-cookie)"(\s*:\s*)"[^"]*"/gi,
+    '"$1"$2"<redacted>"'
+  );
+
+  // 2. JSON-style single-quoted keys:
+  result = result.replace(
+    /'(apiKey|api_key|x-api-key|api-key|accessToken|refreshToken|token|secret|password|key|authorization|proxy-authorization|cookie|set-cookie)'(\s*:\s*)'[^']*'/gi,
+    "'$1'$2'<redacted>'"
+  );
+
+  // 3. Environment variable assignments (e.g. KEY=val, NVIDIA_KEY=val, MY_TOKEN=val):
+  result = result.replace(
+    /\b([A-Za-z0-9_]*(?:API_KEY|TOKEN|SECRET|PASSWORD|_KEY|KEY)[A-Za-z0-9_]*\s*=\s*)(?:"[^"]*"|'[^']*'|\S+)/gi,
+    "$1<redacted>"
+  );
+
+  // 4. Header-style Authorization and Proxy-Authorization:
+  // Authorization: Basic ..., Authorization: Bearer ..., Authorization: <scheme> <value>, or Authorization: <value>
+  result = result.replace(
+    /\b((?:Proxy-)?Authorization\s*:\s*)(?:([A-Za-z0-9_-]+)\s+)?(?:"[^"]*"|'[^']*'|[^\s"',;]+)/gi,
+    (match, prefix, scheme) => {
+      return scheme ? `${prefix}${scheme} <redacted>` : `${prefix}<redacted>`;
+    }
+  );
+
+  // 5. Cookie and Set-Cookie headers:
+  result = result.replace(/\b((?:Set-)?Cookie\s*:\s*)[^\r\n]+/gi, "$1<redacted>");
+
+  // 6. Headers / key-value forms for x-api-key, api-key:
+  result = result.replace(
+    /\b(x-api-key|api-key)\s*[:=]\s*(?:"[^"]*"|'[^']*'|\S+)/gi,
+    "$1: <redacted>"
+  );
+
+  // 7. Key-value forms for token, key, secret, password (e.g. token: ..., secret = ..., password: ...):
+  // Redacts whole value up to whitespace/quote/comma/semicolon (covers JWT a.b.c)
+  result = result.replace(
+    /\b(token|key|secret|password)\s*([:=]|\bis\b)\s*(?:(Bearer|Basic)\s+(?:<redacted>|[^\s"',;]+)|<redacted>|(?:"[^"]*"|'[^']*')|[^\s"',;]+)/gi,
+    (match, keyName, sep, scheme) => {
+      const isIs = sep.toLowerCase() === "is";
+      const separator = isIs ? " is " : (sep.includes("=") ? " = " : ": ");
+      if (scheme) {
+        return `${keyName}${separator}${scheme} <redacted>`;
+      }
+      return `${keyName}${separator}<redacted>`;
+    }
+  );
+
+  // 8. Known token prefixes (sk-..., nvapi-...):
+  result = result.replace(/\bsk-[A-Za-z0-9_-]{8,}\b/gi, "<redacted>");
+  result = result.replace(/\bnvapi-[A-Za-z0-9_-]{8,}\b/gi, "<redacted>");
+
+  return result;
 }
 
 export function getTail(text: string, maxChars: number = TAIL_CHARACTERS): string {
@@ -203,7 +274,12 @@ export function isTransientError(info: {
           }
         }
       } catch {
-        if (/error/i.test(line)) {
+        if (
+          /error/i.test(line) ||
+          /(?:status|code|http)\D{0,5}(?:429|5\d\d)\b/i.test(line) ||
+          /\b(overloaded|rate\s*limit|too\s*many\s*requests|temporarily\s*unavailable|temporarily\s*overloaded|econnreset|etimedout)\b/i.test(line) ||
+          /\b(upstream\s*error|provider\s*error)\b/i.test(line)
+        ) {
           errorSources.push(line);
         }
       }
@@ -220,6 +296,22 @@ export function isTransientError(info: {
   ];
 
   return patterns.some((pattern) => pattern.test(combined));
+}
+
+export function extractPlainStderrError(stderr: string): string | undefined {
+  const lines = stderr.split(/\r?\n/).map((l) => l.trim()).filter(Boolean);
+  for (let i = lines.length - 1; i >= 0; i--) {
+    const line = lines[i];
+    if (
+      /error/i.test(line) ||
+      /(?:status|code|http)\D{0,5}(?:429|5\d\d)\b/i.test(line) ||
+      /\b(overloaded|rate\s*limit|too\s*many\s*requests|temporarily\s*unavailable|temporarily\s*overloaded|econnreset|etimedout)\b/i.test(line) ||
+      /\b(upstream\s*error|provider\s*error)\b/i.test(line)
+    ) {
+      return line;
+    }
+  }
+  return undefined;
 }
 
 function extractRunResultErrorText(stdout: string): string | undefined {
@@ -331,26 +423,27 @@ export async function runCline(
   validateInputLimits(effectiveInput);
 
   const deps = options.deps ?? {};
+  const platform = deps.platform ?? process.platform;
   const settingsPath = resolveProviderSettingsPath(deps.providerSettingsPath);
+
+  const nowFn = deps.now ?? (() => performance.now());
+  const overallStarted = nowFn();
+  const totalBudgetMs = deps.totalBudgetMs ?? (timeoutSeconds * 1000);
+  const overallDeadline = overallStarted + totalBudgetMs;
+  const getRemainingBudgetMs = () => Math.max(0, overallDeadline - nowFn());
+  const sleep = deps.sleep ?? (ms => new Promise<void>(resolve => setTimeout(resolve, ms)));
+  const schedule = deps.setTimeout ?? setTimeout;
+  const unschedule = deps.clearTimeout ?? clearTimeout;
+  const minRetryBudgetMs = deps.minRetryBudgetMs ?? (deps.timeoutMs !== undefined ? 0 : Math.min(15_000, Math.floor(totalBudgetMs * 0.25)));
 
   return withProviderOverride(
     { provider: effectiveInput.provider, model: effectiveInput.model },
     settingsPath,
     signal,
-    async () => {
+    async (selection) => {
+      effectiveInput.provider = selection.provider;
+      effectiveInput.model = selection.model;
       const cwd = await validateCwd(effectiveInput.cwd, deps.access);
-      const args = [
-        "--json",
-        "--auto-approve", String(options.autoApprove ?? false),
-        "--thinking", effectiveInput.thinking ?? "none",
-        "--timeout", String(timeoutSeconds)
-      ];
-      if (effectiveInput.provider) args.push("-P", effectiveInput.provider);
-      if (effectiveInput.model) args.push("-m", effectiveInput.model);
-      if (effectiveInput.systemPrompt) args.push("--system", effectiveInput.systemPrompt);
-      if (cwd) args.push("--cwd", cwd);
-      args.push(effectiveInput.prompt);
-
       const windowsEntry = deps.entryPath ?? (process.platform === "win32" && process.env.APPDATA
         ? path.join(process.env.APPDATA, "npm", "node_modules", "cline", "bin", "cline")
         : undefined);
@@ -360,10 +453,6 @@ export async function runCline(
       }
 
       const executable = (process.platform === "win32" || deps.entryPath) ? process.execPath : "cline";
-      const spawnArgs = (process.platform === "win32" || deps.entryPath) && windowsEntry
-        ? [windowsEntry, ...args]
-        : args;
-
       const backoffMs = deps.backoffMs ?? 2500;
       const updateBackoffMs = deps.updateBackoffMs ?? 2000;
       const maxAttempts = 2;
@@ -382,11 +471,13 @@ export async function runCline(
           try {
             await accessFn(windowsEntry);
           } catch {
-            if (attempt < maxAttempts) {
+            const remainingForUpdate = getRemainingBudgetMs();
+            if (attempt < maxAttempts && remainingForUpdate > 0 && remainingForUpdate >= minRetryBudgetMs) {
               if (signal?.aborted) {
                 throw new ClineRunError("cancelled", "The Cline request was cancelled.", { attempts: attempt });
               }
-              await new Promise((r) => setTimeout(r, updateBackoffMs));
+              const sleepMs = Math.min(updateBackoffMs, Math.max(0, remainingForUpdate - minRetryBudgetMs));
+              if (sleepMs > 0) await sleep(sleepMs);
               if (signal?.aborted) {
                 throw new ClineRunError("cancelled", "The Cline request was cancelled.", { attempts: attempt });
               }
@@ -400,7 +491,45 @@ export async function runCline(
           }
         }
 
-        const started = performance.now();
+        const remainingBeforeAttempt = getRemainingBudgetMs();
+        if (remainingBeforeAttempt <= 0) {
+          throw new ClineRunError("timeout", `Cline exceeded the ${timeoutSeconds}-second timeout.`, { attempts: attempt - 1 });
+        }
+
+        // Budget calculation for this attempt
+        let attemptBudgetMs = totalBudgetMs;
+        if (attempt === 1) {
+          if (maxAttempts > 1 && Math.floor(totalBudgetMs * 0.40) >= minRetryBudgetMs) {
+            attemptBudgetMs = Math.floor(totalBudgetMs * 0.60);
+          }
+        } else {
+          attemptBudgetMs = remainingBeforeAttempt;
+        }
+
+        const effectiveAttemptBudgetMs = Math.min(attemptBudgetMs, remainingBeforeAttempt);
+        const attemptTimeoutSeconds = Math.max(1, Math.floor(effectiveAttemptBudgetMs / 1000));
+        const attemptTimerMs = deps.timeoutMs !== undefined
+          ? Math.min(deps.timeoutMs, effectiveAttemptBudgetMs)
+          : effectiveAttemptBudgetMs;
+
+        const args = [
+          "--json",
+          "--auto-approve", String(options.autoApprove ?? false),
+          "--thinking", effectiveInput.thinking ?? "none",
+          "--timeout", String(attemptTimeoutSeconds)
+        ];
+        if (effectiveInput.provider) args.push("-P", effectiveInput.provider);
+        if (effectiveInput.model) args.push("-m", effectiveInput.model);
+        if (effectiveInput.systemPrompt) args.push("--system", effectiveInput.systemPrompt);
+        if (cwd) args.push("--cwd", cwd);
+        args.push(effectiveInput.prompt);
+
+        const spawnArgs = (process.platform === "win32" || deps.entryPath) && windowsEntry
+          ? [windowsEntry, ...args]
+          : args;
+
+        if (getRemainingBudgetMs() <= 0) throw new ClineRunError("timeout", "Cline exceeded the global deadline.", { attempts: attempt - 1 });
+        const started = nowFn();
         let stdout = "";
         let stderr = "";
         let timedOut = false;
@@ -416,45 +545,85 @@ export async function runCline(
           let settled = false;
           let child: ReturnType<typeof spawn>;
           let exitTimer: NodeJS.Timeout | undefined;
+          let escalationTimer: NodeJS.Timeout | undefined;
+          let settlementTimer: NodeJS.Timeout | undefined;
+          let exitSeen = false;
           let exitCode: number | null = null;
           let exitSignal: NodeJS.Signals | null = null;
+          let spawnError: any;
 
-          const timerDuration = deps.timeoutMs ?? (timeoutSeconds * 1000 + 1_000);
-          const timer = setTimeout(() => {
-            timedOut = true;
-            try {
-              child?.kill();
-            } catch {}
-          }, timerDuration);
+          const clampGrace = (ms: number) => Math.max(0, Math.min(ms, getRemainingBudgetMs()));
+          const cleanup = () => {
+            if (settled) return false;
+            settled = true;
+            unschedule(timer);
+            if (exitTimer) unschedule(exitTimer);
+            if (escalationTimer) unschedule(escalationTimer);
+            if (settlementTimer) unschedule(settlementTimer);
+            signal?.removeEventListener("abort", abort);
+            return true;
+          };
+
+          const terminateChild = (isTimeout: boolean) => {
+            if (isTimeout) {
+              timedOut = true;
+            } else {
+              cancelled = true;
+            }
+            if (settled || settlementTimer) return;
+
+            const kill = (signal: NodeJS.Signals) => {
+              if (exitSeen || settled || !child) return;
+              try {
+                if (typeof child.pid === "number") {
+                  if (deps.killTree) deps.killTree(child.pid, signal);
+                  else defaultKillTree(child.pid, signal, platform);
+                }
+                else child.kill(signal);
+              } catch {}
+            };
+            // Windows taskkill must see the live root to enumerate its descendants.
+            // POSIX children lead a process group, so signal the entire group.
+            kill(platform === "win32" ? "SIGKILL" : "SIGTERM");
+            if (settled) return;
+            if (platform !== "win32" && !exitSeen) {
+              escalationTimer = schedule(() => kill("SIGKILL"),
+                clampGrace(deps.killGracePeriodMs ?? deps.closeGracePeriodMs ?? 500));
+            }
+
+            settlementTimer = schedule(() => {
+              if (settled) return;
+              try {
+                if (typeof child?.stdout?.destroy === "function") child.stdout.destroy();
+                if (typeof child?.stderr?.destroy === "function") child.stderr.destroy();
+              } catch {}
+              if (cleanup()) {
+                resolve({
+                  code: exitCode,
+                  signal: exitSignal ?? (isTimeout ? "SIGTERM" : null),
+                  error: spawnError
+                });
+              }
+            }, clampGrace(deps.settlementDeadlineMs ?? (deps.closeGracePeriodMs ?? 500) * 3));
+          };
+
+          const timer = schedule(() => {
+            terminateChild(true);
+          }, Math.min(attemptTimerMs, getRemainingBudgetMs()));
           if (!deps.timeoutMs) {
             timer.unref();
           }
 
           const abort = () => {
-            cancelled = true;
-            try {
-              child?.kill();
-            } catch {}
+            terminateChild(false);
           };
           signal?.addEventListener("abort", abort, { once: true });
-
-          const cleanup = () => {
-            if (settled) return false;
-            settled = true;
-            clearTimeout(timer);
-            if (exitTimer) {
-              clearTimeout(exitTimer);
-            }
-            signal?.removeEventListener("abort", abort);
-            return true;
-          };
-
-          const closeGracePeriodMs = deps.closeGracePeriodMs ?? 500;
 
           try {
             child = spawnFn(executable, spawnArgs, {
               shell: false,
               windowsHide: true,
+              detached: platform !== "win32",
               stdio: ["ignore", "pipe", "pipe"],
               env
             });
@@ -472,7 +641,6 @@ export async function runCline(
             stderr += chunk.toString();
           });
 
-          let spawnError: any;
           child.on("error", (err) => {
             spawnError = err;
             if (cleanup()) {
@@ -481,9 +649,20 @@ export async function runCline(
           });
 
           child.on("exit", (code, sig) => {
+            if (exitSeen) return;
+            exitSeen = true;
+            // The group remains addressable while descendants live, even after its leader exits.
+            if (platform !== "win32" && typeof child.pid === "number") {
+              try {
+                if (deps.killTree) deps.killTree(child.pid, "SIGKILL");
+                else defaultKillTree(child.pid, "SIGKILL", platform);
+              } catch {}
+            }
+            if (escalationTimer) unschedule(escalationTimer);
+            if (settled) return;
             exitCode = code;
             exitSignal = sig;
-            exitTimer = setTimeout(() => {
+            exitTimer = schedule(() => {
               try {
                 if (typeof child.stdout?.destroy === "function") {
                   child.stdout.destroy();
@@ -497,7 +676,7 @@ export async function runCline(
               if (cleanup()) {
                 resolve({ code: exitCode, signal: exitSignal, error: spawnError });
               }
-            }, closeGracePeriodMs);
+            }, clampGrace(deps.closeGracePeriodMs ?? 500));
             if (!deps.closeGracePeriodMs) {
               exitTimer.unref();
             }
@@ -530,16 +709,23 @@ export async function runCline(
           );
         }
 
-        const elapsedSec = ((performance.now() - started) / 1000).toFixed(1);
+        const elapsedSec = ((nowFn() - started) / 1000).toFixed(1);
         const code = exitInfo.code;
-
-        if (cancelled || signal?.aborted) {
-          throw new ClineRunError("cancelled", "The Cline request was cancelled.", { attempts: attempt });
-        }
 
         const stdoutTail = getTail(redactSecrets(stdout));
         const stderrTail = getTail(redactSecrets(stderr));
         const effectiveCode = code !== null ? code : -1;
+
+        if (cancelled || signal?.aborted) {
+          const cancelSummary = "The Cline request was cancelled.";
+          const cancelMsg = buildErrorTextWithTails(cancelSummary, stderrTail, stdoutTail);
+          throw new ClineRunError("cancelled", cancelMsg, {
+            exitCode: code,
+            stderrTail,
+            stdoutTail,
+            attempts: attempt
+          });
+        }
 
         // 1. Usable completed result check FIRST
         const usableResult = parseUsableResult(stdout, effectiveCode);
@@ -557,38 +743,41 @@ export async function runCline(
             return {
               ...usableResult,
               warnings,
-              durationMs: usableResult.durationMs ?? Math.round(performance.now() - started)
+              durationMs: usableResult.durationMs ?? Math.round(nowFn() - started)
             };
           }
           return {
             ...usableResult,
-            durationMs: usableResult.durationMs ?? Math.round(performance.now() - started)
+            durationMs: usableResult.durationMs ?? Math.round(nowFn() - started)
           };
         }
 
-        // 2. Timeout check (retry only if timeoutSeconds <= 120)
+        // 2. Timeout check with budget split
         if (timedOut) {
           const timeoutMsg = buildErrorTextWithTails(
             `Cline exceeded the ${timeoutSeconds}-second timeout (elapsed: ${elapsedSec}s).`,
             stderrTail,
             stdoutTail
           );
-          let allowRetry = timeoutSeconds <= 120;
+          const remainingBudgetMs = getRemainingBudgetMs();
+          let allowRetry = remainingBudgetMs > 0 && remainingBudgetMs >= minRetryBudgetMs;
           if (allowRetry && options.canRetry) {
             allowRetry = await options.canRetry({ stdout, stderr, attempt });
+            allowRetry = allowRetry && getRemainingBudgetMs() > 0 && getRemainingBudgetMs() >= minRetryBudgetMs;
           }
           if (allowRetry && attempt < maxAttempts) {
             if (signal?.aborted) {
               throw new ClineRunError("cancelled", "The Cline request was cancelled.", { attempts: attempt });
             }
-            await new Promise((r) => setTimeout(r, backoffMs));
+            const sleepMs = Math.min(backoffMs, Math.max(0, getRemainingBudgetMs() - minRetryBudgetMs));
+            if (sleepMs > 0) await sleep(sleepMs);
             if (signal?.aborted) {
               throw new ClineRunError("cancelled", "The Cline request was cancelled.", { attempts: attempt });
             }
             continue;
           }
           throw new ClineRunError("timeout", timeoutMsg, {
-            exitCode: null,
+            exitCode: typeof code === "number" ? code : null,
             stderrTail,
             stdoutTail,
             attempts: attempt
@@ -600,15 +789,17 @@ export async function runCline(
           stderr.includes("MODULE_NOT_FOUND") ||
           stderr.includes("Cannot find module")
         ) {
-          let allowRetry = true;
-          if (options.canRetry) {
+          let allowRetry = getRemainingBudgetMs() > 0 && getRemainingBudgetMs() >= minRetryBudgetMs;
+          if (allowRetry && options.canRetry) {
             allowRetry = await options.canRetry({ stdout, stderr, attempt });
+            allowRetry = allowRetry && getRemainingBudgetMs() > 0 && getRemainingBudgetMs() >= minRetryBudgetMs;
           }
           if (allowRetry && attempt < maxAttempts) {
             if (signal?.aborted) {
               throw new ClineRunError("cancelled", "The Cline request was cancelled.", { attempts: attempt });
             }
-            await new Promise((r) => setTimeout(r, updateBackoffMs));
+            const sleepMs = Math.min(updateBackoffMs, Math.max(0, getRemainingBudgetMs() - minRetryBudgetMs));
+            if (sleepMs > 0) await sleep(sleepMs);
             if (signal?.aborted) {
               throw new ClineRunError("cancelled", "The Cline request was cancelled.", { attempts: attempt });
             }
@@ -631,6 +822,8 @@ export async function runCline(
         const extractedError = rawExtracted ? redactSecrets(rawExtracted) : undefined;
         const rawRunResultError = extractRunResultErrorText(stdout);
         const runResultErrorText = rawRunResultError ? redactSecrets(rawRunResultError) : undefined;
+        const rawPlainStderrError = extractPlainStderrError(stderr);
+        const plainStderrError = rawPlainStderrError ? redactSecrets(rawPlainStderrError) : undefined;
         const transient = isTransientError({
           code,
           stderr,
@@ -640,35 +833,39 @@ export async function runCline(
         });
 
         if (transient) {
-          let allowRetry = true;
-          if (options.canRetry) {
+          const remainingBudgetMs = getRemainingBudgetMs();
+          let allowRetry = remainingBudgetMs > 0 && remainingBudgetMs >= minRetryBudgetMs;
+          if (allowRetry && options.canRetry) {
             allowRetry = await options.canRetry({ stdout, stderr, attempt });
+            allowRetry = allowRetry && getRemainingBudgetMs() > 0 && getRemainingBudgetMs() >= minRetryBudgetMs;
           }
           if (allowRetry && attempt < maxAttempts) {
             if (signal?.aborted) {
               throw new ClineRunError("cancelled", "The Cline request was cancelled.", { attempts: attempt });
             }
-            await new Promise((r) => setTimeout(r, backoffMs));
+            const sleepMs = Math.min(backoffMs, Math.max(0, getRemainingBudgetMs() - minRetryBudgetMs));
+            if (sleepMs > 0) await sleep(sleepMs);
             if (signal?.aborted) {
               throw new ClineRunError("cancelled", "The Cline request was cancelled.", { attempts: attempt });
             }
             continue;
           }
           const exitMsg = code !== null ? ` (exit code ${code})` : exitInfo.signal ? ` (signal ${exitInfo.signal})` : "";
-          const summary = `Cline failed with transient provider error${exitMsg}: ${extractedError || runResultErrorText || "Service temporarily unavailable"}.`;
+          const effectiveDetail = extractedError || runResultErrorText || plainStderrError || "Service temporarily unavailable";
+          const summary = `Cline failed with transient provider error${exitMsg}: ${effectiveDetail}.`;
           const msg = buildErrorTextWithTails(summary, stderrTail, stdoutTail);
           throw new ClineRunError("transient_provider_error", msg, {
             exitCode: code,
             stderrTail,
             stdoutTail,
             attempts: attempt,
-            extractedMessage: extractedError || runResultErrorText
+            extractedMessage: effectiveDetail
           });
         }
 
         // 5. If not transient, but run_result or stderr had an error message (even with code === 0):
-        if (runResultErrorText || extractedError) {
-          const errorDetail = extractedError || runResultErrorText;
+        if (runResultErrorText || extractedError || (plainStderrError && /error/i.test(plainStderrError))) {
+          const errorDetail = extractedError || runResultErrorText || plainStderrError;
           const exitMsg = code !== null && code !== 0 ? ` (exit code ${code})` : exitInfo.signal ? ` (signal ${exitInfo.signal})` : "";
           const summary = `Cline failed${exitMsg}: ${errorDetail}.`;
           const msg = buildErrorTextWithTails(summary, stderrTail, stdoutTail);
@@ -717,6 +914,13 @@ export async function runCline(
       }
 
       throw new ClineRunError("launch_failed", "Cline execution failed unexpectedly.", { attempts: attempt });
+    },
+    {
+      deadline: overallDeadline,
+      lockTimeoutMs: deps.lockTimeoutMs,
+      acquireSettingsMutex: deps.acquireSettingsMutex,
+      sleep: deps.sleep,
+      nowFn
     }
   );
 }

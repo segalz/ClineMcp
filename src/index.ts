@@ -4,7 +4,7 @@ import { z } from "zod";
 import { askCline, ClineRunError, formatErrorAsText } from "./runner.js";
 import { applyClineEdits, ClineEditsError } from "./edits.js";
 import { askClineWorkspace } from "./workspace.js";
-import { PROHIBITED_NAMES } from "./settings.js";
+import { PROHIBITED_NAMES, resolveProviderSettingsPath, recoverProviderSettingsJournal } from "./settings.js";
 
 const server = new McpServer({ name: "cline-local-bridge", version: "1.0.0" });
 
@@ -168,5 +168,12 @@ server.registerTool(
     }
   }
 );
+
+try {
+  const result = await recoverProviderSettingsJournal(resolveProviderSettingsPath(), { lockTimeoutMs: 10_000 });
+  if (result === "failed") console.error("Settings startup recovery failed; the restore journal was retained.");
+} catch {
+  console.error("Settings startup recovery could not acquire the mutex or access settings; the journal was retained.");
+}
 
 await server.connect(new StdioServerTransport());
