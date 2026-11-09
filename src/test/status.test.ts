@@ -174,7 +174,7 @@ test("status writes are atomic, merged per key and leave no temp files", async (
 test("daily quota is not retried, is recorded, and later runs refuse without launching", async () => {
   const statusPath = freshStatusPath();
   const mock = mockSpawn([{ stderr: errorLine(QUOTA_MESSAGE), code: 1 }, { stdout: completed("should not run") }]);
-  await assert.rejects(runCline({ prompt: "x" }, undefined, { deps: deps(statusPath, mock.spawn) }), (err: unknown) => {
+  await assert.rejects(runCline({ provider: "test-provider", model: "test-model", prompt: "x" }, undefined, { deps: deps(statusPath, mock.spawn) }), (err: unknown) => {
     assert.ok(err instanceof ClineRunError);
     assert.equal(err.kind, "quota_exhausted");
     assert.equal(err.attempts, 1);
@@ -183,26 +183,26 @@ test("daily quota is not retried, is recorded, and later runs refuse without lau
     return true;
   });
   assert.equal(mock.calls.length, 1);
-  const entry = await readStatusEntry(statusPath);
+  const entry = await readStatusEntry(statusPath, "test-provider", "test-model");
   assert.equal(entry?.state, "quota_exhausted");
   assert.equal(entry?.reset_at, new Date(NOW + 86_340_000).toISOString());
 
-  await assert.rejects(runCline({ prompt: "x" }, undefined, { deps: deps(statusPath, mock.spawn) }), (err: unknown) =>
+  await assert.rejects(runCline({ provider: "test-provider", model: "test-model", prompt: "x" }, undefined, { deps: deps(statusPath, mock.spawn) }), (err: unknown) =>
     err instanceof ClineRunError && err.kind === "quota_exhausted" && err.attempts === 0 && /not launched/.test(err.message));
   assert.equal(mock.calls.length, 1);
 
   // After the reset time the lock no longer applies.
-  const later = await runCline({ prompt: "x" }, undefined, {
+  const later = await runCline({ provider: "test-provider", model: "test-model", prompt: "x" }, undefined, {
     deps: deps(statusPath, mock.spawn, { wallNow: () => NOW + 86_340_000 })
   });
   assert.equal(later.text, "should not run");
-  assert.equal((await readStatusEntry(statusPath))?.state, "available");
+  assert.equal((await readStatusEntry(statusPath, "test-provider", "test-model"))?.state, "available");
 });
 
 test("OpenRouter free-models-per-day 429 is not treated as a retryable rate limit", async () => {
   const statusPath = freshStatusPath();
   const mock = mockSpawn([{ stderr: errorLine("429 Rate limit exceeded: free-models-per-day"), code: 1 }]);
-  await assert.rejects(runCline({ prompt: "x" }, undefined, { deps: deps(statusPath, mock.spawn) }),
+  await assert.rejects(runCline({ provider: "test-provider", model: "test-model", prompt: "x" }, undefined, { deps: deps(statusPath, mock.spawn) }),
     (err: unknown) => err instanceof ClineRunError && err.kind === "quota_exhausted");
   assert.equal(mock.calls.length, 1);
 });
@@ -210,10 +210,10 @@ test("OpenRouter free-models-per-day 429 is not treated as a retryable rate limi
 test("transient rate limit still retries once and records rate_limited", async () => {
   const statusPath = freshStatusPath();
   const mock = mockSpawn([{ stderr: errorLine("429 Too many requests, retry after 20s"), code: 1 }]);
-  await assert.rejects(runCline({ prompt: "x" }, undefined, { deps: deps(statusPath, mock.spawn) }),
+  await assert.rejects(runCline({ provider: "test-provider", model: "test-model", prompt: "x" }, undefined, { deps: deps(statusPath, mock.spawn) }),
     (err: unknown) => err instanceof ClineRunError && err.kind === "transient_provider_error" && err.attempts === 2);
   assert.equal(mock.calls.length, 2);
-  const entry = await readStatusEntry(statusPath);
+  const entry = await readStatusEntry(statusPath, "test-provider", "test-model");
   assert.equal(entry?.state, "rate_limited");
   assert.equal(entry?.retry_after_s, 20);
   assert.equal(entry?.source, "run");
@@ -224,7 +224,7 @@ test("successful real run records available under the selected provider and mode
   const settingsPath = path.join(root, `providers-${++counter}.json`);
   await writeFile(settingsPath, JSON.stringify({ lastUsedProvider: "cline", providers: { cline: { settings: { model: "vendor/free-model:free" } } } }));
   const mock = mockSpawn([{ stdout: completed("done") }]);
-  await runCline({ prompt: "x" }, undefined, { deps: deps(statusPath, mock.spawn, { providerSettingsPath: settingsPath }) });
+  await runCline({ provider: "cline", model: "vendor/free-model:free", prompt: "x" }, undefined, { deps: deps(statusPath, mock.spawn, { providerSettingsPath: settingsPath }) });
   const entry = await readStatusEntry(statusPath, "cline", "vendor/free-model:free");
   assert.equal(entry?.state, "available");
   assert.equal(entry?.source, "run");
@@ -233,7 +233,7 @@ test("successful real run records available under the selected provider and mode
 
 test("timeout message states the per-attempt budget and total", async () => {
   const mock = mockSpawn([{ hang: true }]);
-  await assert.rejects(runCline({ prompt: "x", timeoutSeconds: 5 }, undefined, {
+  await assert.rejects(runCline({ provider: "test-provider", model: "test-model", prompt: "x", timeoutSeconds: 5 }, undefined, {
     deps: deps(freshStatusPath(), mock.spawn, { timeoutMs: 15 })
   }), (err: unknown) => {
     assert.ok(err instanceof ClineRunError);
@@ -249,7 +249,7 @@ test("ping: single attempt, no approval, no cwd; cached until stale; force re-ch
   let now = NOW;
   const mock = mockSpawn([{ stdout: completed("PONG") }]);
   const pingDeps = deps(statusPath, mock.spawn, { wallNow: () => now });
-  const first = await clinePing({}, undefined, pingDeps);
+  const first = await clinePing({ provider: "test-provider", model: "test-model" }, undefined, pingDeps);
   assert.equal(first.state, "available");
   assert.equal(first.cached, false);
   assert.equal(first.reason, "replied PONG");
@@ -262,41 +262,52 @@ test("ping: single attempt, no approval, no cwd; cached until stale; force re-ch
   assert.equal(args.at(-1), PING_PROMPT);
 
   now += 30_000;
-  assert.equal((await clinePing({}, undefined, pingDeps)).cached, true);
+  assert.equal((await clinePing({ provider: "test-provider", model: "test-model" }, undefined, pingDeps)).cached, true);
   assert.equal(mock.calls.length, 1);
-  assert.equal((await clinePing({ force: true }, undefined, pingDeps)).cached, false);
+  assert.equal((await clinePing({ provider: "test-provider", model: "test-model", force: true }, undefined, pingDeps)).cached, false);
   assert.equal(mock.calls.length, 2);
   now += AVAILABLE_TTL_MS;
-  assert.equal((await clinePing({}, undefined, pingDeps)).cached, false);
+  assert.equal((await clinePing({ provider: "test-provider", model: "test-model" }, undefined, pingDeps)).cached, false);
   assert.equal(mock.calls.length, 3);
+});
+
+test("ping: without both provider and model it fails before the cache and never launches", async () => {
+  const statusPath = freshStatusPath();
+  const mock = mockSpawn([{ stdout: completed("PONG") }]);
+  await writeStatusEntry(statusPath, buildEntry({ provider: "default", model: "default", classification: { state: "available" }, reason: "r", source: "ping" }, NOW));
+  for (const input of [{}, { provider: "cline" }, { model: "cline-free/x" }]) {
+    await assert.rejects(clinePing(input, undefined, deps(statusPath, mock.spawn)),
+      (err: unknown) => err instanceof ClineRunError && err.kind === "launch_failed" && /provider and model are required/.test(err.message));
+  }
+  assert.equal(mock.calls.length, 0);
 });
 
 test("ping: timeout is unreachable with no retry", async () => {
   const statusPath = freshStatusPath();
   const mock = mockSpawn([{ hang: true }]);
-  const result = await clinePing({}, undefined, deps(statusPath, mock.spawn, { timeoutMs: 15 }));
+  const result = await clinePing({ provider: "test-provider", model: "test-model" }, undefined, deps(statusPath, mock.spawn, { timeoutMs: 15 }));
   assert.equal(result.state, "unreachable");
   assert.match(result.reason, /^timeout: .*attempt 1\/1/);
   assert.equal(mock.calls.length, 1);
-  assert.equal((await readStatusEntry(statusPath))?.source, "ping");
+  assert.equal((await readStatusEntry(statusPath, "test-provider", "test-model"))?.source, "ping");
 });
 
 test("ping: quota and rate limit states with reset/retry data, and it bypasses the quota lock", async () => {
   const statusPath = freshStatusPath();
   const quota = mockSpawn([{ stderr: errorLine(QUOTA_MESSAGE), code: 1 }]);
-  const locked = await clinePing({}, undefined, deps(statusPath, quota.spawn));
+  const locked = await clinePing({ provider: "test-provider", model: "test-model" }, undefined, deps(statusPath, quota.spawn));
   assert.equal(locked.state, "quota_exhausted");
   assert.equal(locked.reset_at, new Date(NOW + 86_340_000).toISOString());
   // Cached lock is returned without launching; force launches despite the lock.
-  assert.equal((await clinePing({}, undefined, deps(statusPath, quota.spawn))).cached, true);
+  assert.equal((await clinePing({ provider: "test-provider", model: "test-model" }, undefined, deps(statusPath, quota.spawn))).cached, true);
   assert.equal(quota.calls.length, 1);
   const limited = mockSpawn([{ stderr: errorLine("429 Too many requests. Try again in 45s"), code: 1 }]);
-  const result = await clinePing({ force: true }, undefined, deps(statusPath, limited.spawn));
+  const result = await clinePing({ provider: "test-provider", model: "test-model", force: true }, undefined, deps(statusPath, limited.spawn));
   assert.equal(result.state, "rate_limited");
   assert.equal(result.retry_after_s, 45);
   assert.equal(limited.calls.length, 1);
   const file = JSON.parse(await readFile(statusPath, "utf8"));
-  assert.equal(file.entries[statusKey()].state, "rate_limited");
+  assert.equal(file.entries[statusKey("test-provider", "test-model")].state, "rate_limited");
 });
 
 
@@ -317,7 +328,7 @@ test("quota reported before a timeout is not retried", async () => {
     queueMicrotask(() => child.stderr.emit("data", Buffer.from(errorLine(QUOTA_MESSAGE))));
     return child;
   };
-  await assert.rejects(runCline({ prompt: "x" }, undefined, {
+  await assert.rejects(runCline({ provider: "test-provider", model: "test-model", prompt: "x" }, undefined, {
     deps: deps(freshStatusPath(), spawn, { timeoutMs: 15 })
   }), (err: unknown) => err instanceof ClineRunError && err.kind === "quota_exhausted" && err.attempts === 1);
   assert.equal(mock.calls.length, 1);

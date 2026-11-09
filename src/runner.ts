@@ -442,6 +442,15 @@ export function validateInputLimits(input: AskClineInput): void {
   }
 }
 
+export const MISSING_SELECTION_MESSAGE =
+  "provider and model are required. The bridge never runs on Cline's saved default model, which can go stale silently. " +
+  "Pass a provider (e.g. \"cline\") and a model id from Cline's current catalog (free ones start with \"cline-free/\").";
+
+/** Fails before any I/O when the caller did not choose both provider and model. */
+export function requireSelection(input: { provider?: string; model?: string }): void {
+  if (!input.provider || !input.model) throw new ClineRunError("launch_failed", MISSING_SELECTION_MESSAGE, { attempts: 0 });
+}
+
 export async function runCline(
   input: AskClineInput,
   signal?: AbortSignal,
@@ -458,6 +467,7 @@ export async function runCline(
     provider: options.provider ?? input.provider,
     model: options.model ?? input.model
   };
+  requireSelection(effectiveInput);
   const timeoutSeconds = effectiveInput.timeoutSeconds ?? DEFAULT_TIMEOUT_SECONDS;
   if (!Number.isInteger(timeoutSeconds) || timeoutSeconds < 1 || timeoutSeconds > MAX_TIMEOUT_SECONDS) {
     throw new ClineRunError("launch_failed", `timeoutSeconds must be an integer from 1 to ${MAX_TIMEOUT_SECONDS}.`);

@@ -12,11 +12,11 @@ Status values: `todo`, `in progress`, `done`, `blocked`, `skipped`.
 | 1.3 | Tests: overlapping runs, restore after last run | done | 2026-11-09 | 111 tests, 110 pass, 1 skipped; 6 new |
 | 1.R | Verify: code review | done | 2026-11-09 | Codex round 1 FAIL (P1 cleanup masking, P2 model-only provider) → fixed; round 2 PASS |
 | 1.L | Verify: live check against Cline | done | 2026-11-09 | Built server via MCP stdio: 2 concurrent `ask_cline` on `cline-free/nemotron-3.5-super-vl` → PONG1/PONG2, 2 runs in journal at once, selection restored, journal removed; only Cline's own token refresh changed |
-| 2.1 | provider + model required in all tools | todo | | |
-| 2.2 | Missing-model error lists free models | todo | | Depends on 3 |
-| 2.3 | Tests for mandatory model | todo | | |
-| 2.R | Verify: code review | todo | | |
-| 2.L | Verify: live check against Cline | todo | | |
+| 2.1 | provider + model required in all tools | done | 2026-11-09 | zod schema, `requireSelection` in runCline, ping before cache, `withProviderOverride`; saved-default code removed (D-16) |
+| 2.2 | Missing-model error lists free models | in progress | 2026-11-09 | Plain message now; the live free-model list is added in Stage 3 |
+| 2.3 | Tests for mandatory model | done | 2026-11-09 | 111 tests, 110 pass, 1 skipped |
+| 2.R | Verify: code review | done | 2026-11-09 | Codex round 1 FAIL (helper accepted one field) → fixed; round 2 PASS |
+| 2.L | Verify: live check against Cline | done | 2026-11-09 | Via MCP: `{}`, provider-only, model-only and ping without selection refused (-32602) in ≤4 ms, settings untouched; explicit `cline-free/nemotron-3.5-super-vl` → PONG, settings restored |
 | 3.1 | Load catalog from installed @cline/llms | todo | | |
 | 3.2 | `catalog_unavailable` on load failure | todo | | |
 | 3.3 | Tool `cline_list_models` | todo | | |

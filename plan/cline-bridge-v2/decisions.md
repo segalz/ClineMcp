@@ -80,6 +80,13 @@ touched before (`lastUsedProvider`, `model`, `reasoning`).
 run is marked finished so the next call restores. If the run itself failed, its own error is rethrown.
 **Why:** Codex review round 1 (P1). Previously a restore failure replaced a good result with an error.
 
+### D-16 — 2026-11-09 — Both fields required at every layer; no inference
+**Decision:** `provider` and `model` are required by the MCP schema, at `runCline` entry, in `cline_ping`
+before its cache, and in `withProviderOverride` before any settings access. The code that filled a missing
+field from saved settings (`resolveSavedSelection`, model-only provider inference) was removed.
+**Why:** D-02. Codex review round 1 found the helper still accepted one field, which is not reachable via MCP
+but contradicts the rule.
+
 ### D-13 — 2026-11-09 — Codex replaces Grok; Grok is out
 **Decision:** Pre-code analysis and `n.R` code review go to Codex (`codex_ask`, read-only sandbox).
 Fallback: AGY, then OpenCode. Grok is not used in this project. Supersedes the Grok parts of D-12.

@@ -1,5 +1,4 @@
-import { ClineRunError, runCline, redactSecrets, type ClineDependencies } from "./runner.js";
-import { readProviderSettingsSnapshot, resolveProviderSettingsPath, resolveSavedSelection } from "./settings.js";
+import { ClineRunError, requireSelection, runCline, redactSecrets, type ClineDependencies } from "./runner.js";
 import {
   buildEntry,
   classifyRunError,
@@ -35,20 +34,10 @@ export interface ClinePingResult {
   cached: boolean;
 }
 
-/** The provider/model a run would use, resolved read-only so the cache can be consulted first. */
-export async function resolvePingSelection(
-  input: { provider?: string; model?: string },
-  settingsPath: string
-): Promise<{ provider?: string; model?: string }> {
-  if (input.provider && input.model) return { provider: input.provider, model: input.model };
-  const saved = await resolveSavedSelection(settingsPath).catch(() => ({} as { provider?: string; model?: string }));
-  if (!input.provider && !input.model) return saved;
-  if (input.model) return { provider: saved.provider ?? "cline", model: input.model };
-  const snapshot = await readProviderSettingsSnapshot(settingsPath, input.provider).catch(() => undefined);
-  return {
-    provider: input.provider,
-    model: typeof snapshot?.originalModel === "string" ? snapshot.originalModel : undefined
-  };
+/** The explicit provider/model to check. Validated before the cache, so a missing pair never returns a cached default. */
+export function resolvePingSelection(input: { provider?: string; model?: string }): { provider: string; model: string } {
+  requireSelection(input);
+  return { provider: input.provider!, model: input.model! };
 }
 
 /**
@@ -71,7 +60,7 @@ export async function clinePing(
 ): Promise<ClinePingResult> {
   const wallNow = deps.wallNow ?? Date.now;
   const statusPath = resolveStatusPath(deps.statusPath);
-  const selection = await resolvePingSelection(input, resolveProviderSettingsPath(deps.providerSettingsPath));
+  const selection = resolvePingSelection(input);
 
   if (statusPath) {
     const cached = await readStatusEntry(statusPath, selection.provider, selection.model).catch(() => undefined);

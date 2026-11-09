@@ -415,28 +415,6 @@ export async function recoverProviderSettingsJournal(settingsPath: string, optio
   try { return await recoverLocked(settingsPath, options); }
   finally { await release(); }
 }
-const warnedJournals = new Set<string>();
-async function readSelectionJournal(settingsPath: string): Promise<RestoreJournal | undefined> {
-  try { return await readJournal(settingsPath); }
-  catch {
-    const key = getJournalPath(settingsPath);
-    if (!warnedJournals.has(key)) {
-      warnedJournals.add(key);
-      console.error("Invalid or unreadable settings restore journal; using saved settings: " + key);
-    }
-    return undefined;
-  }
-}
-export async function resolveSavedSelection(settingsPath: string): Promise<{ provider?: string; model?: string }> {
-  const priorJournal = await readSelectionJournal(settingsPath);
-  const data = await readSettings(settingsPath).catch(() => ({} as Record<string, any>));
-  const journal = priorJournal ?? await readSelectionJournal(settingsPath);
-  const base = journal?.base;
-  const provider = base ? base.originalLastUsedProvider : data.lastUsedProvider;
-  if (typeof provider !== "string" || PROHIBITED_NAMES.has(provider.toLowerCase())) return {};
-  const model = base && Object.hasOwn(base.providers, provider) ? base.providers[provider].originalModel : getProviderEntry(data, provider)?.settings?.model;
-  return typeof model === "string" ? { provider, model } : {};
-}
 /** Lock wait for the end-of-run cleanup. Independent of the run's deadline, which may already have passed. */
 export const RELEASE_LOCK_TIMEOUT_MS = 30_000;
 /**
@@ -449,7 +427,11 @@ export async function withProviderOverride<T extends { warnings?: string[] }>(
   input: { provider?: string; model?: string }, settingsPath: string, signal: AbortSignal | undefined,
   action: (selection: { provider?: string; model?: string }) => Promise<T>, options: MutexOptions & JournalOptions = {}
 ): Promise<T> {
-  if (!input.provider && !input.model) return action(await resolveSavedSelection(settingsPath));
+  // The bridge never runs on Cline's saved default selection (D-02): both fields are required here too,
+  // before any settings access, so no caller can have a missing field filled in from saved settings.
+  if (!input.provider || !input.model) {
+    throw new ClineRunError("launch_failed", "provider and model are required; the saved default selection is never used.");
+  }
   const now = options.nowFn ?? (() => performance.now());
   const wallNow = options.wallNow ?? Date.now;
   const acquire = options.acquireSettingsMutex ?? acquireSettingsMutex;
@@ -465,20 +447,16 @@ export async function withProviderOverride<T extends { warnings?: string[] }>(
       let existing: RestoreJournal | undefined;
       try { existing = await readJournal(settingsPath); }
       catch { throw new ClineRunError("settings_restore_failed", "Unable to read the settings restore journal."); }
-      // With live runs the file's lastUsedProvider may be another run's override; the journal holds the user's original.
-      // No original lastUsedProvider means Cline's own default, "cline" (as readProviderSettingsSnapshot assumes).
-      const requested = input.provider ?? (existing ? existing.base.originalLastUsedProvider ?? "cline" : undefined);
-      const snapshot = await readProviderSettingsSnapshot(settingsPath, requested);
+      const provider = input.provider;
+      const snapshot = await readProviderSettingsSnapshot(settingsPath, provider);
       if (snapshot.skipRestore) throw new ClineRunError("settings_restore_failed", "Unable to snapshot provider settings.");
-      const provider = snapshot.targetProvider ?? "cline";
       const journal: RestoreJournal = existing ?? { version: 2, base: baselineFrom(snapshot), runs: {} };
       // Capture a provider's original values only the first time any live run overrides it.
       if (!Object.hasOwn(journal.base.providers, provider)) journal.base.providers[provider] = providerBaselineFrom(snapshot);
       journal.runs[runId] = { pid: process.pid, provider, startedAtMs: wallNow() };
       if (release.verifyOwnership && !await release.verifyOwnership()) continue;
       await atomicWrite(journalPath, journal);
-      const originalModel = journal.base.providers[provider].originalModel;
-      selection = { provider: input.provider ?? provider, model: input.model ?? (typeof originalModel === "string" ? originalModel : undefined) };
+      selection = { provider, model: input.model };
     } finally { await release(); }
   }
   let result: T;

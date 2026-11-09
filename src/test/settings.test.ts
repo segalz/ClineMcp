@@ -68,7 +68,7 @@ test("overlapping overrides run concurrently; originals restored only after the 
   }, options);
   await entered.promise;
   // Model-only override while another run is live: provider comes from the user's original selection.
-  const second = withProviderOverride({ model: "two" }, file, undefined, async selection => {
+  const second = withProviderOverride({ provider: "default", model: "two" }, file, undefined, async selection => {
     secondSelection = selection; secondEntered.resolve(); await finishSecond.promise; return {};
   }, options);
   await secondEntered.promise;
@@ -85,25 +85,6 @@ test("overlapping overrides run concurrently; originals restored only after the 
   assert.equal(restored.providers.default.settings.model, "baseline");
   assert.equal(restored.providers.other, undefined);
   await assert.rejects(readFile(getJournalPath(file)), { code: "ENOENT" });
-}));
-
-test("model-only run while another run is live falls back to cline when there was no original lastUsedProvider", async () => fixture(async file => {
-  const mutex = fakeMutex();
-  const options = { acquireSettingsMutex: mutex.acquire };
-  await writeFile(file, JSON.stringify({ providers: {} }));
-  const entered = deferred();
-  const finish = deferred();
-  const first = withProviderOverride({ provider: "other", model: "one" }, file, undefined, async () => {
-    await writeFile(file, JSON.stringify({ lastUsedProvider: "other", providers: { other: { settings: { model: "one" } } } }));
-    entered.resolve(); await finish.promise; return {};
-  }, options);
-  await entered.promise;
-  let selection: unknown;
-  await withProviderOverride({ model: "two" }, file, undefined, async s => { selection = s; return {}; }, options);
-  assert.deepEqual(selection, { provider: "cline", model: "two" });
-  finish.resolve();
-  await first;
-  assert.equal((await json(file)).lastUsedProvider, undefined);
 }));
 
 test("cleanup failure returns the result with a warning and the next call restores", async () => fixture(async file => {
@@ -170,7 +151,7 @@ test("crash releases fake mutex but leaves journal: next override restores befor
   await writeRestoreJournal(getJournalPath(file), snapshot);
   await writeFile(file, JSON.stringify({ lastUsedProvider: "default", providers: { default: { settings: { model: "crashed", reasoning: "high", apiKey: "refreshed" } } } }));
   await mutex.crash();
-  await withProviderOverride({ model: "next" }, file, undefined, async () => {
+  await withProviderOverride({ provider: "default", model: "next" }, file, undefined, async () => {
     assert.equal((await json(file)).providers.default.settings.model, "baseline");
     assert.equal((await json(getJournalPath(file))).base.providers.default.originalModel, "baseline");
     return {};
@@ -185,7 +166,7 @@ test("failed recovery keeps journal and fails every override without overwriting
   const original = await readFile(getJournalPath(file), "utf8");
   await writeFile(file, "invalid json");
   for (let n = 0; n < 2; n++) {
-    await assert.rejects(withProviderOverride({ model: "next" }, file, undefined, async () => {
+    await assert.rejects(withProviderOverride({ provider: "default", model: "next" }, file, undefined, async () => {
       assert.fail("must not run"); return {};
     }), (err: unknown) => err instanceof ClineRunError && err.kind === "settings_restore_failed");
     assert.equal(await readFile(getJournalPath(file), "utf8"), original);
@@ -214,29 +195,18 @@ test("new entry removed on restore; mid-run refreshed auth preserved without mod
   }
 }));
 
-test("non-override during in-flight override runs immediately with journal baseline flags", async () => fixture(async file => {
-  const entered = deferred(); const finish = deferred();
-  const first = withProviderOverride({ model: "temporary" }, file, undefined, async () => {
-    const data = await json(file); data.providers.default.settings.model = "temporary";
-    await writeFile(file, JSON.stringify(data)); entered.resolve(); await finish.promise; return {};
-  });
-  await entered.promise;
-  try {
-    let flags: string[] = [];
-    const result = await runCline({ prompt: "hello" }, undefined, { deps: {
+test("runCline without both provider and model fails before touching settings, the mutex or Cline", async () => fixture(async file => {
+  const before = await readFile(file, "utf8");
+  for (const input of [{}, { provider: "default" }, { model: "baseline" }]) {
+    await assert.rejects(runCline({ prompt: "hello", ...input }, undefined, { deps: {
       providerSettingsPath: file, entryPath: "fake", access: async () => {},
-      acquireSettingsMutex: async () => { assert.fail("default must never acquire mutex"); },
-      spawn: ((_exe: string, args: string[]) => {
-        flags = args; const child = new EventEmitter() as any;
-        child.stdout = new EventEmitter(); child.stderr = new EventEmitter(); child.kill = () => {};
-        queueMicrotask(() => { child.stdout.emit("data", JSON.stringify({ type: "run_result", finishReason: "completed", text: "ok" })); child.emit("close", 0); });
-        return child;
-      }) as any
-    } });
-    assert.equal(result.text, "ok");
-    assert.equal(flags[flags.indexOf("-P") + 1], "default");
-    assert.equal(flags[flags.indexOf("-m") + 1], "baseline");
-  } finally { finish.resolve(); await first; }
+      acquireSettingsMutex: async () => { assert.fail("must not acquire the mutex"); },
+      spawn: (() => { assert.fail("must not launch Cline"); }) as any
+    } }), (err: unknown) => err instanceof ClineRunError && err.kind === "launch_failed" && err.attempts === 0 &&
+      /provider and model are required/.test(err.message));
+  }
+  assert.equal(await readFile(file, "utf8"), before);
+  await assert.rejects(readFile(getJournalPath(file)), { code: "ENOENT" });
 }));
 
 test("startup restores orphan journal, deletes unchanged journal, and retains failed recovery", async () => fixture(async file => {
@@ -288,41 +258,31 @@ test("real OS mutex timeout is clamped to remaining deadline and abort cancels w
 
 test("end-of-run restore failure returns a warning, retains journal and blocks subsequent override", async () => fixture(async file => {
   const mutex = fakeMutex();
-  const result = await withProviderOverride<{ warnings?: string[] }>({ model: "temporary" }, file, undefined, async () => {
+  const result = await withProviderOverride<{ warnings?: string[] }>({ provider: "default", model: "temporary" }, file, undefined, async () => {
     await writeFile(file, "broken during run"); return {};
   }, { acquireSettingsMutex: mutex.acquire });
   assert.match(result.warnings?.[0] ?? "", /not restored yet/);
   const original = await readFile(getJournalPath(file), "utf8");
-  await assert.rejects(withProviderOverride({ model: "next" }, file, undefined, async () => {
+  await assert.rejects(withProviderOverride({ provider: "default", model: "next" }, file, undefined, async () => {
     assert.fail("unrecovered journal must block execution"); return {};
   }, { acquireSettingsMutex: mutex.acquire }), (err: unknown) => err instanceof ClineRunError && err.kind === "settings_restore_failed");
   assert.equal(await readFile(getJournalPath(file), "utf8"), original);
 }));
 
-test("default selection uses saved flags, or journal's original provider when override targets another provider", async () => fixture(async file => {
+test("withProviderOverride without both provider and model is rejected before any settings access", async () => fixture(async file => {
   const forbiddenMutex: typeof acquireSettingsMutex = async () => { throw new Error("unexpected mutex"); };
-  await withProviderOverride({}, file, undefined, async selection => {
-    assert.deepEqual(selection, { provider: "default", model: "baseline" }); return {};
-  }, { acquireSettingsMutex: forbiddenMutex });
-  const snapshot = await readProviderSettingsSnapshot(file, "other");
-  await writeRestoreJournal(getJournalPath(file), snapshot);
-  const data = await json(file); data.lastUsedProvider = "other";
-  data.providers.other = { settings: { model: "temporary" } };
-  await writeFile(file, JSON.stringify(data));
-  await withProviderOverride({}, file, undefined, async selection => {
-    assert.deepEqual(selection, { provider: "default", model: "baseline" }); return {};
-  }, { acquireSettingsMutex: forbiddenMutex });
-  await recoverProviderSettingsJournal(file);
-  await writeFile(file, JSON.stringify({ lastUsedProvider: "unknown" }));
-  await withProviderOverride({}, file, undefined, async selection => {
-    assert.deepEqual(selection, {}); return {};
-  }, { acquireSettingsMutex: forbiddenMutex });
+  for (const input of [{}, { provider: "default" }, { model: "baseline" }]) {
+    await assert.rejects(withProviderOverride(input, file, undefined, async () => {
+      assert.fail("must not run on the saved default"); return {};
+    }, { acquireSettingsMutex: forbiddenMutex }), (err: unknown) => err instanceof ClineRunError && err.kind === "launch_failed");
+  }
+  await assert.rejects(readFile(getJournalPath(file)), { code: "ENOENT" });
 }));
 
 test("malformed restore journal is retained and cannot be overwritten", async () => fixture(async file => {
   await writeFile(getJournalPath(file), "truncated journal");
   assert.equal(await recoverProviderSettingsJournal(file), "failed");
-  await assert.rejects(withProviderOverride({ model: "next" }, file, undefined, async () => ({})),
+  await assert.rejects(withProviderOverride({ provider: "default", model: "next" }, file, undefined, async () => ({})),
     (err: unknown) => err instanceof ClineRunError && err.kind === "settings_restore_failed");
   assert.equal(await readFile(getJournalPath(file), "utf8"), "truncated journal");
 }));
@@ -357,18 +317,9 @@ test("built stdio bridge startup restores a temporary journal and logs failed re
 
 
 
-test("malformed journal lets defaults use saved flags, logs once, and blocks overrides with a typed error", async t => fixture(async file => {
-  const warnings: string[] = [];
-  t.mock.method(console, "error", (message: string) => warnings.push(message));
+test("malformed journal blocks overrides with a typed error and is kept", async () => fixture(async file => {
   await writeFile(getJournalPath(file), "malformed");
-  for (let i = 0; i < 2; i++) {
-    await withProviderOverride({}, file, undefined, async selection => {
-      assert.deepEqual(selection, { provider: "default", model: "baseline" }); return {};
-    });
-  }
-  assert.equal(warnings.length, 1);
-  assert.match(warnings[0], /using saved settings/);
-  await assert.rejects(withProviderOverride({ model: "temporary" }, file, undefined, async () => {
+  await assert.rejects(withProviderOverride({ provider: "default", model: "temporary" }, file, undefined, async () => {
     assert.fail("override must not run"); return {};
   }), (err: unknown) => err instanceof ClineRunError && err.kind === "settings_restore_failed");
   assert.equal(await readFile(getJournalPath(file), "utf8"), "malformed");
@@ -384,11 +335,11 @@ test("journal with a removed settings file is unchanged and deleted", async () =
   await assert.rejects(readFile(file), { code: "ENOENT" });
 }));
 
-test("model-only override without lastUsedProvider journals cline and removes its temporary entry", async () => fixture(async file => {
+test("override of a provider with no saved entry journals it and removes its temporary entry", async () => fixture(async file => {
   for (const missingFile of [false, true]) {
     if (missingFile) await unlink(file);
     else await writeFile(file, JSON.stringify({ providers: {} }));
-    await withProviderOverride({ model: "temporary" }, file, undefined, async selection => {
+    await withProviderOverride({ provider: "cline", model: "temporary" }, file, undefined, async selection => {
       assert.deepEqual(selection, { provider: "cline", model: "temporary" });
       const journal = await json(getJournalPath(file));
       assert.deepEqual(Object.keys(journal.base.providers), ["cline"]);
@@ -406,7 +357,7 @@ test("model-only override without lastUsedProvider journals cline and removes it
 test("non-string model and reasoning values survive journal round trip and restoration", async () => fixture(async file => {
   for (const value of [null, 42, false, { custom: [1, "two"] }]) {
     await writeFile(file, JSON.stringify({ lastUsedProvider: "default", providers: { default: { settings: { model: value, reasoning: value } } } }));
-    await withProviderOverride({ model: "temporary" }, file, undefined, async () => {
+    await withProviderOverride({ provider: "default", model: "temporary" }, file, undefined, async () => {
       const base = (await json(getJournalPath(file))).base.providers.default;
       assert.equal(base.hadModel, true); assert.equal(base.hadReasoning, true);
       assert.deepEqual(base.originalModel, value); assert.deepEqual(base.originalReasoning, value);
@@ -446,7 +397,7 @@ test("real POSIX socket path replacement loses ownership and prevents journal cr
     assert.equal(await writeRestoreJournal(getJournalPath(file), snapshot, release.verifyOwnership), false);
     await assert.rejects(readFile(getJournalPath(file)), { code: "ENOENT" });
     let acquisitions = 0;
-    await withProviderOverride({ model: "temporary" }, file, undefined, async () => {
+    await withProviderOverride({ provider: "default", model: "temporary" }, file, undefined, async () => {
       assert.equal(acquisitions, 2, "must reacquire after rejecting the replaced endpoint");
       assert.ok(await readFile(getJournalPath(file)));
       return {};
@@ -470,7 +421,7 @@ test("ownership lost before journal creation releases and reacquires before runn
   let releases = 0;
   let checks = 0;
   let actionRan = false;
-  await withProviderOverride({ model: "temporary" }, file, undefined, async () => {
+  await withProviderOverride({ provider: "default", model: "temporary" }, file, undefined, async () => {
     actionRan = true;
     // Registration released the lost lock, reacquired, and released again before the run.
     assert.equal(attempts, 2);
@@ -496,7 +447,7 @@ test("ownership lost before journal creation releases and reacquires before runn
 
 test("repeated ownership loss before journal creation respects the original deadline", async () => fixture(async file => {
   let now = 0; let releases = 0;
-  await assert.rejects(withProviderOverride({ model: "temporary" }, file, undefined, async () => {
+  await assert.rejects(withProviderOverride({ provider: "default", model: "temporary" }, file, undefined, async () => {
     assert.fail("unowned mutex must not run"); return {};
   }, { deadline: 10, nowFn: () => now, acquireSettingsMutex: async () => {
     const release: ReleaseSettingsMutex = async () => { releases++; };

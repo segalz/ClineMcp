@@ -9,13 +9,13 @@ import { PROHIBITED_NAMES, resolveProviderSettingsPath, recoverProviderSettingsJ
 
 const server = new McpServer({ name: "cline-local-bridge", version: "1.0.0" });
 
+// Required on every tool: the bridge never runs on Cline's saved default selection.
 const providerModelSchema = z
   .string()
   .regex(/^[A-Za-z0-9._:/@-]{1,120}$/)
   .refine((val) => !PROHIBITED_NAMES.has(val.toLowerCase()), {
     message: "Prohibited provider or model name"
-  })
-  .optional();
+  });
 
 export { formatErrorAsText };
 

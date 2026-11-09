@@ -89,7 +89,7 @@ test("non-zero exit with tails", async () => {
   await assert.rejects(
     async () => {
       await runCline(
-        { prompt: "hello" },
+        { provider: "test-provider", model: "test-model", prompt: "hello" },
         undefined,
         {
           deps: {
@@ -136,7 +136,7 @@ test("completed run_result + exit 1 → success + warning", async () => {
   };
 
   const result = await runCline(
-    { prompt: "test" },
+    { provider: "test-provider", model: "test-model", prompt: "test" },
     undefined,
     {
       deps: {
@@ -176,7 +176,7 @@ test("done-only + exit 1 → success + warning", async () => {
   };
 
   const result = await runCline(
-    { prompt: "test" },
+    { provider: "test-provider", model: "test-model", prompt: "test" },
     undefined,
     {
       deps: {
@@ -225,7 +225,7 @@ test("overloaded → one retry then success", async () => {
   };
 
   const result = await runCline(
-    { prompt: "test" },
+    { provider: "test-provider", model: "test-model", prompt: "test" },
     undefined,
     {
       deps: {
@@ -260,7 +260,7 @@ test("overloaded twice → transient_provider_error with exactly 2 attempts", as
   await assert.rejects(
     async () => {
       await runCline(
-        { prompt: "test" },
+        { provider: "test-provider", model: "test-model", prompt: "test" },
         undefined,
         {
           deps: {
@@ -301,7 +301,7 @@ test("non-transient → no retry", async () => {
   await assert.rejects(
     async () => {
       await runCline(
-        { prompt: "test" },
+        { provider: "test-provider", model: "test-model", prompt: "test" },
         undefined,
         {
           deps: {
@@ -338,7 +338,7 @@ test("timeout message with elapsed", async () => {
   await assert.rejects(
     async () => {
       await runCline(
-        { prompt: "test", timeoutSeconds: 5 },
+        { provider: "test-provider", model: "test-model", prompt: "test", timeoutSeconds: 5 },
         undefined,
         {
           deps: {
@@ -369,7 +369,7 @@ test("missing entry → cline_updating", async () => {
   await assert.rejects(
     async () => {
       await runCline(
-        { prompt: "test" },
+        { provider: "test-provider", model: "test-model", prompt: "test" },
         undefined,
         {
           deps: {
@@ -413,7 +413,7 @@ test("env has CLINE_NO_AUTO_UPDATE=1", async () => {
   };
 
   await runCline(
-    { prompt: "test" },
+    { provider: "test-provider", model: "test-model", prompt: "test" },
     undefined,
     {
       deps: {
@@ -603,7 +603,7 @@ test("stdout containing durationMs:512 or inputTokens:503 on non-transient failu
   await assert.rejects(
     async () => {
       await runCline(
-        { prompt: "test" },
+        { provider: "test-provider", model: "test-model", prompt: "test" },
         undefined,
         {
           deps: {
@@ -682,7 +682,7 @@ test("provider block created by Cline: removes temporary model and preserves aut
 
   try {
     await runCline(
-      { prompt: "test", provider: "new-provider" },
+      { prompt: "test", provider: "new-provider", model: "created-model" },
       undefined,
       {
         deps: {
@@ -732,7 +732,7 @@ test("MODULE_NOT_FOUND does not retry if canRetry returns false", async () => {
   await assert.rejects(
     async () => {
       await runCline(
-        { prompt: "test" },
+        { provider: "test-provider", model: "test-model", prompt: "test" },
         undefined,
         {
           canRetry: () => false,
@@ -772,7 +772,7 @@ test("MODULE_NOT_FOUND in stderr does not prevent returning completed result", a
   };
 
   const result = await runCline(
-    { prompt: "test" },
+    { provider: "test-provider", model: "test-model", prompt: "test" },
     undefined,
     {
       deps: {
@@ -801,7 +801,7 @@ test("abort signal prevents attempt from starting", async () => {
   await assert.rejects(
     async () => {
       await runCline(
-        { prompt: "test" },
+        { provider: "test-provider", model: "test-model", prompt: "test" },
         controller.signal,
         {
           deps: {
@@ -837,7 +837,7 @@ test("spawn error event returns launch_failed with error code", async () => {
   await assert.rejects(
     async () => {
       await runCline(
-        { prompt: "test" },
+        { provider: "test-provider", model: "test-model", prompt: "test" },
         undefined,
         {
           deps: {
@@ -867,7 +867,7 @@ test("timeout with timeoutSeconds > 120 retries within budget", async () => {
   await assert.rejects(
     async () => {
       await runCline(
-        { prompt: "test", timeoutSeconds: 150 },
+        { provider: "test-provider", model: "test-model", prompt: "test", timeoutSeconds: 150 },
         undefined,
         {
           deps: {
@@ -901,7 +901,7 @@ test("timeout with insufficient budget does not retry", async () => {
   await assert.rejects(
     async () => {
       await runCline(
-        { prompt: "test", timeoutSeconds: 40 },
+        { provider: "test-provider", model: "test-model", prompt: "test", timeoutSeconds: 40 },
         undefined,
         {
           deps: {
@@ -984,7 +984,7 @@ test("exit code 0 with transient overload error retries once then succeeds", asy
   };
 
   const result = await runCline(
-    { prompt: "hello" },
+    { provider: "test-provider", model: "test-model", prompt: "hello" },
     undefined,
     {
       deps: {
@@ -1024,7 +1024,7 @@ test("exit code 0 with non-transient error in run_result is not retried and repo
   await assert.rejects(
     async () => {
       await runCline(
-        { prompt: "hello" },
+        { provider: "test-provider", model: "test-model", prompt: "hello" },
         undefined,
         {
           deps: {
@@ -1070,7 +1070,7 @@ test("stderr info JSON with rate limit mention and non-transient exit is NOT ret
   await assert.rejects(
     async () => {
       await runCline(
-        { prompt: "hello" },
+        { provider: "test-provider", model: "test-model", prompt: "hello" },
         undefined,
         {
           deps: {
@@ -1138,7 +1138,7 @@ test("redacts full output before taking tail to preserve tokens near tail bounda
   await assert.rejects(
     async () => {
       await runCline(
-        { prompt: "test" },
+        { provider: "test-provider", model: "test-model", prompt: "test" },
         undefined,
         {
           deps: {
@@ -1170,7 +1170,7 @@ test("child killed by outside signal without completed result is treated as non-
   await assert.rejects(
     async () => {
       await runCline(
-        { prompt: "test" },
+        { provider: "test-provider", model: "test-model", prompt: "test" },
         undefined,
         {
           deps: {
@@ -1211,7 +1211,7 @@ test("child killed by outside signal with completed result succeeds with warning
   };
 
   const result = await runCline(
-    { prompt: "test" },
+    { provider: "test-provider", model: "test-model", prompt: "test" },
     undefined,
     {
       deps: {
@@ -1241,7 +1241,7 @@ test("attempt promise settles on child error even if close never fires", async (
   await assert.rejects(
     async () => {
       await runCline(
-        { prompt: "test" },
+        { provider: "test-provider", model: "test-model", prompt: "test" },
         undefined,
         {
           deps: {
@@ -1285,7 +1285,7 @@ test("mock child that emits exit but never close still settles via grace period 
   };
 
   const result = await runCline(
-    { prompt: "test" },
+    { provider: "test-provider", model: "test-model", prompt: "test" },
     undefined,
     {
       deps: {
@@ -1352,7 +1352,7 @@ test("extractedMessage from run_result error text has secrets redacted", async (
   await assert.rejects(
     async () => {
       await runCline(
-        { prompt: "test" },
+        { provider: "test-provider", model: "test-model", prompt: "test" },
         undefined,
         {
           deps: {
@@ -1407,7 +1407,7 @@ test("plain-stderr classification for transient errors: Overloaded, Too many req
     };
 
     const res = await runCline(
-      { prompt: "test" },
+      { provider: "test-provider", model: "test-model", prompt: "test" },
       undefined,
       {
         deps: {
@@ -1515,7 +1515,7 @@ test("cancellation includes captured stdout/stderr tails and exit status", async
   await assert.rejects(
     async () => {
       await runCline(
-        { prompt: "test" },
+        { provider: "test-provider", model: "test-model", prompt: "test" },
         controller.signal,
         {
           deps: {
@@ -1555,7 +1555,7 @@ test("timeout reports numeric exit code when child exits with a code", async () 
   await assert.rejects(
     async () => {
       await runCline(
-        { prompt: "test", timeoutSeconds: 5 },
+        { provider: "test-provider", model: "test-model", prompt: "test", timeoutSeconds: 5 },
         undefined,
         {
           deps: {
@@ -1659,7 +1659,7 @@ test("retry is skipped if remaining budget < minRetryBudgetMs", async () => {
   await assert.rejects(
     async () => {
       await runCline(
-        { prompt: "test", timeoutSeconds: 30 },
+        { provider: "test-provider", model: "test-model", prompt: "test", timeoutSeconds: 30 },
         undefined,
         {
           deps: {
@@ -1753,7 +1753,7 @@ test("kill and settlement grace use remaining time when termination starts", asy
   const clock = fakeClock();
   let treeKilledAt: number | undefined;
   let calls = 0;
-  const work = runCline({ prompt: "test" }, undefined, { deps: {
+  const work = runCline({ provider: "test-provider", model: "test-model", prompt: "test" }, undefined, { deps: {
     platform: "linux", entryPath: "fake", access: async () => {}, now: clock.now,
     setTimeout: clock.schedule, clearTimeout: clock.clear, sleep: clock.sleep,
     totalBudgetMs: 100, minRetryBudgetMs: 50, timeoutMs: 10,
@@ -1771,7 +1771,7 @@ test("kill and settlement grace use remaining time when termination starts", asy
 
 test("exit-without-close grace is clamped when exit arrives near the deadline", async () => {
   const clock = fakeClock();
-  const work = runCline({ prompt: "test" }, undefined, { deps: {
+  const work = runCline({ provider: "test-provider", model: "test-model", prompt: "test" }, undefined, { deps: {
     entryPath: "fake", access: async () => {}, now: clock.now,
     setTimeout: clock.schedule, clearTimeout: clock.clear, sleep: clock.sleep,
     totalBudgetMs: 100, minRetryBudgetMs: 1000, closeGracePeriodMs: 500,
@@ -1792,7 +1792,7 @@ test("exit-without-close grace is clamped when exit arrives near the deadline", 
 test("retry backoff preserves minimum retry budget within the same deadline", async () => {
   const clock = fakeClock();
   const spawnTimes: number[] = [];
-  const work = runCline({ prompt: "test" }, undefined, { deps: {
+  const work = runCline({ provider: "test-provider", model: "test-model", prompt: "test" }, undefined, { deps: {
     entryPath: "fake", access: async () => {}, now: clock.now,
     setTimeout: clock.schedule, clearTimeout: clock.clear, sleep: clock.sleep,
     totalBudgetMs: 100, minRetryBudgetMs: 30, backoffMs: 200,
@@ -1819,7 +1819,7 @@ test("retry backoff preserves minimum retry budget within the same deadline", as
 test("attempt timeout is calculated after entry access consumes global budget", async () => {
   const clock = fakeClock();
   let flags: string[] = [];
-  const work = runCline({ prompt: "test", timeoutSeconds: 100 }, undefined, { deps: {
+  const work = runCline({ provider: "test-provider", model: "test-model", prompt: "test", timeoutSeconds: 100 }, undefined, { deps: {
     entryPath: "fake", access: async () => { clock.advance(70_000); }, now: clock.now,
     setTimeout: clock.schedule, clearTimeout: clock.clear, sleep: clock.sleep,
     totalBudgetMs: 100_000, minRetryBudgetMs: 15_000,
@@ -1835,7 +1835,7 @@ test("attempt timeout is calculated after entry access consumes global budget", 
 
 test("retry permission check cannot consume the minimum retry budget and still launch again", async () => {
   const clock = fakeClock(); let calls = 0;
-  const work = runCline({ prompt: "test" }, undefined, {
+  const work = runCline({ provider: "test-provider", model: "test-model", prompt: "test" }, undefined, {
     canRetry: async () => { clock.advance(80); return true; },
     deps: {
       entryPath: "fake", access: async () => {}, now: clock.now,
@@ -1864,7 +1864,7 @@ test("POSIX default tree kill signals the negative process-group PID", t => {
 test("Windows kills the live tree first and never kills the root separately", async () => {
   const clock = fakeClock(); const calls: string[] = [];
   let child: any;
-  const work = runCline({ prompt: "test" }, undefined, { deps: {
+  const work = runCline({ provider: "test-provider", model: "test-model", prompt: "test" }, undefined, { deps: {
     platform: "win32", entryPath: "fake", access: async () => {}, now: clock.now,
     setTimeout: clock.schedule, clearTimeout: clock.clear,
     totalBudgetMs: 100, timeoutMs: 10, minRetryBudgetMs: 1000,
@@ -1885,7 +1885,7 @@ test("Windows kills the live tree first and never kills the root separately", as
 
 test("POSIX spawns a process group then sends TERM and KILL to the injectable tree killer", async () => {
   const clock = fakeClock(); const signals: Array<NodeJS.Signals | undefined> = [];
-  const work = runCline({ prompt: "test" }, undefined, { deps: {
+  const work = runCline({ provider: "test-provider", model: "test-model", prompt: "test" }, undefined, { deps: {
     platform: "linux", entryPath: "fake", access: async () => {}, now: clock.now,
     setTimeout: clock.schedule, clearTimeout: clock.clear,
     totalBudgetMs: 100, timeoutMs: 10, minRetryBudgetMs: 1000,
@@ -1905,8 +1905,8 @@ test("POSIX spawns a process group then sends TERM and KILL to the injectable tr
 test("POSIX kills the remaining group once after root exit even when stdio never closes", async () => {
   const clock = fakeClock(); const signals: Array<NodeJS.Signals | undefined> = [];
   let child: any;
-  const work = runCline({ prompt: "test" }, undefined, { deps: {
-    platform: "linux", entryPath: "fake", access: async () => {}, now: clock.now,
+  const work = runCline({ provider: "test-provider", model: "test-model", prompt: "test" }, undefined, { deps: {
+    platform: "linux", entryPath: "fake", access: async () => {}, acquireSettingsMutex: async () => async () => {}, now: clock.now,
     setTimeout: clock.schedule, clearTimeout: clock.clear,
     totalBudgetMs: 100, timeoutMs: 10, minRetryBudgetMs: 1000,
     killGracePeriodMs: 10, settlementDeadlineMs: 30, closeGracePeriodMs: 100,
@@ -1924,8 +1924,8 @@ test("POSIX kills the remaining group once after root exit even when stdio never
 
 test("timeout after an observed exit never signals the exited PID", async () => {
   const clock = fakeClock();
-  const work = runCline({ prompt: "test" }, undefined, { deps: {
-    platform: "win32", entryPath: "fake", access: async () => {}, now: clock.now,
+  const work = runCline({ provider: "test-provider", model: "test-model", prompt: "test" }, undefined, { deps: {
+    platform: "win32", entryPath: "fake", access: async () => {}, acquireSettingsMutex: async () => async () => {}, now: clock.now,
     setTimeout: clock.schedule, clearTimeout: clock.clear,
     totalBudgetMs: 100, timeoutMs: 10, minRetryBudgetMs: 1000, closeGracePeriodMs: 100,
     killTree: () => assert.fail("PID could already have been reused"),
@@ -1940,8 +1940,8 @@ test("timeout after an observed exit never signals the exited PID", async () => 
 
 test("POSIX kills the group once after normal root exit, without killing the exited root", async () => {
   const clock = fakeClock(); const signals: Array<NodeJS.Signals | undefined> = [];
-  const work = runCline({ prompt: "test" }, undefined, { deps: {
-    platform: "linux", entryPath: "fake", access: async () => {}, now: clock.now,
+  const work = runCline({ provider: "test-provider", model: "test-model", prompt: "test" }, undefined, { deps: {
+    platform: "linux", entryPath: "fake", access: async () => {}, acquireSettingsMutex: async () => async () => {}, now: clock.now,
     setTimeout: clock.schedule, clearTimeout: clock.clear,
     totalBudgetMs: 100, minRetryBudgetMs: 1000, closeGracePeriodMs: 10,
     killTree: (pid, signal) => { assert.equal(pid, 4321); signals.push(signal); },
