@@ -67,6 +67,19 @@ checks; it is never called directly during development.
 while that bridge is broken.
 **Note:** Overrides the global "Cline first" analysis route for this project only.
 
+### D-14 — 2026-11-09 — Journal v2 with run IDs; restore after the last live run
+**Decision:** The restore journal holds the user's original values (`base`) and a map of active runs
+(`runId → pid, provider, startedAtMs`). A run is dead when its PID is gone, it is older than 6 h, or this
+process marked it finished. The baseline is restored only when no live run remains. The end-of-run lock has
+its own 30 s timeout, independent of the run deadline.
+**Why:** A counter cannot tell which run crashed (Codex analysis). The restore keeps all three fields it
+touched before (`lastUsedProvider`, `model`, `reasoning`).
+
+### D-15 — 2026-11-09 — A cleanup failure never hides the run's result
+**Decision:** If unregistering fails after a successful run, the result is returned with a warning and the
+run is marked finished so the next call restores. If the run itself failed, its own error is rethrown.
+**Why:** Codex review round 1 (P1). Previously a restore failure replaced a good result with an error.
+
 ### D-13 — 2026-11-09 — Codex replaces Grok; Grok is out
 **Decision:** Pre-code analysis and `n.R` code review go to Codex (`codex_ask`, read-only sandbox).
 Fallback: AGY, then OpenCode. Grok is not used in this project. Supersedes the Grok parts of D-12.

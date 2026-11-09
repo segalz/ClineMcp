@@ -1724,13 +1724,17 @@ test("one deadline includes mutex wait, hung child, kill and settlement grace", 
   let killedAt: number | undefined;
   let spawnAt: number | undefined;
   let calls = 0;
+  let acquisitions = 0;
   const work = runCline({ prompt: "test", provider: "fake", model: "fake" }, undefined, { deps: {
     entryPath: "fake", access: async () => {}, providerSettingsPath: path.join(isolatedSettingsDir, "deadline.json"),
     now: clock.now, setTimeout: clock.schedule, clearTimeout: clock.clear, sleep: clock.sleep,
     totalBudgetMs: 100, minRetryBudgetMs: 15,
     closeGracePeriodMs: 500, killGracePeriodMs: 500, settlementDeadlineMs: 1500,
     acquireSettingsMutex: async (_file, _signal, opts) => {
-      assert.equal(opts?.deadline, 100); await clock.sleep(70); return async () => {};
+      // Registration shares the run deadline; the end-of-run release has its own lock timeout.
+      if (++acquisitions === 1) { assert.equal(opts?.deadline, 100); await clock.sleep(70); }
+      else assert.equal(opts?.deadline, undefined);
+      return async () => {};
     },
     killTree: () => { killedAt = clock.now(); },
     spawn: (() => {
@@ -1742,6 +1746,7 @@ test("one deadline includes mutex wait, hung child, kill and settlement grace", 
   await assert.rejects(clock.finish(work), (err: unknown) => err instanceof ClineRunError && err.kind === "timeout");
   assert.equal(calls, 1); assert.equal(spawnAt, 70);
   assert.equal(killedAt, 100); assert.equal(clock.now(), 100);
+  assert.equal(acquisitions, 2);
 });
 
 test("kill and settlement grace use remaining time when termination starts", async () => {

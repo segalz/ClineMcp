@@ -5,13 +5,13 @@ Status values: `todo`, `in progress`, `done`, `blocked`, `skipped`.
 
 | Step | Title | Status | Date | Notes |
 |---|---|---|---|---|
-| 0.1 | Clean baseline on a work branch | todo | | Uncommitted: ping.ts, status.ts, index.ts, runner.ts, tests |
-| 0.2 | Record current test result | todo | | |
-| 1.1 | Short lock at start/end with active-run counter | todo | | |
-| 1.2 | Crash-safe journal and stale counter recovery | todo | | |
-| 1.3 | Tests: overlapping runs, restore after last run | todo | | |
-| 1.R | Verify: code review | todo | | |
-| 1.L | Verify: live check against Cline | todo | | |
+| 0.1 | Clean baseline on a work branch | done | 2026-11-09 | Prior work committed+pushed to main (b573b95, 2879ea3); branch `bridge-v2` |
+| 0.2 | Record current test result | done | 2026-11-09 | `npm test`: 106 tests, 105 pass, 1 skipped, 0 fail |
+| 1.1 | Short lock at start/end with active-run counter | done | 2026-11-09 | Journal v2: base + runs {runId: pid, provider, startedAtMs} (D-14) |
+| 1.2 | Crash-safe journal and stale counter recovery | done | 2026-11-09 | Dead PID / >6 h runs pruned; v1 journals still recovered |
+| 1.3 | Tests: overlapping runs, restore after last run | done | 2026-11-09 | 111 tests, 110 pass, 1 skipped; 6 new |
+| 1.R | Verify: code review | done | 2026-11-09 | Codex round 1 FAIL (P1 cleanup masking, P2 model-only provider) → fixed; round 2 PASS |
+| 1.L | Verify: live check against Cline | done | 2026-11-09 | Built server via MCP stdio: 2 concurrent `ask_cline` on `cline-free/nemotron-3.5-super-vl` → PONG1/PONG2, 2 runs in journal at once, selection restored, journal removed; only Cline's own token refresh changed |
 | 2.1 | provider + model required in all tools | todo | | |
 | 2.2 | Missing-model error lists free models | todo | | Depends on 3 |
 | 2.3 | Tests for mandatory model | todo | | |

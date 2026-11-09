@@ -51,24 +51,116 @@ function fakeMutex() {
   return { acquire, crash: async () => { await owner?.(); } };
 }
 
-test("two simulated bridge processes serialize overrides", async () => fixture(async file => {
+test("overlapping overrides run concurrently; originals restored only after the last run ends", async () => fixture(async file => {
+  const mutex = fakeMutex();
+  const options = { acquireSettingsMutex: mutex.acquire, lockTimeoutMs: 50 };
+  const entered = deferred();
+  const finishFirst = deferred();
+  const finishSecond = deferred();
+  const secondEntered = deferred();
+  let secondSelection: unknown;
+  const first = withProviderOverride({ provider: "other", model: "one" }, file, undefined, async () => {
+    // Simulate the CLI writing its selection back, as Cline 3.0.74 does.
+    await writeFile(file, JSON.stringify({ lastUsedProvider: "other", providers: {
+      default: { settings: { model: "baseline", reasoning: "low", apiKey: "never-journal-this" } },
+      other: { settings: { model: "one" } } } }));
+    entered.resolve(); await finishFirst.promise; return {};
+  }, options);
+  await entered.promise;
+  // Model-only override while another run is live: provider comes from the user's original selection.
+  const second = withProviderOverride({ model: "two" }, file, undefined, async selection => {
+    secondSelection = selection; secondEntered.resolve(); await finishSecond.promise; return {};
+  }, options);
+  await secondEntered.promise;
+  assert.deepEqual(secondSelection, { provider: "default", model: "two" });
+  assert.equal(Object.keys((await json(getJournalPath(file))).runs).length, 2);
+  finishFirst.resolve();
+  await first;
+  assert.equal((await json(file)).lastUsedProvider, "other", "must not restore while a run is live");
+  assert.equal(Object.keys((await json(getJournalPath(file))).runs).length, 1);
+  finishSecond.resolve();
+  await second;
+  const restored = await json(file);
+  assert.equal(restored.lastUsedProvider, "default");
+  assert.equal(restored.providers.default.settings.model, "baseline");
+  assert.equal(restored.providers.other, undefined);
+  await assert.rejects(readFile(getJournalPath(file)), { code: "ENOENT" });
+}));
+
+test("model-only run while another run is live falls back to cline when there was no original lastUsedProvider", async () => fixture(async file => {
   const mutex = fakeMutex();
   const options = { acquireSettingsMutex: mutex.acquire };
+  await writeFile(file, JSON.stringify({ providers: {} }));
   const entered = deferred();
   const finish = deferred();
-  let secondStarted = false;
-  const first = withProviderOverride({ model: "one" }, file, undefined, async () => {
+  const first = withProviderOverride({ provider: "other", model: "one" }, file, undefined, async () => {
+    await writeFile(file, JSON.stringify({ lastUsedProvider: "other", providers: { other: { settings: { model: "one" } } } }));
     entered.resolve(); await finish.promise; return {};
   }, options);
   await entered.promise;
-  const second = withProviderOverride({ model: "two" }, file, undefined, async () => {
-    secondStarted = true; return {};
-  }, options);
-  await delay(10);
-  assert.equal(secondStarted, false);
+  let selection: unknown;
+  await withProviderOverride({ model: "two" }, file, undefined, async s => { selection = s; return {}; }, options);
+  assert.deepEqual(selection, { provider: "cline", model: "two" });
   finish.resolve();
-  await Promise.all([first, second]);
-  assert.equal(secondStarted, true);
+  await first;
+  assert.equal((await json(file)).lastUsedProvider, undefined);
+}));
+
+test("cleanup failure returns the result with a warning and the next call restores", async () => fixture(async file => {
+  const mutex = fakeMutex();
+  let failNextAcquire = false;
+  const acquire: typeof acquireSettingsMutex = async (f, s, o) => {
+    if (failNextAcquire) { failNextAcquire = false; throw new ClineRunError("settings_lock_timeout", "held elsewhere"); }
+    return mutex.acquire(f, s, o);
+  };
+  const result = await withProviderOverride<{ warnings?: string[]; value: number }>({ provider: "default", model: "temp" }, file, undefined, async () => {
+    await writeFile(file, JSON.stringify({ lastUsedProvider: "default", providers: { default: { settings: { model: "temp" } } } }));
+    failNextAcquire = true;
+    return { value: 7 };
+  }, { acquireSettingsMutex: acquire });
+  assert.equal(result.value, 7);
+  assert.match(result.warnings?.[0] ?? "", /not restored yet/);
+  assert.equal((await json(file)).providers.default.settings.model, "temp");
+  assert.equal(await recoverProviderSettingsJournal(file, { acquireSettingsMutex: mutex.acquire }), "restored");
+  assert.equal((await json(file)).providers.default.settings.model, "baseline");
+}));
+
+test("cleanup failure never masks the action's own error", async () => fixture(async file => {
+  const mutex = fakeMutex();
+  let failNextAcquire = false;
+  const acquire: typeof acquireSettingsMutex = async (f, s, o) => {
+    if (failNextAcquire) { failNextAcquire = false; throw new ClineRunError("settings_lock_timeout", "held elsewhere"); }
+    return mutex.acquire(f, s, o);
+  };
+  await assert.rejects(withProviderOverride({ provider: "default", model: "temp" }, file, undefined, async () => {
+    failNextAcquire = true; throw new Error("action failed");
+  }, { acquireSettingsMutex: acquire }), /action failed/);
+}));
+
+test("a run left in the journal by a dead bridge process is pruned and the originals restored", async () => fixture(async file => {
+  const mutex = fakeMutex();
+  await writeFile(getJournalPath(file), JSON.stringify({ version: 2,
+    base: { hadLastUsedProvider: true, originalLastUsedProvider: "default",
+      providers: { default: { hadEntry: true, hadModel: true, originalModel: "baseline", hadReasoning: true, originalReasoning: "low" } } },
+    runs: { dead: { pid: 999_999, provider: "default", startedAtMs: Date.now() } } }));
+  await writeFile(file, JSON.stringify({ lastUsedProvider: "default", providers: { default: { settings: { model: "crashed", reasoning: "high" } } } }));
+  const result = await recoverProviderSettingsJournal(file, { acquireSettingsMutex: mutex.acquire, isProcessAlive: pid => pid !== 999_999 });
+  assert.equal(result, "restored");
+  assert.equal((await json(file)).providers.default.settings.model, "baseline");
+  await assert.rejects(readFile(getJournalPath(file)), { code: "ENOENT" });
+}));
+
+test("startup recovery keeps the journal while another live bridge process still has a run", async () => fixture(async file => {
+  const mutex = fakeMutex();
+  await writeFile(getJournalPath(file), JSON.stringify({ version: 2,
+    base: { hadLastUsedProvider: true, originalLastUsedProvider: "default",
+      providers: { default: { hadEntry: true, hadModel: true, originalModel: "baseline", hadReasoning: true, originalReasoning: "low" } } },
+    runs: { live: { pid: 424_242, provider: "default", startedAtMs: Date.now() } } }));
+  await writeFile(file, JSON.stringify({ lastUsedProvider: "default", providers: { default: { settings: { model: "in-use" } } } }));
+  const result = await recoverProviderSettingsJournal(file, { acquireSettingsMutex: mutex.acquire, isProcessAlive: () => true });
+  assert.equal(result, "unchanged");
+  assert.equal((await json(file)).providers.default.settings.model, "in-use");
+  assert.ok(await readFile(getJournalPath(file)));
 }));
 
 test("crash releases fake mutex but leaves journal: next override restores before snapshot", async () => fixture(async file => {
@@ -80,7 +172,7 @@ test("crash releases fake mutex but leaves journal: next override restores befor
   await mutex.crash();
   await withProviderOverride({ model: "next" }, file, undefined, async () => {
     assert.equal((await json(file)).providers.default.settings.model, "baseline");
-    assert.equal((await json(getJournalPath(file))).originalModel, "baseline");
+    assert.equal((await json(getJournalPath(file))).base.providers.default.originalModel, "baseline");
     return {};
   }, { acquireSettingsMutex: mutex.acquire });
   assert.equal((await json(file)).providers.default.settings.apiKey, "refreshed");
@@ -194,11 +286,12 @@ test("real OS mutex timeout is clamped to remaining deadline and abort cancels w
 }));
 
 
-test("end-of-run restore failure retains journal and blocks subsequent override", async () => fixture(async file => {
+test("end-of-run restore failure returns a warning, retains journal and blocks subsequent override", async () => fixture(async file => {
   const mutex = fakeMutex();
-  await assert.rejects(withProviderOverride({ model: "temporary" }, file, undefined, async () => {
+  const result = await withProviderOverride<{ warnings?: string[] }>({ model: "temporary" }, file, undefined, async () => {
     await writeFile(file, "broken during run"); return {};
-  }, { acquireSettingsMutex: mutex.acquire }), (err: unknown) => err instanceof ClineRunError && err.kind === "settings_restore_failed");
+  }, { acquireSettingsMutex: mutex.acquire });
+  assert.match(result.warnings?.[0] ?? "", /not restored yet/);
   const original = await readFile(getJournalPath(file), "utf8");
   await assert.rejects(withProviderOverride({ model: "next" }, file, undefined, async () => {
     assert.fail("unrecovered journal must block execution"); return {};
@@ -298,8 +391,9 @@ test("model-only override without lastUsedProvider journals cline and removes it
     await withProviderOverride({ model: "temporary" }, file, undefined, async selection => {
       assert.deepEqual(selection, { provider: "cline", model: "temporary" });
       const journal = await json(getJournalPath(file));
-      assert.equal(journal.targetProvider, "cline");
-      assert.equal(journal.hadEntry, false);
+      assert.deepEqual(Object.keys(journal.base.providers), ["cline"]);
+      assert.equal(journal.base.providers.cline.hadEntry, false);
+      assert.equal((Object.values(journal.runs)[0] as any).provider, "cline");
       await writeFile(file, JSON.stringify({ lastUsedProvider: "cline", providers: { cline: { settings: { model: "temporary", reasoning: "high" } } } }));
       return {};
     });
@@ -313,9 +407,9 @@ test("non-string model and reasoning values survive journal round trip and resto
   for (const value of [null, 42, false, { custom: [1, "two"] }]) {
     await writeFile(file, JSON.stringify({ lastUsedProvider: "default", providers: { default: { settings: { model: value, reasoning: value } } } }));
     await withProviderOverride({ model: "temporary" }, file, undefined, async () => {
-      const journal = await json(getJournalPath(file));
-      assert.equal(journal.hadModel, true); assert.equal(journal.hadReasoning, true);
-      assert.deepEqual(journal.originalModel, value); assert.deepEqual(journal.originalReasoning, value);
+      const base = (await json(getJournalPath(file))).base.providers.default;
+      assert.equal(base.hadModel, true); assert.equal(base.hadReasoning, true);
+      assert.deepEqual(base.originalModel, value); assert.deepEqual(base.originalReasoning, value);
       await writeFile(file, JSON.stringify({ lastUsedProvider: "default", providers: { default: { settings: { model: "temporary", reasoning: "high", accessToken: "fresh" } } } }));
       return {};
     });
@@ -378,8 +472,9 @@ test("ownership lost before journal creation releases and reacquires before runn
   let actionRan = false;
   await withProviderOverride({ model: "temporary" }, file, undefined, async () => {
     actionRan = true;
+    // Registration released the lost lock, reacquired, and released again before the run.
     assert.equal(attempts, 2);
-    assert.equal(releases, 1);
+    assert.equal(releases, 2);
     assert.equal(checks, 2);
     assert.ok(await readFile(getJournalPath(file)));
     return {};
@@ -394,7 +489,9 @@ test("ownership lost before journal creation releases and reacquires before runn
     return release;
   } });
   assert.equal(actionRan, true);
-  assert.equal(releases, 2);
+  // One more short acquisition to unregister the run at the end.
+  assert.equal(attempts, 3);
+  assert.equal(releases, 3);
 }));
 
 test("repeated ownership loss before journal creation respects the original deadline", async () => fixture(async file => {
