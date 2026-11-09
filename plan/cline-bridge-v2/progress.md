@@ -13,16 +13,16 @@ Status values: `todo`, `in progress`, `done`, `blocked`, `skipped`.
 | 1.R | Verify: code review | done | 2026-11-09 | Codex round 1 FAIL (P1 cleanup masking, P2 model-only provider) → fixed; round 2 PASS |
 | 1.L | Verify: live check against Cline | done | 2026-11-09 | Built server via MCP stdio: 2 concurrent `ask_cline` on `cline-free/nemotron-3.5-super-vl` → PONG1/PONG2, 2 runs in journal at once, selection restored, journal removed; only Cline's own token refresh changed |
 | 2.1 | provider + model required in all tools | done | 2026-11-09 | zod schema, `requireSelection` in runCline, ping before cache, `withProviderOverride`; saved-default code removed (D-16) |
-| 2.2 | Missing-model error lists free models | in progress | 2026-11-09 | Plain message now; the live free-model list is added in Stage 3 |
+| 2.2 | Missing-model error lists free models | done | 2026-11-09 | Schema description and error point to `cline_list_models` (a zod validation error cannot carry a live list) |
 | 2.3 | Tests for mandatory model | done | 2026-11-09 | 111 tests, 110 pass, 1 skipped |
 | 2.R | Verify: code review | done | 2026-11-09 | Codex round 1 FAIL (helper accepted one field) → fixed; round 2 PASS |
 | 2.L | Verify: live check against Cline | done | 2026-11-09 | Via MCP: `{}`, provider-only, model-only and ping without selection refused (-32602) in ≤4 ms, settings untouched; explicit `cline-free/nemotron-3.5-super-vl` → PONG, settings restored |
-| 3.1 | Load catalog from installed @cline/llms | todo | | |
-| 3.2 | `catalog_unavailable` on load failure | todo | | |
-| 3.3 | Tool `cline_list_models` | todo | | |
-| 3.4 | Tests for discovery | todo | | |
-| 3.R | Verify: code review | todo | | |
-| 3.L | Verify: live check against Cline | todo | | |
+| 3.1 | Load catalog from installed @cline/llms | done | 2026-11-09 | Public export `GENERATED_CLINE_RECOMMENDED_MODELS.free` + `getGeneratedModelsForProvider("cline")` (D-17) |
+| 3.2 | `catalog_unavailable` on load failure | done | 2026-11-09 | Also for prohibited ids and a missing entry; entry is realpath-resolved |
+| 3.3 | Tool `cline_list_models` | done | 2026-11-09 | Joins last bridge status per model |
+| 3.4 | Tests for discovery | done | 2026-11-09 | 118 tests, 116 pass, 2 skipped (symlink test needs Windows symlink privilege) |
+| 3.R | Verify: code review | done | 2026-11-09 | Codex round 1 FAIL (prohibited ids, symlink root, `""` entry) → fixed; round 2 PASS |
+| 3.L | Verify: live check against Cline | blocked | 2026-11-09 | `cline_list_models` via MCP OK: 5 free models, CLI 3.0.74, status join OK. Ping/ask blocked: Cline login expired 22:49 ("cline requires re-authentication") for every model; needs the user to sign in to Cline again |
 | 4.1 | Write events.ndjson live | todo | | |
 | 4.2 | Redaction and size cap | todo | | |
 | 4.3 | Status reducer → status.json | todo | | |

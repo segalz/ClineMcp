@@ -54,7 +54,8 @@ export type ClineErrorKind =
   | "workspace_cleanup_failed"
   | "commit_created"
   | "edits_inspection_failed"
-  | "quota_exhausted";
+  | "quota_exhausted"
+  | "catalog_unavailable";
 
 export interface ClineRunErrorDetails {
   exitCode?: number | null;
@@ -442,9 +443,17 @@ export function validateInputLimits(input: AskClineInput): void {
   }
 }
 
+/** The Cline CLI entry script the runner launches (and whose install holds the model catalog). */
+export function resolveClineEntry(entryPath?: string): string | undefined {
+  if (entryPath !== undefined) return entryPath;
+  return process.platform === "win32" && process.env.APPDATA
+    ? path.join(process.env.APPDATA, "npm", "node_modules", "cline", "bin", "cline")
+    : undefined;
+}
+
 export const MISSING_SELECTION_MESSAGE =
   "provider and model are required. The bridge never runs on Cline's saved default model, which can go stale silently. " +
-  "Pass a provider (e.g. \"cline\") and a model id from Cline's current catalog (free ones start with \"cline-free/\").";
+  "Pass provider \"cline\" and a model id; call cline_list_models for the free models the installed Cline offers now.";
 
 /** Fails before any I/O when the caller did not choose both provider and model. */
 export function requireSelection(input: { provider?: string; model?: string }): void {
@@ -554,9 +563,7 @@ export async function runCline(
   );
 
   async function runAttempts(cwd: string | undefined): Promise<ClineResponse> {
-      const windowsEntry = deps.entryPath ?? (process.platform === "win32" && process.env.APPDATA
-        ? path.join(process.env.APPDATA, "npm", "node_modules", "cline", "bin", "cline")
-        : undefined);
+      const windowsEntry = resolveClineEntry(deps.entryPath);
 
       if (process.platform === "win32" && !windowsEntry && !deps.entryPath) {
         throw new ClineRunError("launch_failed", "Unable to locate the local Cline CLI.");

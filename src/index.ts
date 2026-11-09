@@ -5,6 +5,7 @@ import { askCline, ClineRunError, formatErrorAsText } from "./runner.js";
 import { applyClineEdits, ClineEditsError } from "./edits.js";
 import { askClineWorkspace } from "./workspace.js";
 import { clinePing } from "./ping.js";
+import { listFreeModels } from "./models.js";
 import { PROHIBITED_NAMES, resolveProviderSettingsPath, recoverProviderSettingsJournal } from "./settings.js";
 
 const server = new McpServer({ name: "cline-local-bridge", version: "1.0.0" });
@@ -15,7 +16,8 @@ const providerModelSchema = z
   .regex(/^[A-Za-z0-9._:/@-]{1,120}$/)
   .refine((val) => !PROHIBITED_NAMES.has(val.toLowerCase()), {
     message: "Prohibited provider or model name"
-  });
+  })
+  .describe("Required. Provider \"cline\" with a model id from cline_list_models (free models), or another configured provider/model.");
 
 export { formatErrorAsText };
 
@@ -190,6 +192,24 @@ server.registerTool(
       return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
     } catch (error) {
       const message = formatErrorAsText(error, "The Cline ping failed unexpectedly.");
+      return { content: [{ type: "text", text: message }], isError: true };
+    }
+  }
+);
+
+server.registerTool(
+  "cline_list_models",
+  {
+    description: "List the models the installed Cline CLI advertises as free right now (provider \"cline\"), read from " +
+      "its own catalog, with the bridge's last recorded status per model. Use an id from here as `model` for the other " +
+      "tools. The list rotates with Cline releases; check a model with cline_ping before relying on it.",
+    inputSchema: {}
+  },
+  async () => {
+    try {
+      return { content: [{ type: "text", text: JSON.stringify(await listFreeModels(), null, 2) }] };
+    } catch (error) {
+      const message = formatErrorAsText(error, "Listing Cline models failed unexpectedly.");
       return { content: [{ type: "text", text: message }], isError: true };
     }
   }

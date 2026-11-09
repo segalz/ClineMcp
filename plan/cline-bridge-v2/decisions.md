@@ -87,6 +87,19 @@ field from saved settings (`resolveSavedSelection`, model-only provider inferenc
 **Why:** D-02. Codex review round 1 found the helper still accepted one field, which is not reachable via MCP
 but contradicts the rule.
 
+### D-17 — 2026-11-09 — "Free" means what Cline itself advertises as free
+**Decision:** `cline_list_models` returns `GENERATED_CLINE_RECOMMENDED_MODELS.free` from the installed CLI's
+`@cline/llms`, not every zero-priced catalog entry, and not only `cline-free/*` ids (the list also holds
+e.g. `reflection/beam-free`). All are used with provider `cline`.
+**Why:** Codex analysis: zero pricing also covers routers such as `openrouter/auto`; the explicit free list is
+Cline's own classification.
+
+### Open risk — settings restore vs. a concurrent token refresh
+The restore reads the freshest settings file and rewrites it. If another Cline client (the desktop app)
+rotates the login token in the milliseconds between that read and write, the rotation could be lost and
+Cline would ask for re-authentication. Pre-existing in v1; not shown to be the cause of the 2026-11-09
+expiry. Revisit if re-authentication repeats.
+
 ### D-13 — 2026-11-09 — Codex replaces Grok; Grok is out
 **Decision:** Pre-code analysis and `n.R` code review go to Codex (`codex_ask`, read-only sandbox).
 Fallback: AGY, then OpenCode. Grok is not used in this project. Supersedes the Grok parts of D-12.
