@@ -25,7 +25,9 @@ export { formatErrorAsText };
 server.registerTool(
   "ask_cline",
   {
-    description: "Ask the locally installed Cline CLI for an analysis/chat response. File edits are not approved.",
+    description: "Ask the locally installed Cline CLI for an analysis/chat answer from the text you send. Cline has NO tools " +
+      "here (it cannot read files, list directories or run commands); put the code or text in the prompt. To let Cline " +
+      "read a repository use ask_cline_workspace; to have it change files use apply_cline_edits.",
     inputSchema: {
       prompt: z.string().min(1).max(20_000),
       cwd: z.string().min(1).optional(),

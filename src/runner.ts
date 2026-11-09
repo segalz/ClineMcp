@@ -158,6 +158,8 @@ export interface ClineInvocationOptions {
   maxAttempts?: number;
   /** Record a live trace (events.ndjson + status.json) for this run and return its location. */
   trace?: boolean;
+  /** Text placed before the caller's prompt. Not counted against the prompt limits, which apply to the caller's text. */
+  promptPreamble?: string;
   /** Record the outcome in the provider status file (default true). */
   recordStatus?: boolean;
   /** Refuse without launching while a cached daily-quota lock is active (default true). */
@@ -464,6 +466,31 @@ export function validateInputLimits(input: AskClineInput): void {
   }
 }
 
+/** CreateProcess limit is 32,767 UTF-16 units; keep a margin for what Node adds. */
+export const WINDOWS_COMMAND_LINE_LIMIT = 32_000;
+
+/**
+ * Length of the command line Node builds on Windows (MSVC quoting: each argument quoted, quotes escaped,
+ * backslashes before a quote or the closing quote doubled). Used to refuse an over-long request clearly
+ * instead of failing at spawn.
+ */
+export function windowsCommandLineLength(executable: string, args: string[]): number {
+  let total = 0;
+  for (const arg of [executable, ...args]) {
+    let length = 2; // surrounding quotes
+    let backslashes = 0;
+    for (const ch of arg) {
+      if (ch === "\\") { backslashes++; length++; continue; }
+      if (ch === "\"") length += backslashes + 2; // doubled backslashes + escaped quote
+      else length += ch.length; // UTF-16 units: a character outside the BMP (e.g. an emoji) counts 2
+      backslashes = 0;
+    }
+    length += backslashes; // backslashes before the closing quote are doubled
+    total += length + 1; // separating space
+  }
+  return total;
+}
+
 /** The Cline CLI entry script the runner launches (and whose install holds the model catalog). */
 export function resolveClineEntry(entryPath?: string): string | undefined {
   if (entryPath !== undefined) return entryPath;
@@ -672,11 +699,19 @@ export async function runCline(
         if (effectiveInput.model) args.push("-m", effectiveInput.model);
         if (effectiveInput.systemPrompt) args.push("--system", effectiveInput.systemPrompt);
         if (cwd) args.push("--cwd", cwd);
-        args.push(effectiveInput.prompt);
+        args.push((options.promptPreamble ?? "") + effectiveInput.prompt);
 
         const spawnArgs = (process.platform === "win32" || deps.entryPath) && windowsEntry
           ? [windowsEntry, ...args]
           : args;
+        if (platform === "win32") {
+          const length = windowsCommandLineLength(executable, spawnArgs);
+          if (length > WINDOWS_COMMAND_LINE_LIMIT) {
+            throw new ClineRunError("launch_failed",
+              `The request is too long for the Windows command line after escaping (${length} of ${WINDOWS_COMMAND_LINE_LIMIT} characters; ` +
+              "quotes and backslashes count extra). Shorten the prompt or system prompt.", { attempts: attempt - 1 });
+          }
+        }
 
         if (getRemainingBudgetMs() <= 0) throw new ClineRunError("timeout", "Cline exceeded the global deadline.", { attempts: attempt - 1 });
         const started = nowFn();
@@ -1091,10 +1126,20 @@ export async function runCline(
   }
 }
 
+/**
+ * ask_cline runs Cline with auto-approval off. Headless, that refuses EVERY tool call (even reads), and the
+ * Cline 3.0.74 CLI has no read-only approval option (D-21). Without this notice Cline spends iterations
+ * trying tools, gets refused, and answers that it needs approval.
+ */
+export const NO_TOOLS_PREAMBLE =
+  "[Bridge note: this request runs WITHOUT tools. Every tool call (reading files, listing directories, " +
+  "running commands, searching) will be refused, so do not call any tool. Answer only from the text of this " +
+  "message. If you cannot answer without reading files, say so in one sentence.]\n\n";
+
 export async function askCline(
   input: AskClineInput,
   signal?: AbortSignal,
   options?: ClineInvocationOptions
 ): Promise<ClineResponse> {
-  return runCline(input, signal, options);
+  return runCline(input, signal, { ...options, promptPreamble: NO_TOOLS_PREAMBLE });
 }

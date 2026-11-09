@@ -108,10 +108,21 @@ new free-text formats; perfect free-text redaction is not achievable.
 location (also on errors). Traces are removed on bridge start after 24 h, or when their process died.
 Removal "after the result is collected" applies to async tasks (Stage 5).
 
-### D-20 — 2026-11-09 — Observation: `ask_cline` cannot read files
+### D-20 — 2026-11-09 — Observation: `ask_cline` cannot read files — Superseded by D-21
 `ask_cline` runs Cline with `--auto-approve false`, so even read tools are refused and Cline asks for approval
-in its answer. `ask_cline_workspace` (auto-approve on, disposable worktree) is the tool for repository reads.
-Not changed in v2; noted so callers are not surprised.
+in its answer.
+
+### D-21 — 2026-11-09 — `ask_cline` tells Cline up front that it has no tools
+**Decision:** `ask_cline` prepends a short notice to the prompt (`NO_TOOLS_PREAMBLE`): no tools, answer from the
+message, say so in one sentence if files are needed. Its MCP description says the same and points to
+`ask_cline_workspace` (read a repo) and `apply_cline_edits` (change files). On Windows any request whose escaped
+command line exceeds 32,000 UTF-16 units is refused clearly before launch.
+**Why:** The user flagged the wasted tries as a bug. Codex analysis of CLI 3.0.74: headless `--auto-approve false`
+refuses every tool; there is no read-only approval flag (per-tool `toolPolicies` exist internally but the CLI does
+not expose them); `--plan` still allows `run_commands`; `--yolo` approves `editor` and `run_commands`. So
+"no tools, said honestly" is the only safe option.
+**Evidence:** Live: same file-listing request went from 2 refused tool calls / 2 iterations to 0 / 1 with an
+honest one-sentence answer; a code question in the prompt was answered correctly.
 
 ### Open risk — settings restore vs. a concurrent token refresh
 The restore reads the freshest settings file and rewrites it. If another Cline client (the desktop app)

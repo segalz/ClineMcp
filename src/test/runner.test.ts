@@ -13,7 +13,9 @@ import {
   MAX_TOTAL_TEXT_CHARACTERS,
   validateInputLimits,
   redactSecrets,
-  defaultKillTree
+  defaultKillTree,
+  NO_TOOLS_PREAMBLE,
+  windowsCommandLineLength
 } from "../runner.js";
 import {
   restoreProviderSettingsSnapshot,
@@ -1957,4 +1959,35 @@ test("POSIX kills the group once after normal root exit, without killing the exi
   } });
   assert.equal((await clock.finish(work)).text, "done");
   assert.deepEqual(signals, ["SIGKILL"]);
+});
+
+test("ask_cline tells Cline up front that it has no tools; other runs do not get the notice", async () => {
+  const prompts: string[] = [];
+  const deps = {
+    entryPath: "fake", access: async () => {}, acquireSettingsMutex: async () => async () => {},
+    spawn: ((_exe: string, args: string[]) => {
+      prompts.push(args.at(-1)!);
+      const child = createMockChild();
+      queueMicrotask(() => { child.stdout.emit("data", Buffer.from('{"type":"run_result","finishReason":"completed","text":"ok"}\n')); child.emit("close", 0); });
+      return child;
+    }) as any
+  };
+  const longPrompt = "q".repeat(MAX_PROMPT_CHARACTERS);
+  await askCline({ prompt: longPrompt, provider: "p", model: "m" }, undefined, { deps });
+  await runCline({ prompt: "plain", provider: "p", model: "m" }, undefined, { deps });
+  assert.equal(prompts[0], NO_TOOLS_PREAMBLE + longPrompt, "a prompt at the full limit is still accepted with the notice");
+  assert.match(NO_TOOLS_PREAMBLE, /WITHOUT tools/);
+  assert.equal(prompts[1], "plain");
+});
+
+test("Windows: a request whose escaped command line is too long is refused clearly before launch", async () => {
+  assert.equal(windowsCommandLineLength("a", ["b c", 'x"y', "d\\"]), 4 + 6 + 7 + 6);
+  assert.equal(windowsCommandLineLength("a", ["\u{1F600}"]), 4 + 5, "an emoji is two UTF-16 units");
+  let spawned = false;
+  await assert.rejects(askCline({ prompt: '"'.repeat(MAX_PROMPT_CHARACTERS), provider: "p", model: "m" }, undefined, { deps: {
+    platform: "win32", entryPath: "fake", access: async () => {}, acquireSettingsMutex: async () => async () => {},
+    spawn: (() => { spawned = true; return createMockChild(); }) as any
+  } }), (err: unknown) => err instanceof ClineRunError && err.kind === "launch_failed" &&
+    /too long for the Windows command line after escaping/.test(err.message));
+  assert.equal(spawned, false);
 });

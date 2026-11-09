@@ -46,6 +46,8 @@ Status values: `todo`, `in progress`, `done`, `blocked`, `skipped`.
 | 7.R | Verify: code review | todo | | |
 | 7.L | Verify: live check against Cline | todo | | |
 
+| X.1 | `ask_cline` no-tools notice + Windows length guard (D-21) | done | 2026-11-09 | Codex analysis + review (3 rounds: Windows command-line length, UTF-16 count) PASS; 139 tests; live 0 tool calls / 1 iteration |
+
 ## Session notes
 
 - 2026-11-09 — Helper readiness check (D-12/D-13). Same read-only question to each helper, with
