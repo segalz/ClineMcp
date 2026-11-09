@@ -7,9 +7,29 @@ import { askClineWorkspace } from "./workspace.js";
 import { clinePing } from "./ping.js";
 import { listFreeModels } from "./models.js";
 import { cleanupTraces } from "./trace.js";
+import { TaskManager, MAX_TASK_TIMEOUT_SECONDS, MAX_WAIT_SECONDS } from "./tasks.js";
 import { PROHIBITED_NAMES, resolveProviderSettingsPath, recoverProviderSettingsJournal } from "./settings.js";
 
 const server = new McpServer({ name: "cline-local-bridge", version: "1.0.0" });
+
+/**
+ * Synchronous tool calls in flight. On shutdown each is aborted (killing its Cline process tree) and awaited,
+ * so the worktree and the settings journal are cleaned up before the bridge exits.
+ */
+const activeCalls = new Set<{ controller: AbortController; done: Promise<unknown> }>();
+let shuttingDown = false;
+function track<T>(clientSignal: AbortSignal, work: (signal: AbortSignal) => Promise<T>): Promise<T> {
+  if (shuttingDown) {
+    return Promise.reject(new ClineRunError("cancelled", "The bridge is shutting down; no new Cline runs start.", { attempts: 0 }));
+  }
+  const controller = new AbortController();
+  const onClientAbort = () => controller.abort();
+  if (clientSignal.aborted) controller.abort(); else clientSignal.addEventListener("abort", onClientAbort, { once: true });
+  const done = work(controller.signal);
+  const entry = { controller, done };
+  activeCalls.add(entry);
+  return done.finally(() => { activeCalls.delete(entry); clientSignal.removeEventListener("abort", onClientAbort); });
+}
 
 // Required on every tool: the bridge never runs on Cline's saved default selection.
 const providerModelSchema = z
@@ -40,7 +60,7 @@ server.registerTool(
   },
   async (input, extra) => {
     try {
-      const result = await askCline(input, extra.signal, { trace: true });
+      const result = await track(extra.signal, signal => askCline(input, signal, { trace: true }));
       const response = {
         text: result.text,
         ...(result.model ? { model: result.model } : {}),
@@ -73,7 +93,7 @@ server.registerTool(
   },
   async (input, extra) => {
     try {
-      const result = await applyClineEdits(input, extra.signal, { trace: true });
+      const result = await track(extra.signal, signal => applyClineEdits(input, signal, { trace: true }));
       return {
         content: [{
           type: "text",
@@ -162,7 +182,7 @@ server.registerTool(
   },
   async (input, extra) => {
     try {
-      const result = await askClineWorkspace(input, extra.signal, { trace: true });
+      const result = await track(extra.signal, signal => askClineWorkspace(input, signal, { trace: true }));
       return {
         content: [{
           type: "text",
@@ -198,7 +218,7 @@ server.registerTool(
   },
   async (input, extra) => {
     try {
-      const result = await clinePing(input, extra.signal);
+      const result = await track(extra.signal, signal => clinePing(input, signal));
       return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
     } catch (error) {
       const message = formatErrorAsText(error, "The Cline ping failed unexpectedly.");
@@ -231,6 +251,105 @@ try {
 } catch {
   console.error("Settings startup recovery could not acquire the mutex or access settings; the journal was retained.");
 }
+
+// --- Async tasks --------------------------------------------------------------------------------------------
+
+const tasks = new TaskManager();
+const asText = (value: unknown) => ({ content: [{ type: "text" as const, text: JSON.stringify(value, null, 2) }] });
+const asError = (error: unknown, fallback: string) =>
+  ({ content: [{ type: "text" as const, text: formatErrorAsText(error, fallback) }], isError: true });
+
+server.registerTool(
+  "cline_start",
+  {
+    description: "Start a Cline task in the background and return its taskId at once. mode \"ask\": answer from the prompt, " +
+      "no tools; \"workspace\": read a Git repository in a disposable worktree; \"edits\": change files in the checkout " +
+      "(no commits; diff in the result). Then follow it with cline_status, stop it with cline_cancel, and collect it with " +
+      `cline_result. One attempt, no automatic retry; timeoutSeconds up to ${MAX_TASK_TIMEOUT_SECONDS}; at most 2 tasks at once.`,
+    inputSchema: {
+      mode: z.enum(["ask", "workspace", "edits"]),
+      prompt: z.string().min(1).max(20_000),
+      provider: providerModelSchema,
+      model: providerModelSchema,
+      cwd: z.string().min(1).optional().describe("Required for workspace and edits: a path inside a Git repository."),
+      thinking: z.enum(["none", "low", "medium", "high", "xhigh"]).optional(),
+      timeoutSeconds: z.number().int().min(1).max(MAX_TASK_TIMEOUT_SECONDS).optional(),
+      waitSeconds: z.number().int().min(0).max(30).optional().describe("Wait this long for first progress before returning (default 3).")
+    }
+  },
+  async ({ waitSeconds, ...input }) => {
+    try {
+      const started = tasks.start(input);
+      return asText(await tasks.status(started.taskId, waitSeconds ?? 3));
+    } catch (error) {
+      return asError(error, "Starting the Cline task failed unexpectedly.");
+    }
+  }
+);
+
+server.registerTool(
+  "cline_status",
+  {
+    description: "Where a Cline task is now: state, step, current tool, last complete reasoning, files, any question Cline " +
+      `asked. Long poll: returns as soon as the task finishes or asks a new question, else after waitSeconds (max ${MAX_WAIT_SECONDS}).`,
+    inputSchema: {
+      taskId: z.string().uuid(),
+      waitSeconds: z.number().int().min(0).max(MAX_WAIT_SECONDS).optional().describe("Default 20.")
+    }
+  },
+  async ({ taskId, waitSeconds }) => {
+    try { return asText(await tasks.status(taskId, waitSeconds ?? 20)); }
+    catch (error) { return asError(error, "Reading the task status failed unexpectedly."); }
+  }
+);
+
+server.registerTool(
+  "cline_cancel",
+  {
+    description: "Stop a running Cline task (its process tree is killed). Collect it afterwards with cline_result.",
+    inputSchema: { taskId: z.string().uuid() }
+  },
+  async ({ taskId }) => {
+    try { return asText(await tasks.cancel(taskId)); }
+    catch (error) { return asError(error, "Cancelling the task failed unexpectedly."); }
+  }
+);
+
+server.registerTool(
+  "cline_result",
+  {
+    description: "Final result of a finished Cline task (answer, usage, and for edits the diff), plus log_run_hint for " +
+      "model-picker log_run (null when cancelled: do not log). Removes the task and its trace unless keepTrace.",
+    inputSchema: { taskId: z.string().uuid(), keepTrace: z.boolean().optional() }
+  },
+  async ({ taskId, keepTrace }) => {
+    try { return asText(await tasks.result(taskId, keepTrace ?? false)); }
+    catch (error) { return asError(error, "Reading the task result failed unexpectedly."); }
+  }
+);
+
+// When the client goes away or the bridge is stopped, no Cline task may keep running.
+/**
+ * Long enough for an aborted run to finish its cleanup: settings unregister (lock wait up to 30 s), then either
+ * worktree removal (two Git steps of 20 s plus folder removal) or the edits post-run Git budget (60 s in total).
+ */
+const SHUTDOWN_WAIT_MS = 120_000;
+const shutdown = async () => {
+  if (shuttingDown) return;
+  shuttingDown = true;
+  for (const call of activeCalls) call.controller.abort();
+  let timer: NodeJS.Timeout | undefined;
+  await Promise.race([
+    Promise.allSettled([tasks.shutdown(SHUTDOWN_WAIT_MS), ...[...activeCalls].map(c => c.done)]),
+    new Promise<void>(resolve => { timer = setTimeout(resolve, SHUTDOWN_WAIT_MS); })
+  ]);
+  if (timer) clearTimeout(timer);
+  process.exit(0);
+};
+process.stdin.on("end", () => { void shutdown(); });
+process.stdin.on("close", () => { void shutdown(); });
+process.on("SIGINT", () => { void shutdown(); });
+process.on("SIGTERM", () => { void shutdown(); });
 
 // Old finished traces and traces of dead bridge processes; never blocks startup.
 void cleanupTraces().catch(() => {});

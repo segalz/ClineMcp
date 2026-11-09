@@ -4,6 +4,7 @@ import path from "node:path";
 import { randomUUID } from "node:crypto";
 import { spawn } from "node:child_process";
 import {
+  defaultKillTree,
   ClineRunError,
   runCline,
   type AskClineInput,
@@ -33,7 +34,12 @@ function gitExecutable(): string {
   return process.platform === "win32" ? "git.exe" : "git";
 }
 
-function runGit(cwd: string, args: string[]): Promise<string> {
+/** A Git command may not hang a run or a task slot: it has a deadline and follows the caller's abort signal. */
+export const GIT_TIMEOUT_MS = 60_000;
+/** Worktree removal is quick; a shorter deadline keeps the bridge's shutdown wait bounded. */
+export const CLEANUP_GIT_TIMEOUT_MS = 20_000;
+
+function runGit(cwd: string, args: string[], signal?: AbortSignal, timeoutMs = GIT_TIMEOUT_MS): Promise<string> {
   return new Promise((resolve, reject) => {
     let stdout = "";
     const child = spawn(gitExecutable(), ["-C", cwd, ...args], {
@@ -41,22 +47,49 @@ function runGit(cwd: string, args: string[]): Promise<string> {
       windowsHide: true,
       stdio: ["ignore", "pipe", "pipe"]
     });
+    let finished = false;
+    const stop = (message: string) => {
+      if (finished) return;
+      finished = true;
+      clearTimeout(timer);
+      signal?.removeEventListener("abort", onAbort);
+      // Windows: kill the whole tree (worktree add runs its checkout in a child git). Elsewhere git is not a
+      // group leader, so a plain kill of the process is what is available.
+      try {
+        if (process.platform === "win32" && typeof child.pid === "number") defaultKillTree(child.pid, "SIGKILL", "win32");
+        else child.kill();
+      } catch { /* already gone */ }
+      // Reject only once Git has really exited (or after 5 s), so the caller's cleanup does not race it.
+      const giveUp = setTimeout(() => reject(new Error(message)), 5000);
+      child.once("close", () => { clearTimeout(giveUp); reject(new Error(message)); });
+    };
+    const timer = setTimeout(() => stop(`git ${args[0]} timed out after ${Math.round(timeoutMs / 1000)} s`), timeoutMs);
+    timer.unref?.();
+    const onAbort = () => stop("git command cancelled");
+    if (signal?.aborted) onAbort(); else signal?.addEventListener("abort", onAbort, { once: true });
+    const settle = (fn: () => void) => {
+      if (finished) return;
+      finished = true;
+      clearTimeout(timer);
+      signal?.removeEventListener("abort", onAbort);
+      fn();
+    };
     child.stdout.on("data", (chunk: Buffer) => { stdout += chunk.toString("utf8"); });
     child.stderr.resume();
-    child.on("error", () => reject(new Error("git launch failed")));
-    child.on("close", (code) => code === 0 ? resolve(stdout.trim()) : reject(new Error("git command failed")));
+    child.on("error", () => settle(() => reject(new Error("git launch failed"))));
+    child.on("close", (code) => settle(() => { code === 0 ? resolve(stdout.trim()) : reject(new Error("git command failed")); }));
   });
 }
 
 async function cleanupWorktree(repositoryRoot: string, worktreePath: string): Promise<void> {
   try {
-    await runGit(repositoryRoot, ["worktree", "remove", "--force", worktreePath]);
+    await runGit(repositoryRoot, ["worktree", "remove", "--force", worktreePath], undefined, CLEANUP_GIT_TIMEOUT_MS);
   } catch {
     // Removal can fail transiently on Windows when Cline has just released a handle.
   }
   try {
     await rm(worktreePath, { recursive: true, force: true, maxRetries: 5, retryDelay: 250 });
-    await runGit(repositoryRoot, ["worktree", "prune"]);
+    await runGit(repositoryRoot, ["worktree", "prune"], undefined, CLEANUP_GIT_TIMEOUT_MS);
   } catch {
     throw new ClineRunError("workspace_cleanup_failed", "The temporary Cline worktree could not be removed completely.");
   }
@@ -71,17 +104,36 @@ export async function askClineWorkspace(
   let repositoryRoot: string;
   let commit: string;
   try {
-    repositoryRoot = await runGit(requestedCwd, ["rev-parse", "--show-toplevel"]);
-    commit = await runGit(repositoryRoot, ["rev-parse", "HEAD"]);
+    repositoryRoot = await runGit(requestedCwd, ["rev-parse", "--show-toplevel"], signal);
+    commit = await runGit(repositoryRoot, ["rev-parse", "HEAD"], signal);
   } catch {
+    if (signal?.aborted) throw new ClineRunError("cancelled", "The Cline request was cancelled.", { attempts: 0 });
     throw new ClineRunError("workspace_not_git", "The requested cwd must be inside a Git repository with at least one commit.");
   }
 
   await mkdir(WORKTREE_BASE, { recursive: true });
   const worktreePath = path.join(WORKTREE_BASE, `review-${randomUUID()}`);
   try {
-    await runGit(repositoryRoot, ["worktree", "add", "--detach", worktreePath, commit]);
+    await runGit(repositoryRoot, ["worktree", "add", "--detach", worktreePath, commit], signal);
   } catch {
+    // A failed, timed-out or cancelled add can leave a partial worktree behind; if removing it fails too,
+    // the caller is told where it is.
+    let leftover: string | undefined;
+    await cleanupWorktree(repositoryRoot, worktreePath).catch((cleanupError: unknown) => {
+      leftover = `The partial worktree ${worktreePath} could not be removed: ${(cleanupError as Error)?.message ?? String(cleanupError)}`;
+    });
+    const setupError = signal?.aborted
+      ? new ClineRunError("cancelled", "The Cline request was cancelled.", { attempts: 0 })
+      : undefined;
+    if (setupError) {
+      if (leftover) setupError.notes = [leftover];
+      throw setupError;
+    }
+    if (leftover) {
+      const failed = new ClineRunError("workspace_setup_failed", "Unable to create a temporary Git worktree for Cline.");
+      failed.notes = [leftover];
+      throw failed;
+    }
     throw new ClineRunError("workspace_setup_failed", "Unable to create a temporary Git worktree for Cline.");
   }
 

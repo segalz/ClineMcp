@@ -29,12 +29,12 @@ Status values: `todo`, `in progress`, `done`, `blocked`, `skipped`.
 | 4.4 | Cleanup (TTL, orphans) | done | 2026-11-09 | On bridge start: finished > 24 h, dead-PID orphans, live PID silent > 7 days. Removal right after collection belongs to Stage 5 (D-19) |
 | 4.R | Verify: code review | done | 2026-11-09 | Codex 6 rounds: partial-delta secret, recursion crash, unbounded finish, live-trace deletion, lost traces on wrapper/plain errors, oversized lines, structured-key gaps, retry task id → all fixed; round 6 PASS |
 | 4.L | Verify: live check against Cline | done | 2026-11-09 | Via MCP `ask_cline` on `cline-free/nemotron-3.5-super-vl`: status.json changed every second during the run (iteration, tools, streaming chars, reasoning); response carried `trace`; 23 events, 0 deltas, 0 dropped. Side finding: `ask_cline` runs with auto-approve off, so Cline could not read files and asked for approval (pre-existing behaviour, see D-20) |
-| 5.1 | `cline_start` | todo | | |
-| 5.2 | `cline_status` long-poll | todo | | |
-| 5.3 | `cline_cancel`, `cline_result`, log_run_hint | todo | | |
-| 5.4 | Guards: no retry, max 2, wall cap, orphans | todo | | |
-| 5.R | Verify: code review | todo | | |
-| 5.L | Verify: live check against Cline | todo | | |
+| 5.1 | `cline_start` | done | 2026-11-10 | `src/tasks.ts` TaskManager; modes ask/workspace/edits; taskId = trace runId |
+| 5.2 | `cline_status` long-poll | done | 2026-11-10 | ≤60 s; returns on settle or a new question |
+| 5.3 | `cline_cancel`, `cline_result`, log_run_hint | done | 2026-11-10 | Hint null for cancelled and local failures (D-23); trace folder removed after collection |
+| 5.4 | Guards: no retry, max 2, wall cap, orphans | done | 2026-11-10 | maxAttempts 1, `task_limit`, 1800 s cap (sync stays 300), shutdown stops tasks AND sync calls, Git deadlines + tree kill (D-22) |
+| 5.R | Verify: code review | done | 2026-11-10 | Codex 9 rounds (shutdown, hanging Git, trace recreation, hint mapping, retry checks, cleanup notes, Git tree kill) → round 9 PASS |
+| 5.L | Verify: live check against Cline | done | 2026-11-10 | Via MCP: A+B in parallel, 3rd refused (`task_limit`); B cancelled at 4 s, its process gone, hint null; long poll returned when A finished (1,030 words, 19.8 s); trace folder removed on collection; closing the client mid-task killed its Cline (0 extra cline.exe) |
 | 6.1 | `QUESTION:` protocol in system prompt | todo | | |
 | 6.2 | Detect input_required / auto_answered | todo | | |
 | 6.3 | `cline_send` → fresh run with context | todo | | |

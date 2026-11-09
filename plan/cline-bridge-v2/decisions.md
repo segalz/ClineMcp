@@ -124,6 +124,20 @@ not expose them); `--plan` still allows `run_commands`; `--yolo` approves `edito
 **Evidence:** Live: same file-listing request went from 2 refused tool calls / 2 iterations to 0 / 1 with an
 honest one-sentence answer; a code question in the prompt was answered correctly.
 
+### D-22 — 2026-11-10 — No Cline or Git process outlives its run or the bridge
+**Decision:** On stdin end/close or SIGINT/SIGTERM the bridge refuses new work, aborts every async task and every
+sync tool call in flight, waits up to 120 s for their cleanup (settings unregister ≤30 s, then worktree removal or
+the edits post-run Git budget of 60 s), then exits. Git commands have deadlines (60 s; cleanup 20 s; post-run
+steps share 60 s; retry checks share 20 s), follow the caller's cancel before the run, and on Windows are killed
+as a process tree. A cancel just before launch never starts Cline.
+**Why:** Codex review (Stage 5) found each way a process or a task slot could be left behind.
+
+### D-23 — 2026-11-10 — Only model runs are logged to model-picker
+**Decision:** `cline_result` returns `log_run_hint: null` with `log_run_note` when the task was cancelled or failed
+locally (bad cwd, Git setup, settings lock, launch, catalog, cleanup). Otherwise the hint maps timeout → `timeout`,
+quota/rate limit → `quota` (with `retry_after_s`), anything else → `crash`.
+**Why:** model-picker counts crashes against the model's skill; local failures are not the model's fault.
+
 ### Open risk — settings restore vs. a concurrent token refresh
 The restore reads the freshest settings file and rewrites it. If another Cline client (the desktop app)
 rotates the login token in the milliseconds between that read and write, the rotation could be lost and

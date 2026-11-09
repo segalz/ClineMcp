@@ -56,7 +56,10 @@ export type ClineErrorKind =
   | "commit_created"
   | "edits_inspection_failed"
   | "quota_exhausted"
-  | "catalog_unavailable";
+  | "catalog_unavailable"
+  | "task_limit"
+  | "task_not_found"
+  | "task_running";
 
 export interface ClineRunErrorDetails {
   exitCode?: number | null;
@@ -160,6 +163,12 @@ export interface ClineInvocationOptions {
   trace?: boolean;
   /** Text placed before the caller's prompt. Not counted against the prompt limits, which apply to the caller's text. */
   promptPreamble?: string;
+  /** Upper bound for timeoutSeconds (default 300). Async tasks raise it; the sync tools keep 300. */
+  maxTimeoutSeconds?: number;
+  /** Fixed run id for the trace (async tasks use their task id). */
+  traceRunId?: string;
+  /** Called as soon as the trace recorder exists, before Cline starts. */
+  onTraceStart?: (recorder: TraceRecorder) => void;
   /** Record the outcome in the provider status file (default true). */
   recordStatus?: boolean;
   /** Refuse without launching while a cached daily-quota lock is active (default true). */
@@ -526,13 +535,15 @@ export async function runCline(
   };
   requireSelection(effectiveInput);
   const timeoutSeconds = effectiveInput.timeoutSeconds ?? DEFAULT_TIMEOUT_SECONDS;
-  if (!Number.isInteger(timeoutSeconds) || timeoutSeconds < 1 || timeoutSeconds > MAX_TIMEOUT_SECONDS) {
-    throw new ClineRunError("launch_failed", `timeoutSeconds must be an integer from 1 to ${MAX_TIMEOUT_SECONDS}.`);
+  const maxTimeoutSeconds = options.maxTimeoutSeconds ?? MAX_TIMEOUT_SECONDS;
+  if (!Number.isInteger(timeoutSeconds) || timeoutSeconds < 1 || timeoutSeconds > maxTimeoutSeconds) {
+    throw new ClineRunError("launch_failed", `timeoutSeconds must be an integer from 1 to ${maxTimeoutSeconds}.`);
   }
   validateInputLimits(effectiveInput);
 
   const deps = options.deps ?? {};
-  const recorder = options.trace ? new TraceRecorder({ base: deps.traceBase, wallNow: deps.wallNow }) : undefined;
+  const recorder = options.trace ? new TraceRecorder({ base: deps.traceBase, wallNow: deps.wallNow, runId: options.traceRunId }) : undefined;
+  if (recorder) options.onTraceStart?.(recorder);
   const platform = deps.platform ?? process.platform;
   const settingsPath = resolveProviderSettingsPath(deps.providerSettingsPath);
 
@@ -732,6 +743,10 @@ export async function runCline(
           CLINE_NO_AUTO_UPDATE: "1"
         };
 
+        // A cancel that arrived during the awaits above (entry access, budget checks) must stop the launch.
+        if (signal?.aborted) {
+          throw new ClineRunError("cancelled", "The Cline request was cancelled.", { attempts: attempt - 1 });
+        }
         const execPromise = new Promise<{ code: number | null; signal: NodeJS.Signals | null; error?: any }>((resolve) => {
           let settled = false;
           let child: ReturnType<typeof spawn>;
@@ -824,6 +839,8 @@ export async function runCline(
             }
             return;
           }
+
+          if (typeof child.pid === "number") recorder?.processStarted(child.pid);
 
           child.stdout?.on("data", (chunk: Buffer | string) => {
             stdout += chunk.toString();
@@ -969,8 +986,10 @@ export async function runCline(
           );
           const remainingBudgetMs = getRemainingBudgetMs();
           let allowRetry = remainingBudgetMs > 0 && remainingBudgetMs >= minRetryBudgetMs;
-          if (allowRetry && options.canRetry) {
+          if (allowRetry && attempt < maxAttempts && options.canRetry) {
             allowRetry = await options.canRetry({ stdout, stderr, attempt });
+            // A cancel during the retry check is a cancel, not the provider error that triggered it.
+            if (signal?.aborted) throw new ClineRunError("cancelled", "The Cline request was cancelled.", { attempts: attempt });
             allowRetry = allowRetry && getRemainingBudgetMs() > 0 && getRemainingBudgetMs() >= minRetryBudgetMs;
           }
           if (allowRetry && attempt < maxAttempts) {
@@ -998,8 +1017,10 @@ export async function runCline(
           stderr.includes("Cannot find module")
         ) {
           let allowRetry = getRemainingBudgetMs() > 0 && getRemainingBudgetMs() >= minRetryBudgetMs;
-          if (allowRetry && options.canRetry) {
+          if (allowRetry && attempt < maxAttempts && options.canRetry) {
             allowRetry = await options.canRetry({ stdout, stderr, attempt });
+            // A cancel during the retry check is a cancel, not the provider error that triggered it.
+            if (signal?.aborted) throw new ClineRunError("cancelled", "The Cline request was cancelled.", { attempts: attempt });
             allowRetry = allowRetry && getRemainingBudgetMs() > 0 && getRemainingBudgetMs() >= minRetryBudgetMs;
           }
           if (allowRetry && attempt < maxAttempts) {
@@ -1044,8 +1065,10 @@ export async function runCline(
         if (transient) {
           const remainingBudgetMs = getRemainingBudgetMs();
           let allowRetry = remainingBudgetMs > 0 && remainingBudgetMs >= minRetryBudgetMs;
-          if (allowRetry && options.canRetry) {
+          if (allowRetry && attempt < maxAttempts && options.canRetry) {
             allowRetry = await options.canRetry({ stdout, stderr, attempt });
+            // A cancel during the retry check is a cancel, not the provider error that triggered it.
+            if (signal?.aborted) throw new ClineRunError("cancelled", "The Cline request was cancelled.", { attempts: attempt });
             allowRetry = allowRetry && getRemainingBudgetMs() > 0 && getRemainingBudgetMs() >= minRetryBudgetMs;
           }
           if (allowRetry && attempt < maxAttempts) {

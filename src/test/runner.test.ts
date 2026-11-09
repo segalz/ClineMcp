@@ -1991,3 +1991,38 @@ test("Windows: a request whose escaped command line is too long is refused clear
     /too long for the Windows command line after escaping/.test(err.message));
   assert.equal(spawned, false);
 });
+
+test("the retry check is not called when no attempt remains", async () => {
+  let checks = 0;
+  await assert.rejects(runCline({ prompt: "x", provider: "p", model: "m" }, undefined, {
+    maxAttempts: 1,
+    canRetry: async () => { checks++; return true; },
+    deps: { entryPath: "fake", access: async () => {}, backoffMs: 0, acquireSettingsMutex: async () => async () => {},
+      spawn: (() => {
+        const child = createMockChild();
+        queueMicrotask(() => {
+          child.stdout.emit("data", Buffer.from('{"type":"run_result","finishReason":"error","text":"Service temporarily overloaded"}\n'));
+          child.emit("close", 1);
+        });
+        return child;
+      }) as any }
+  }));
+  assert.equal(checks, 0);
+});
+
+test("a cancel during the retry check is reported as cancelled", async () => {
+  const controller = new AbortController();
+  await assert.rejects(runCline({ prompt: "x", provider: "p", model: "m" }, controller.signal, {
+    maxAttempts: 2,
+    canRetry: async () => { controller.abort(); return false; },
+    deps: { entryPath: "fake", access: async () => {}, backoffMs: 0, acquireSettingsMutex: async () => async () => {},
+      spawn: (() => {
+        const child = createMockChild();
+        queueMicrotask(() => {
+          child.stdout.emit("data", Buffer.from('{"type":"run_result","finishReason":"error","text":"Service temporarily overloaded"}\n'));
+          child.emit("close", 1);
+        });
+        return child;
+      }) as any }
+  }), (e: unknown) => e instanceof ClineRunError && e.kind === "cancelled");
+});

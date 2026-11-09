@@ -1,9 +1,27 @@
 import os from "node:os";
 import path from "node:path";
 import { randomUUID } from "node:crypto";
-import { appendFile, mkdir, readdir, readFile, rm, stat } from "node:fs/promises";
+import { appendFile, mkdir, readdir, readFile, rename, rm, stat, unlink, writeFile } from "node:fs/promises";
 import { redactSecrets } from "./runner.js";
-import { atomicWriteJson } from "./status.js";
+/**
+ * Atomic JSON write that never creates directories (unlike status.ts atomicWriteJson): a write that lands
+ * after the trace folder was removed fails instead of recreating it. Retries briefly on Windows locks.
+ */
+async function writeJsonNoMkdir(destination: string, data: unknown): Promise<void> {
+  const temp = `${destination}.${randomUUID()}.tmp`;
+  await writeFile(temp, JSON.stringify(data, null, 2) + "\n", { encoding: "utf8", mode: 0o600, flag: "wx" });
+  try {
+    for (let attempt = 0; ; attempt++) {
+      try { await rename(temp, destination); return; }
+      catch (err: any) {
+        if (attempt >= 4 || !["EPERM", "EBUSY", "EACCES"].includes(err?.code)) throw err;
+        await new Promise(resolve => setTimeout(resolve, 20 * (attempt + 1)));
+      }
+    }
+  } finally {
+    await unlink(temp).catch(() => {});
+  }
+}
 
 /** Where per-run traces live. One folder per run: events.ndjson + status.json. */
 export function resolveTraceBase(override?: string): string {
@@ -31,7 +49,10 @@ export type TraceState = "starting" | "running" | "done" | "failed";
 
 export interface TraceStatus {
   runId: string;
+  /** The bridge process that owns this run. */
   pid: number;
+  /** The Cline process of the current attempt. */
+  childPid?: number;
   state: TraceState;
   startedAt: string;
   updatedAt: string;
@@ -171,6 +192,7 @@ export class TraceRecorder {
   private writtenBytes = 0;
   private statusTimer: NodeJS.Timeout | undefined;
   private finished = false;
+  private closed = false;
   private readonly maxEventBytes: number;
   private readonly maxPendingBytes: number;
   private readonly statusIntervalMs: number;
@@ -199,6 +221,31 @@ export class TraceRecorder {
       this.chain = this.chain.then(() => this.writeStatus()).catch(() => {});
     }, options.heartbeatMs ?? HEARTBEAT_MS);
     this.heartbeat.unref?.();
+  }
+
+  /**
+   * Stops all further writes, including ones still queued. Call before deleting the trace folder; a write that
+   * is already in progress may still finish, so wait for idle() first.
+   */
+  close(): void {
+    this.closed = true;
+    this.finished = true;
+    if (this.statusTimer) { clearTimeout(this.statusTimer); this.statusTimer = undefined; }
+    if (this.heartbeat) { clearInterval(this.heartbeat); this.heartbeat = undefined; }
+  }
+
+  /** Resolves when queued writes are done, or after waitMs. */
+  async idle(waitMs = FINISH_WAIT_MS): Promise<void> {
+    let timer: NodeJS.Timeout | undefined;
+    await Promise.race([this.chain, new Promise<void>(resolve => { timer = setTimeout(resolve, waitMs); })]);
+    if (timer) clearTimeout(timer);
+  }
+
+  /** The current attempt's Cline process started. */
+  processStarted(childPid: number): void {
+    if (this.finished) return;
+    this.status.childPid = childPid;
+    this.scheduleStatus();
   }
 
   /** A stdout line too long to keep was discarded by the splitter. */
@@ -260,6 +307,7 @@ export class TraceRecorder {
     }
     this.pendingBytes += bytes;
     this.chain = this.chain.then(async () => {
+      if (this.closed) { this.pendingBytes -= bytes; return; }
       try { await this.append(this.info.events, data, { encoding: "utf8", mode: 0o600 }); this.writtenBytes += bytes; this.status.eventsWritten++; }
       catch { this.status.eventsDropped++; }
       finally { this.pendingBytes -= bytes; }
@@ -276,10 +324,11 @@ export class TraceRecorder {
   }
 
   private async writeStatus(): Promise<void> {
+    if (this.closed) return;
     const now = this.wallNow();
     this.status.updatedAt = new Date(now).toISOString();
     this.status.elapsedMs = now - this.started;
-    await atomicWriteJson(this.info.status, this.status);
+    await writeJsonNoMkdir(this.info.status, this.status);
   }
 
   /** Final status. Idempotent; waits for all queued writes. Never throws. */
