@@ -1,6 +1,7 @@
 import { spawn } from "node:child_process";
 import { access } from "node:fs/promises";
 import path from "node:path";
+import { LineSplitter, TraceRecorder, type TraceInfo } from "./trace.js";
 import {
   JsonlParseError,
   parseClineJsonl,
@@ -77,6 +78,10 @@ export class ClineRunError extends Error {
   public readonly providerState?: ProviderState;
   public readonly resetAt?: string;
   public readonly retryAfterSeconds?: number;
+  /** Where the failed run's trace was written, when one was recorded. */
+  public trace?: TraceInfo;
+  /** Secondary problems that happened after this error, e.g. a cleanup that also failed. */
+  public notes?: string[];
 
   constructor(
     public readonly kind: ClineErrorKind,
@@ -138,6 +143,8 @@ export interface ClineDependencies {
   wallNow?: () => number;
   /** Provider status file; null disables status bookkeeping. */
   statusPath?: string | null;
+  /** Base folder for per-run traces (default %TEMP%/cline-tasks). */
+  traceBase?: string;
 }
 
 export interface ClineInvocationOptions {
@@ -149,6 +156,8 @@ export interface ClineInvocationOptions {
   deps?: ClineDependencies;
   /** Defaults to 2; the ping uses 1. */
   maxAttempts?: number;
+  /** Record a live trace (events.ndjson + status.json) for this run and return its location. */
+  trace?: boolean;
   /** Record the outcome in the provider status file (default true). */
   recordStatus?: boolean;
   /** Refuse without launching while a cached daily-quota lock is active (default true). */
@@ -158,6 +167,8 @@ export interface ClineInvocationOptions {
 
 export interface ClineResponse extends ClineFinalResult {
   durationMs: number;
+  /** Where this run's live trace was written (only when requested). */
+  trace?: TraceInfo;
 }
 
 const DEFAULT_TIMEOUT_SECONDS = 180;
@@ -274,12 +285,22 @@ export function formatErrorAsText(error: unknown, fallbackMessage: string): stri
     if (error.stdoutTail && !error.message.includes(error.stdoutTail)) {
       lines.push(`Stdout tail:\n${error.stdoutTail}`);
     }
+    if (error.trace) {
+      lines.push(`Trace: ${error.trace.dir}`);
+    }
+    for (const note of error.notes ?? []) {
+      lines.push(`Note: ${note}`);
+    }
     if ("evidence" in error && (error as any).evidence) {
       lines.push(`Evidence:\n${JSON.stringify((error as any).evidence, null, 2)}`);
     }
     return lines.join("\n\n");
   }
-  return error instanceof Error ? error.message : fallbackMessage;
+  if (error instanceof Error) {
+    const trace = (error as { trace?: TraceInfo }).trace;
+    return trace ? `${error.message}\n\nTrace: ${trace.dir}` : error.message;
+  }
+  return fallbackMessage;
 }
 
 export function isTransientError(info: {
@@ -484,6 +505,7 @@ export async function runCline(
   validateInputLimits(effectiveInput);
 
   const deps = options.deps ?? {};
+  const recorder = options.trace ? new TraceRecorder({ base: deps.traceBase, wallNow: deps.wallNow }) : undefined;
   const platform = deps.platform ?? process.platform;
   const settingsPath = resolveProviderSettingsPath(deps.providerSettingsPath);
 
@@ -498,7 +520,7 @@ export async function runCline(
   const minRetryBudgetMs = deps.minRetryBudgetMs ?? (deps.timeoutMs !== undefined ? 0 : Math.min(15_000, Math.floor(totalBudgetMs * 0.25)));
   const wallNow = deps.wallNow ?? Date.now;
 
-  return withProviderOverride(
+  const work = withProviderOverride(
     { provider: effectiveInput.provider, model: effectiveInput.model },
     settingsPath,
     signal,
@@ -561,6 +583,17 @@ export async function runCline(
       nowFn
     }
   );
+  if (!recorder) return work;
+  try {
+    const response = await work;
+    response.trace = await recorder.finish({ ok: true });
+    return response;
+  } catch (err: any) {
+    const info = await recorder.finish({ ok: false, kind: err?.kind, message: err?.message });
+    // Any error object carries the trace location, typed or not, so no caller loses it.
+    if (err && typeof err === "object") (err as { trace?: TraceInfo }).trace = info;
+    throw err;
+  }
 
   async function runAttempts(cwd: string | undefined): Promise<ClineResponse> {
       const windowsEntry = resolveClineEntry(deps.entryPath);
@@ -649,6 +682,12 @@ export async function runCline(
         const started = nowFn();
         let stdout = "";
         let stderr = "";
+        // Per-attempt line splitting for the live trace; fragments never join across attempts.
+        const thisAttempt = attempt;
+        recorder?.attemptStarted(thisAttempt);
+        const splitter = recorder
+          ? new LineSplitter(line => recorder.line(line, thisAttempt), () => recorder.oversizedLine(thisAttempt))
+          : undefined;
         let timedOut = false;
         let cancelled = false;
 
@@ -753,6 +792,7 @@ export async function runCline(
 
           child.stdout?.on("data", (chunk: Buffer | string) => {
             stdout += chunk.toString();
+            splitter?.push(chunk);
           });
           child.stderr?.on("data", (chunk: Buffer | string) => {
             stderr += chunk.toString();
@@ -809,7 +849,9 @@ export async function runCline(
         let exitInfo: { code: number | null; signal: NodeJS.Signals | null; error?: any };
         try {
           exitInfo = await execPromise;
+          splitter?.flush();
         } catch (err: any) {
+          splitter?.flush();
           const errCode = err?.code ? ` (${err.code})` : "";
           throw new ClineRunError("launch_failed", `Unable to launch the local Cline CLI${errCode}: ${err?.message || String(err)}`, {
             exitCode: null,

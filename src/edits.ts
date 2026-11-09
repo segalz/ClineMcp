@@ -129,6 +129,15 @@ export async function applyClineEdits(
     }
   );
 
+  try {
+    return await inspectAfterRun(result);
+  } catch (err) {
+    // The run itself was traced; a failure while inspecting Git must not lose that trace.
+    if (err instanceof ClineRunError && result.trace && !err.trace) err.trace = result.trace;
+    throw err;
+  }
+
+  async function inspectAfterRun(result: Awaited<ReturnType<typeof runCline>>): Promise<ClineEditsResponse> {
   let headAfter: string | undefined;
   let gitDiff: string | undefined;
   let status: string | undefined;
@@ -169,4 +178,5 @@ export async function applyClineEdits(
   }
 
   return { ...result, gitDiff, status, headBefore, headAfter, commitWasReverted };
+  }
 }

@@ -85,8 +85,10 @@ export async function askClineWorkspace(
     throw new ClineRunError("workspace_setup_failed", "Unable to create a temporary Git worktree for Cline.");
   }
 
+  let result: ClineResponse | undefined;
+  let runError: unknown;
   try {
-    return await runCline(
+    result = await runCline(
       { ...input, cwd: worktreePath },
       signal,
       {
@@ -98,7 +100,28 @@ export async function askClineWorkspace(
         model: input.model
       }
     );
-  } finally {
-    await cleanupWorktree(repositoryRoot, worktreePath);
+  } catch (err) {
+    runError = err;
   }
+  try {
+    await cleanupWorktree(repositoryRoot, worktreePath);
+  } catch (cleanupError) {
+    const trace = result?.trace ?? (runError as { trace?: ClineResponse["trace"] } | undefined)?.trace;
+    if (cleanupError instanceof ClineRunError && trace) cleanupError.trace = trace;
+    // A failed run's own error stays primary, but the leftover worktree must still be reported.
+    if (runError === undefined) throw cleanupError;
+    const note = `The temporary worktree ${worktreePath} could not be removed: ${(cleanupError as Error)?.message ?? String(cleanupError)}`;
+    if (runError instanceof ClineRunError) {
+      runError.notes = [...(runError.notes ?? []), note];
+    } else {
+      // A plain error cannot carry notes: report both in one typed error so the leftover path is never hidden.
+      const wrapped = new ClineRunError("workspace_cleanup_failed",
+        `The Cline run failed (${(runError as Error)?.message ?? String(runError)}).`);
+      wrapped.notes = [note];
+      if (trace) wrapped.trace = trace;
+      throw wrapped;
+    }
+  }
+  if (runError !== undefined) throw runError;
+  return result!;
 }

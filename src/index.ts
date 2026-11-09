@@ -6,6 +6,7 @@ import { applyClineEdits, ClineEditsError } from "./edits.js";
 import { askClineWorkspace } from "./workspace.js";
 import { clinePing } from "./ping.js";
 import { listFreeModels } from "./models.js";
+import { cleanupTraces } from "./trace.js";
 import { PROHIBITED_NAMES, resolveProviderSettingsPath, recoverProviderSettingsJournal } from "./settings.js";
 
 const server = new McpServer({ name: "cline-local-bridge", version: "1.0.0" });
@@ -37,14 +38,15 @@ server.registerTool(
   },
   async (input, extra) => {
     try {
-      const result = await askCline(input, extra.signal);
+      const result = await askCline(input, extra.signal, { trace: true });
       const response = {
         text: result.text,
         ...(result.model ? { model: result.model } : {}),
         durationMs: result.durationMs,
         ...(result.usage ? { usage: result.usage } : {}),
         ...(result.cost !== undefined ? { cost: result.cost } : {}),
-        ...(result.warnings && result.warnings.length > 0 ? { warnings: result.warnings } : {})
+        ...(result.warnings && result.warnings.length > 0 ? { warnings: result.warnings } : {}),
+        ...(result.trace ? { trace: result.trace } : {})
       };
       return { content: [{ type: "text", text: JSON.stringify(response, null, 2) }] };
     } catch (error) {
@@ -69,7 +71,7 @@ server.registerTool(
   },
   async (input, extra) => {
     try {
-      const result = await applyClineEdits(input, extra.signal);
+      const result = await applyClineEdits(input, extra.signal, { trace: true });
       return {
         content: [{
           type: "text",
@@ -84,7 +86,8 @@ server.registerTool(
             headBefore: result.headBefore,
             headAfter: result.headAfter,
             commitWasReverted: result.commitWasReverted,
-            ...(result.warnings && result.warnings.length > 0 ? { warnings: result.warnings } : {})
+            ...(result.warnings && result.warnings.length > 0 ? { warnings: result.warnings } : {}),
+            ...(result.trace ? { trace: result.trace } : {})
           }, null, 2)
         }]
       };
@@ -100,6 +103,7 @@ server.registerTool(
               ...(error.attempts !== undefined ? { attempts: error.attempts } : {}),
               ...(error.stderrTail ? { stderrTail: error.stderrTail } : {}),
               ...(error.stdoutTail ? { stdoutTail: error.stdoutTail } : {}),
+              ...(error.trace ? { trace: error.trace } : {}),
               ...error.evidence
             }, null, 2)
           }],
@@ -118,7 +122,9 @@ server.registerTool(
               ...(error.resetAt ? { resetAt: error.resetAt } : {}),
               ...(error.retryAfterSeconds !== undefined ? { retryAfterSeconds: error.retryAfterSeconds } : {}),
               ...(error.stderrTail ? { stderrTail: error.stderrTail } : {}),
-              ...(error.stdoutTail ? { stdoutTail: error.stdoutTail } : {})
+              ...(error.stdoutTail ? { stdoutTail: error.stdoutTail } : {}),
+              ...(error.trace ? { trace: error.trace } : {}),
+              ...(error.notes?.length ? { notes: error.notes } : {})
             }, null, 2)
           }],
           isError: true
@@ -129,7 +135,8 @@ server.registerTool(
           type: "text",
           text: JSON.stringify({
             kind: "unexpected",
-            message: error instanceof Error ? error.message : "The Cline editing request failed unexpectedly."
+            message: error instanceof Error ? error.message : "The Cline editing request failed unexpectedly.",
+            ...((error as { trace?: unknown } | undefined)?.trace ? { trace: (error as { trace: unknown }).trace } : {})
           }, null, 2)
         }],
         isError: true
@@ -153,7 +160,7 @@ server.registerTool(
   },
   async (input, extra) => {
     try {
-      const result = await askClineWorkspace(input, extra.signal);
+      const result = await askClineWorkspace(input, extra.signal, { trace: true });
       return {
         content: [{
           type: "text",
@@ -163,7 +170,8 @@ server.registerTool(
             durationMs: result.durationMs,
             ...(result.usage ? { usage: result.usage } : {}),
             ...(result.cost !== undefined ? { cost: result.cost } : {}),
-            ...(result.warnings && result.warnings.length > 0 ? { warnings: result.warnings } : {})
+            ...(result.warnings && result.warnings.length > 0 ? { warnings: result.warnings } : {}),
+            ...(result.trace ? { trace: result.trace } : {})
           }, null, 2)
         }]
       };
@@ -221,5 +229,8 @@ try {
 } catch {
   console.error("Settings startup recovery could not acquire the mutex or access settings; the journal was retained.");
 }
+
+// Old finished traces and traces of dead bridge processes; never blocks startup.
+void cleanupTraces().catch(() => {});
 
 await server.connect(new StdioServerTransport());

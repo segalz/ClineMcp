@@ -23,12 +23,12 @@ Status values: `todo`, `in progress`, `done`, `blocked`, `skipped`.
 | 3.4 | Tests for discovery | done | 2026-11-09 | 118 tests, 116 pass, 2 skipped (symlink test needs Windows symlink privilege) |
 | 3.R | Verify: code review | done | 2026-11-09 | Codex round 1 FAIL (prohibited ids, symlink root, `""` entry) → fixed; round 2 PASS |
 | 3.L | Verify: live check against Cline | done | 2026-11-09 | After the user re-signed in (login had expired 22:49): list → 5 free models; ping: `cline-free/nemotron-3.5-super-vl`, `cline-free/solar-mini4`, `nvidia/nemotron-3.5-lightning-free` available; `poolside/laguna-s-2.1-free` "model not supported", `reflection/beam-free` "Insufficient balance" (listed ≠ usable; status join shows it). `ask_cline` on `nvidia/nemotron-3.5-lightning-free` → PONG; settings restored |
-| 4.1 | Write events.ndjson live | todo | | |
-| 4.2 | Redaction and size cap | todo | | |
-| 4.3 | Status reducer → status.json | todo | | |
-| 4.4 | Cleanup (TTL, orphans) | todo | | |
-| 4.R | Verify: code review | todo | | |
-| 4.L | Verify: live check against Cline | todo | | |
+| 4.1 | Write events.ndjson live | done | 2026-11-09 | `src/trace.ts` TraceRecorder; per-attempt LineSplitter in runner; async ordered appends |
+| 4.2 | Redaction and size cap | done | 2026-11-09 | Decoded-value redaction, sensitive keys redact subtrees, deltas never persisted, oversized/cut-off lines dropped with markers; 5 MB file / 1 MB queue caps (D-18) |
+| 4.3 | Status reducer → status.json | done | 2026-11-09 | state, attempt, iteration, current tool+target, tool count, files, last complete reasoning/text, streamingChars, ask_question + auto-answer; 500 ms coalescing + 30 s heartbeat |
+| 4.4 | Cleanup (TTL, orphans) | done | 2026-11-09 | On bridge start: finished > 24 h, dead-PID orphans, live PID silent > 7 days. Removal right after collection belongs to Stage 5 (D-19) |
+| 4.R | Verify: code review | done | 2026-11-09 | Codex 6 rounds: partial-delta secret, recursion crash, unbounded finish, live-trace deletion, lost traces on wrapper/plain errors, oversized lines, structured-key gaps, retry task id → all fixed; round 6 PASS |
+| 4.L | Verify: live check against Cline | done | 2026-11-09 | Via MCP `ask_cline` on `cline-free/nemotron-3.5-super-vl`: status.json changed every second during the run (iteration, tools, streaming chars, reasoning); response carried `trace`; 23 events, 0 deltas, 0 dropped. Side finding: `ask_cline` runs with auto-approve off, so Cline could not read files and asked for approval (pre-existing behaviour, see D-20) |
 | 5.1 | `cline_start` | todo | | |
 | 5.2 | `cline_status` long-poll | todo | | |
 | 5.3 | `cline_cancel`, `cline_result`, log_run_hint | todo | | |

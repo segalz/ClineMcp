@@ -246,7 +246,7 @@ export async function readStatusEntry(statusPath: string, provider?: string, mod
     ? entry : undefined;
 }
 
-async function atomicWriteJson(destination: string, data: unknown): Promise<void> {
+export async function atomicWriteJson(destination: string, data: unknown): Promise<void> {
   await mkdir(path.dirname(destination), { recursive: true });
   const temp = `${destination}.${randomUUID()}.tmp`;
   try {

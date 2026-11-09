@@ -94,6 +94,25 @@ e.g. `reflection/beam-free`). All are used with provider `cline`.
 **Why:** Codex analysis: zero pricing also covers routers such as `openrouter/auto`; the explicit free list is
 Cline's own classification.
 
+### D-18 — 2026-11-09 — Trace redaction is defense in depth, not a security boundary
+**Decision:** Traces live in the same user's TEMP with owner-only permissions. Structured values are redacted
+reliably (a sensitive key redacts its whole subtree, any type). Free-text reasoning is covered only by the
+text patterns; JSON embedded as text with escaped quotes may slip through, and that is accepted. Streaming
+deltas are never persisted; the status shows only complete blocks.
+**Why:** Cline itself already stores every session's full, unredacted messages in `~/.cline/data/sessions`
+for the same user (2,899 sessions on 2026-11-09), so the trace exposes nothing new. Codex review kept finding
+new free-text formats; perfect free-text redaction is not achievable.
+
+### D-19 — 2026-11-09 — Sync calls keep their trace for 24 h
+**Decision:** `ask_cline`, `ask_cline_workspace` and `apply_cline_edits` always record a trace and return its
+location (also on errors). Traces are removed on bridge start after 24 h, or when their process died.
+Removal "after the result is collected" applies to async tasks (Stage 5).
+
+### D-20 — 2026-11-09 — Observation: `ask_cline` cannot read files
+`ask_cline` runs Cline with `--auto-approve false`, so even read tools are refused and Cline asks for approval
+in its answer. `ask_cline_workspace` (auto-approve on, disposable worktree) is the tool for repository reads.
+Not changed in v2; noted so callers are not surprised.
+
 ### Open risk — settings restore vs. a concurrent token refresh
 The restore reads the freshest settings file and rewrites it. If another Cline client (the desktop app)
 rotates the login token in the milliseconds between that read and write, the rotation could be lost and
