@@ -22,7 +22,7 @@ Status values: `todo`, `in progress`, `done`, `blocked`, `skipped`.
 | 3.3 | Tool `cline_list_models` | done | 2026-11-09 | Joins last bridge status per model |
 | 3.4 | Tests for discovery | done | 2026-11-09 | 118 tests, 116 pass, 2 skipped (symlink test needs Windows symlink privilege) |
 | 3.R | Verify: code review | done | 2026-11-09 | Codex round 1 FAIL (prohibited ids, symlink root, `""` entry) → fixed; round 2 PASS |
-| 3.L | Verify: live check against Cline | blocked | 2026-11-09 | `cline_list_models` via MCP OK: 5 free models, CLI 3.0.74, status join OK. Ping/ask blocked: Cline login expired 22:49 ("cline requires re-authentication") for every model; needs the user to sign in to Cline again |
+| 3.L | Verify: live check against Cline | done | 2026-11-09 | After the user re-signed in (login had expired 22:49): list → 5 free models; ping: `cline-free/nemotron-3.5-super-vl`, `cline-free/solar-mini4`, `nvidia/nemotron-3.5-lightning-free` available; `poolside/laguna-s-2.1-free` "model not supported", `reflection/beam-free` "Insufficient balance" (listed ≠ usable; status join shows it). `ask_cline` on `nvidia/nemotron-3.5-lightning-free` → PONG; settings restored |
 | 4.1 | Write events.ndjson live | todo | | |
 | 4.2 | Redaction and size cap | todo | | |
 | 4.3 | Status reducer → status.json | todo | | |
