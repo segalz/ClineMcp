@@ -4,6 +4,7 @@ import { z } from "zod";
 import { askCline, ClineRunError, formatErrorAsText } from "./runner.js";
 import { applyClineEdits, ClineEditsError } from "./edits.js";
 import { askClineWorkspace } from "./workspace.js";
+import { clinePing } from "./ping.js";
 import { PROHIBITED_NAMES, resolveProviderSettingsPath, recoverProviderSettingsJournal } from "./settings.js";
 
 const server = new McpServer({ name: "cline-local-bridge", version: "1.0.0" });
@@ -112,6 +113,8 @@ server.registerTool(
               message: error.message,
               ...(error.exitCode !== undefined && error.exitCode !== null ? { exitCode: error.exitCode } : {}),
               ...(error.attempts !== undefined ? { attempts: error.attempts } : {}),
+              ...(error.resetAt ? { resetAt: error.resetAt } : {}),
+              ...(error.retryAfterSeconds !== undefined ? { retryAfterSeconds: error.retryAfterSeconds } : {}),
               ...(error.stderrTail ? { stderrTail: error.stderrTail } : {}),
               ...(error.stdoutTail ? { stdoutTail: error.stdoutTail } : {})
             }, null, 2)
@@ -164,6 +167,29 @@ server.registerTool(
       };
     } catch (error) {
       const message = formatErrorAsText(error, "The isolated Cline workspace review failed unexpectedly.");
+      return { content: [{ type: "text", text: message }], isError: true };
+    }
+  }
+);
+
+server.registerTool(
+  "cline_ping",
+  {
+    description: "Check whether the configured Cline provider/model can answer right now with a one-word, single-attempt request. " +
+      "Returns available, rate_limited, quota_exhausted (with reset time) or unreachable; results are cached per provider+model.",
+    inputSchema: {
+      provider: providerModelSchema,
+      model: providerModelSchema,
+      force: z.boolean().optional(),
+      timeoutSeconds: z.number().int().min(5).max(60).optional()
+    }
+  },
+  async (input, extra) => {
+    try {
+      const result = await clinePing(input, extra.signal);
+      return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
+    } catch (error) {
+      const message = formatErrorAsText(error, "The Cline ping failed unexpectedly.");
       return { content: [{ type: "text", text: message }], isError: true };
     }
   }

@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import test from "node:test";
+import test, { after } from "node:test";
 import { mkdtemp, readFile, writeFile, rm, unlink } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -13,6 +13,10 @@ import { ClineRunError, runCline } from "../runner.js";
 import { EventEmitter } from "node:events";
 import { spawn } from "node:child_process";
 import { createServer } from "node:net";
+
+// Runs here must never touch the real provider status file.
+process.env.CLINE_MCP_STATUS_PATH = path.join(os.tmpdir(), `cline-settings-status-${process.pid}.json`);
+after(() => rm(process.env.CLINE_MCP_STATUS_PATH!, { force: true }));
 
 const delay = (ms: number) => new Promise<void>(resolve => setTimeout(resolve, ms));
 const deferred = () => {

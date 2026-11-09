@@ -22,6 +22,7 @@ import {
 
 const isolatedSettingsDir = await mkdtemp(path.join(os.tmpdir(), "cline-runner-isolated-"));
 process.env.CLINE_PROVIDER_SETTINGS_PATH = path.join(isolatedSettingsDir, "providers.json");
+process.env.CLINE_MCP_STATUS_PATH = path.join(isolatedSettingsDir, "status.json");
 after(() => rm(isolatedSettingsDir, { recursive: true, force: true }));
 
 function createMockChild() {
@@ -354,8 +355,7 @@ test("timeout message with elapsed", async () => {
       assert.ok(err instanceof ClineRunError);
       assert.equal(err.kind, "timeout");
       assert.equal(err.attempts, 2);
-      assert.match(err.message, /Cline exceeded the 5-second timeout/);
-      assert.match(err.message, /elapsed: \d+(\.\d+)?s/);
+      assert.match(err.message, /attempt 2\/2 killed at \d+(\.\d+)?s of [\d.]+s budget \(total 5s\)/);
       return true;
     }
   );

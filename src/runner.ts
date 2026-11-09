@@ -14,6 +14,17 @@ import {
   withProviderOverride,
   type MutexOptions
 } from "./settings.js";
+import {
+  activeQuotaLock,
+  buildEntry,
+  classifyErrorText,
+  classifyRunError,
+  isDailyQuotaText,
+  readStatusEntry,
+  recordStatusSafely,
+  resolveStatusPath,
+  type ProviderState
+} from "./status.js";
 
 export type ThinkingLevel = "none" | "low" | "medium" | "high" | "xhigh";
 
@@ -42,7 +53,8 @@ export type ClineErrorKind =
   | "workspace_setup_failed"
   | "workspace_cleanup_failed"
   | "commit_created"
-  | "edits_inspection_failed";
+  | "edits_inspection_failed"
+  | "quota_exhausted";
 
 export interface ClineRunErrorDetails {
   exitCode?: number | null;
@@ -50,6 +62,9 @@ export interface ClineRunErrorDetails {
   stdoutTail?: string;
   attempts?: number;
   extractedMessage?: string;
+  providerState?: ProviderState;
+  resetAt?: string;
+  retryAfterSeconds?: number;
 }
 
 export class ClineRunError extends Error {
@@ -58,6 +73,9 @@ export class ClineRunError extends Error {
   public readonly stdoutTail?: string;
   public readonly attempts?: number;
   public readonly extractedMessage?: string;
+  public readonly providerState?: ProviderState;
+  public readonly resetAt?: string;
+  public readonly retryAfterSeconds?: number;
 
   constructor(
     public readonly kind: ClineErrorKind,
@@ -72,6 +90,9 @@ export class ClineRunError extends Error {
       this.stdoutTail = details.stdoutTail;
       this.attempts = details.attempts;
       this.extractedMessage = details.extractedMessage ? redactSecrets(details.extractedMessage) : undefined;
+      this.providerState = details.providerState;
+      this.resetAt = details.resetAt;
+      this.retryAfterSeconds = details.retryAfterSeconds;
     }
   }
 }
@@ -112,6 +133,10 @@ export interface ClineDependencies {
   totalBudgetMs?: number;
   killTree?: KillTreeFn;
   now?: () => number;
+  /** Wall clock for the provider status file; `now` stays monotonic. */
+  wallNow?: () => number;
+  /** Provider status file; null disables status bookkeeping. */
+  statusPath?: string | null;
 }
 
 export interface ClineInvocationOptions {
@@ -121,6 +146,12 @@ export interface ClineInvocationOptions {
   provider?: string;
   model?: string;
   deps?: ClineDependencies;
+  /** Defaults to 2; the ping uses 1. */
+  maxAttempts?: number;
+  /** Record the outcome in the provider status file (default true). */
+  recordStatus?: boolean;
+  /** Refuse without launching while a cached daily-quota lock is active (default true). */
+  respectQuotaLock?: boolean;
   canRetry?: (attemptOutput: { stdout: string; stderr: string; attempt: number }) => Promise<boolean> | boolean;
 }
 
@@ -197,6 +228,11 @@ export function redactSecrets(text: string): string {
   return result;
 }
 
+function formatSeconds(ms: number): string {
+  const seconds = ms / 1000;
+  return Number.isInteger(seconds) ? `${seconds}s` : `${seconds.toFixed(seconds < 10 ? 3 : 1)}s`;
+}
+
 export function getTail(text: string, maxChars: number = TAIL_CHARACTERS): string {
   if (!text) return "";
   return text.length <= maxChars ? text : text.slice(-maxChars);
@@ -224,6 +260,12 @@ export function formatErrorAsText(error: unknown, fallbackMessage: string): stri
     }
     if (error.attempts !== undefined && !error.message.includes(`Attempts: ${error.attempts}`)) {
       lines.push(`Attempts: ${error.attempts}`);
+    }
+    if (error.resetAt) {
+      lines.push(`Reset at: ${error.resetAt}`);
+    }
+    if (error.retryAfterSeconds !== undefined) {
+      lines.push(`Retry after: ${error.retryAfterSeconds}s`);
     }
     if (error.stderrTail && !error.message.includes(error.stderrTail)) {
       lines.push(`Stderr tail:\n${error.stderrTail}`);
@@ -435,6 +477,7 @@ export async function runCline(
   const schedule = deps.setTimeout ?? setTimeout;
   const unschedule = deps.clearTimeout ?? clearTimeout;
   const minRetryBudgetMs = deps.minRetryBudgetMs ?? (deps.timeoutMs !== undefined ? 0 : Math.min(15_000, Math.floor(totalBudgetMs * 0.25)));
+  const wallNow = deps.wallNow ?? Date.now;
 
   return withProviderOverride(
     { provider: effectiveInput.provider, model: effectiveInput.model },
@@ -444,6 +487,63 @@ export async function runCline(
       effectiveInput.provider = selection.provider;
       effectiveInput.model = selection.model;
       const cwd = await validateCwd(effectiveInput.cwd, deps.access);
+
+      const statusPath = options.recordStatus === false && options.respectQuotaLock === false
+        ? undefined
+        : resolveStatusPath(deps.statusPath);
+      if (statusPath && options.respectQuotaLock !== false) {
+        const lock = activeQuotaLock(
+          await readStatusEntry(statusPath, effectiveInput.provider, effectiveInput.model).catch(() => undefined),
+          wallNow()
+        );
+        if (lock) {
+          throw new ClineRunError(
+            "quota_exhausted",
+            `Daily free quota for ${lock.provider}/${lock.model} is exhausted until ${lock.reset_at ?? lock.expires_at} ` +
+              `(recorded ${lock.checked_at}); Cline was not launched.`,
+            { attempts: 0, providerState: "quota_exhausted", resetAt: lock.reset_at ?? lock.expires_at, extractedMessage: lock.reason }
+          );
+        }
+      }
+
+      const recordPath = options.recordStatus === false ? undefined : statusPath;
+      const statusStarted = nowFn();
+      try {
+        const response = await runAttempts(cwd);
+        await recordStatusSafely(recordPath, buildEntry({
+          provider: effectiveInput.provider,
+          model: effectiveInput.model,
+          classification: { state: "available" },
+          reason: "real run completed",
+          source: "run",
+          latencyMs: nowFn() - statusStarted
+        }, wallNow()));
+        return response;
+      } catch (error) {
+        const classified = recordPath ? classifyRunError(error, wallNow()) : undefined;
+        if (classified) {
+          await recordStatusSafely(recordPath, buildEntry({
+            provider: effectiveInput.provider,
+            model: effectiveInput.model,
+            classification: classified,
+            reason: redactSecrets(classified.reason),
+            source: "run",
+            latencyMs: nowFn() - statusStarted
+          }, wallNow()));
+        }
+        throw error;
+      }
+    },
+    {
+      deadline: overallDeadline,
+      lockTimeoutMs: deps.lockTimeoutMs,
+      acquireSettingsMutex: deps.acquireSettingsMutex,
+      sleep: deps.sleep,
+      nowFn
+    }
+  );
+
+  async function runAttempts(cwd: string | undefined): Promise<ClineResponse> {
       const windowsEntry = deps.entryPath ?? (process.platform === "win32" && process.env.APPDATA
         ? path.join(process.env.APPDATA, "npm", "node_modules", "cline", "bin", "cline")
         : undefined);
@@ -455,7 +555,7 @@ export async function runCline(
       const executable = (process.platform === "win32" || deps.entryPath) ? process.execPath : "cline";
       const backoffMs = deps.backoffMs ?? 2500;
       const updateBackoffMs = deps.updateBackoffMs ?? 2000;
-      const maxAttempts = 2;
+      const maxAttempts = Math.max(1, options.maxAttempts ?? 2);
       let attempt = 0;
 
       while (attempt < maxAttempts) {
@@ -752,10 +852,24 @@ export async function runCline(
           };
         }
 
+        // A provider may print a quota error and then hang; never retry that scope.
+        const earlyQuotaText = [extractLastJsonlError(stdout, stderr), extractRunResultErrorText(stdout), stderr].filter(Boolean).join("\n");
+        if (isDailyQuotaText(earlyQuotaText)) {
+          const quota = classifyErrorText(earlyQuotaText, wallNow());
+          throw new ClineRunError("quota_exhausted", "Cline daily free quota exhausted. Not retried.", {
+            exitCode: code, stderrTail, stdoutTail, attempts: attempt,
+            extractedMessage: redactSecrets(earlyQuotaText) + (quota.assumedReset ? " (reset time not given; assumed next UTC midnight)" : ""),
+            providerState: "quota_exhausted",
+            resetAt: quota.resetAtMs !== undefined ? new Date(quota.resetAtMs).toISOString() : undefined,
+            retryAfterSeconds: quota.retryAfterSeconds
+          });
+        }
+
         // 2. Timeout check with budget split
         if (timedOut) {
           const timeoutMsg = buildErrorTextWithTails(
-            `Cline exceeded the ${timeoutSeconds}-second timeout (elapsed: ${elapsedSec}s).`,
+            `Cline timeout: attempt ${attempt}/${maxAttempts} killed at ${elapsedSec}s of ${formatSeconds(attemptTimerMs)} budget ` +
+              `(total ${timeoutSeconds}s).`,
             stderrTail,
             stdoutTail
           );
@@ -824,6 +938,7 @@ export async function runCline(
         const runResultErrorText = rawRunResultError ? redactSecrets(rawRunResultError) : undefined;
         const rawPlainStderrError = extractPlainStderrError(stderr);
         const plainStderrError = rawPlainStderrError ? redactSecrets(rawPlainStderrError) : undefined;
+
         const transient = isTransientError({
           code,
           stderr,
@@ -914,15 +1029,7 @@ export async function runCline(
       }
 
       throw new ClineRunError("launch_failed", "Cline execution failed unexpectedly.", { attempts: attempt });
-    },
-    {
-      deadline: overallDeadline,
-      lockTimeoutMs: deps.lockTimeoutMs,
-      acquireSettingsMutex: deps.acquireSettingsMutex,
-      sleep: deps.sleep,
-      nowFn
-    }
-  );
+  }
 }
 
 export async function askCline(
