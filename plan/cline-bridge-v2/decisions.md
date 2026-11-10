@@ -41,7 +41,7 @@ Any `ask_question` call that still happens is surfaced as `auto_answered`.
 ### D-07 — 2026-11-09 — No automatic retry for async tasks; max 2 concurrent
 **Why:** A task that edits files must not be re-run blindly (F9). The concurrency cap protects quota and the machine.
 
-### D-08 — 2026-11-09 — Deferred: micro-step splitting
+### D-08 — 2026-11-09 — Deferred: micro-step splitting (planned as Stage 9 on 2026-11-10)
 **Decision:** Not in v2. When added, the bridge forces a short plan step that returns structured JSON; Cline decides the content.
 
 ### D-09 — 2026-11-09 — Deferred: true mid-run two-way dialogue

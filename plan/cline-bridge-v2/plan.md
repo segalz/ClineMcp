@@ -174,3 +174,16 @@ Cross-machine sharing is future work: [future-supabase.md](future-supabase.md).
 
 Stage 0 → 1 → 2 → 3 (2.2 uses 3) → 4 → 5 → 6 → 7 → 8. Stages 1–3 alone already restore a working,
 parallel-safe synchronous bridge and can be released before 4–6.
+
+## Stage 9 — Micro-steps (planned, from D-08)
+
+Lesson from 2026-11-10: one long Cline run (4 CLIs, 62 tool calls, ~374k input tokens) lost focus and
+looped on a failed search-and-replace. Short, focused runs did well.
+
+| Step | Work | Done when |
+|---|---|---|
+| 9.1 | Planning run: Cline returns a short list of steps as JSON in a temp file (bridge forces the shape, Cline decides the content). | Test with fake Cline. |
+| 9.2 | Each step runs as its own short task with a small context (original goal + its step + results so far). | Tests. |
+| 9.3 | Loop guard: the same failing tool call repeated N times stops the step and reports it. | Test with a repeated failing edit. |
+| 9.4 | Final merge step writes the result once. | Tests. |
+| 9.R / 9.L | Review; live run of a multi-part research task. | No loop; every step short. |

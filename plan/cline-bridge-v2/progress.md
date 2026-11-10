@@ -54,6 +54,12 @@ Status values: `todo`, `in progress`, `done`, `blocked`, `skipped`.
 | 8.7 | CLI status in replies and dashboard | done | 2026-11-10 | `cli` field in replies when not ok (always in `cline_list_models`); dashboard CLI line with text + tone + marker shape |
 | 8.R | Verify: code review | done | 2026-11-10 | Claude reviewed: round 1 — self-check pinged an unusable model (would roll back every update), state could claim an uninstalled version, hard-coded default version; round 2 — a test overwrote the real `catalog.json`, 4 flaky tests → all fixed by AGY; bridge 207 tests 205 pass / 2 skip (×3, real files untouched), picker 3100 pass / 1 skip |
 | 8.L | Verify: live check against Cline | done | 2026-11-10 | Live via MCP: state.json created, daily check ran (latest 3.0.74 = installed, ok), no `cli` field when ok; `pingall` pinged 5 models; forced `backend_status` (42 s) → 3 available, beam/laguna unavailable with evidence, `pick` → explicit model; real-data dashboard rendered. Rollback / `updating` verified by unit tests only (no newer CLI exists; a real failed install is not forced) |
+| 9.1 | Planning run returns steps | todo | | |
+| 9.2 | One short task per step | todo | | |
+| 9.3 | Loop guard | todo | | |
+| 9.4 | Final merge | todo | | |
+| 9.R | Verify: code review | todo | | |
+| 9.L | Verify: live check against Cline | todo | | |
 
 | X.1 | `ask_cline` no-tools notice + Windows length guard (D-21) | done | 2026-11-09 | Codex analysis + review (3 rounds: Windows command-line length, UTF-16 count) PASS; 139 tests; live 0 tool calls / 1 iteration |
 
