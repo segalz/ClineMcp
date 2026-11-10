@@ -138,6 +138,21 @@ locally (bad cwd, Git setup, settings lock, launch, catalog, cleanup). Otherwise
 quota/rate limit → `quota` (with `retry_after_s`), anything else → `crash`.
 **Why:** model-picker counts crashes against the model's skill; local failures are not the model's fault.
 
+### D-24 — 2026-11-10 — Stage 6 is written by AGY and reviewed by Codex
+**Decision:** At the user's request, Stage 6 code is implemented by AGY (`antigravity_ask`, write mode, branch
+`bridge-v2`) and reviewed by Codex (`codex_ask`, read-only). Claude writes no Stage 6 code: it writes the prompts,
+verifies the diff and tests itself, runs the live check, and commits.
+**Why:** Requested by the user ("only Codex and AGY do the next stage"). Cline stays out (D-12).
+
+### D-25 — 2026-11-10 — A question is the trailing `QUESTION:` block, without Markdown parsing
+**Decision:** A run's answer is a question only when its last non-empty lines are `QUESTION: ...` and optionally
+`OPTIONS: ...`, each with at most 3 leading spaces and no tab. No fence tracking: a closed code block always ends
+with its closing fence, so a `QUESTION:` inside it is never the last line, and 4+ spaces / a tab (indented code)
+are rejected. Accepted residual: an answer that ends inside an UNCLOSED fence with a column-0 `QUESTION:` line
+(malformed Markdown) is treated as a question.
+**Why:** Codex review rounds 3–5 kept finding new nested-Markdown cases (4-backtick fences, fences in lists);
+a full CommonMark parser is out of proportion, and the trailing-block rule covers well-formed Markdown.
+
 ### Open risk — settings restore vs. a concurrent token refresh
 The restore reads the freshest settings file and rewrites it. If another Cline client (the desktop app)
 rotates the login token in the milliseconds between that read and write, the rotation could be lost and

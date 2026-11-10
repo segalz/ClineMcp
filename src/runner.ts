@@ -59,7 +59,8 @@ export type ClineErrorKind =
   | "catalog_unavailable"
   | "task_limit"
   | "task_not_found"
-  | "task_running";
+  | "task_running"
+  | "task_not_waiting";
 
 export interface ClineRunErrorDetails {
   exitCode?: number | null;
@@ -1164,5 +1165,6 @@ export async function askCline(
   signal?: AbortSignal,
   options?: ClineInvocationOptions
 ): Promise<ClineResponse> {
-  return runCline(input, signal, { ...options, promptPreamble: NO_TOOLS_PREAMBLE });
+  const promptPreamble = (options?.promptPreamble ?? "") + NO_TOOLS_PREAMBLE;
+  return runCline(input, signal, { ...options, promptPreamble });
 }

@@ -46,7 +46,7 @@ export class ClineEditsError extends ClineRunError {
 }
 
 const MAX_DIFF_CHARACTERS = 48_000;
-const EDIT_SYSTEM_PROMPT = [
+export const EDIT_SYSTEM_PROMPT = [
   "You are implementing a software-development task directly in the current Git checkout.",
   "You may inspect and edit only files needed for the requested task, then run safe, relevant verification commands.",
   "Never run git add, git commit, git merge, git rebase, git checkout, git restore, git reset, git stash, git clean, or change branches.",

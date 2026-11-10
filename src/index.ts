@@ -291,7 +291,7 @@ server.registerTool(
   "cline_status",
   {
     description: "Where a Cline task is now: state, step, current tool, last complete reasoning, files, any question Cline " +
-      `asked. Long poll: returns as soon as the task finishes or asks a new question, else after waitSeconds (max ${MAX_WAIT_SECONDS}).`,
+      `asked. Long poll: returns as soon as the task finishes, asks a question (input_required), or after waitSeconds (max ${MAX_WAIT_SECONDS}).`,
     inputSchema: {
       taskId: z.string().uuid(),
       waitSeconds: z.number().int().min(0).max(MAX_WAIT_SECONDS).optional().describe("Default 20.")
@@ -300,6 +300,26 @@ server.registerTool(
   async ({ taskId, waitSeconds }) => {
     try { return asText(await tasks.status(taskId, waitSeconds ?? 20)); }
     catch (error) { return asError(error, "Reading the task status failed unexpectedly."); }
+  }
+);
+
+server.registerTool(
+  "cline_send",
+  {
+    description: "Send an answer to a Cline task waiting in input_required state. Starts a fresh run under the same taskId.",
+    inputSchema: {
+      taskId: z.string().uuid(),
+      message: z.string().min(1).max(20_000),
+      waitSeconds: z.number().int().min(0).max(30).optional().describe("Wait this long for first progress before returning (default 3).")
+    }
+  },
+  async ({ taskId, message, waitSeconds }) => {
+    try {
+      await tasks.send(taskId, message);
+      return asText(await tasks.status(taskId, waitSeconds ?? 3));
+    } catch (error) {
+      return asError(error, "Sending message to the Cline task failed unexpectedly.");
+    }
   }
 );
 
@@ -318,8 +338,8 @@ server.registerTool(
 server.registerTool(
   "cline_result",
   {
-    description: "Final result of a finished Cline task (answer, usage, and for edits the diff), plus log_run_hint for " +
-      "model-picker log_run (null when cancelled: do not log). Removes the task and its trace unless keepTrace.",
+    description: "Final result of a finished Cline task, or partial result of an input_required task (does not remove the task), " +
+      "plus log_run_hint for model-picker log_run (null when cancelled: do not log). Removes the task and its trace unless keepTrace.",
     inputSchema: { taskId: z.string().uuid(), keepTrace: z.boolean().optional() }
   },
   async ({ taskId, keepTrace }) => {

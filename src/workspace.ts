@@ -21,8 +21,8 @@ export interface AskClineWorkspaceInput {
   model?: string;
 }
 
-const WORKTREE_BASE = path.join(os.tmpdir(), "cline-mcp-worktrees");
-const WORKSPACE_SYSTEM_PROMPT = [
+export const WORKTREE_BASE = path.join(os.tmpdir(), "cline-mcp-worktrees");
+export const WORKSPACE_SYSTEM_PROMPT = [
   "You are performing an analysis-only review in a disposable Git worktree.",
   "Do not create, edit, delete, rename, format, stage, commit, or restore files.",
   "Do not run commands that modify state, access credentials, or make network requests.",

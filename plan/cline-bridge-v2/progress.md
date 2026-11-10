@@ -35,11 +35,11 @@ Status values: `todo`, `in progress`, `done`, `blocked`, `skipped`.
 | 5.4 | Guards: no retry, max 2, wall cap, orphans | done | 2026-11-10 | maxAttempts 1, `task_limit`, 1800 s cap (sync stays 300), shutdown stops tasks AND sync calls, Git deadlines + tree kill (D-22) |
 | 5.R | Verify: code review | done | 2026-11-10 | Codex 9 rounds (shutdown, hanging Git, trace recreation, hint mapping, retry checks, cleanup notes, Git tree kill) → round 9 PASS |
 | 5.L | Verify: live check against Cline | done | 2026-11-10 | Via MCP: A+B in parallel, 3rd refused (`task_limit`); B cancelled at 4 s, its process gone, hint null; long poll returned when A finished (1,030 words, 19.8 s); trace folder removed on collection; closing the client mid-task killed its Cline (0 extra cline.exe) |
-| 6.1 | `QUESTION:` protocol in system prompt | todo | | |
-| 6.2 | Detect input_required / auto_answered | todo | | |
-| 6.3 | `cline_send` → fresh run with context | todo | | |
-| 6.R | Verify: code review | todo | | |
-| 6.L | Verify: live check against Cline | todo | | |
+| 6.1 | `QUESTION:` protocol in system prompt | done | 2026-11-10 | AGY (D-24): `TASK_QUESTION_PREAMBLE` on every task run, combined with ask mode's no-tools notice |
+| 6.2 | Detect input_required / auto_answered | done | 2026-11-10 | Trailing QUESTION/OPTIONS block only (D-25); `autoAnswered` surfaced; long poll returns on it |
+| 6.3 | `cline_send` → fresh run with context | done | 2026-11-10 | Same taskId, run counter + history; prompt = original + previous answer + `git diff --stat` + full Q&A history (with options), budgeted for 20k chars and the Windows command line |
+| 6.R | Verify: code review | done | 2026-11-10 | Codex 8 rounds (resume race, truncation, Windows budget, expiry, code-block questions, stale results, poll starvation, Q&A history, Git lifecycle, options) → PASS; AGY fixed every round; Claude verified each diff and test run |
+| 6.L | Verify: live check against Cline | done | 2026-11-10 | Via MCP: "hello world, which language?" → `input_required` with 5 options; result call kept the task; `cline_send("Go")` → run 2 → Hello World in Go; hint ok, 37.5 s |
 | 7.1 | model-picker: explicit models, `cline-task`, error_kind map | todo | | |
 | 7.2 | model-picker: free list from bridge | todo | | |
 | 7.3 | Update CLAUDE.md contract and README | todo | | |
