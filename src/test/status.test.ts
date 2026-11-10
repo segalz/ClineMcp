@@ -26,6 +26,9 @@ import {
 const root = await mkdtemp(path.join(os.tmpdir(), "cline-status-test-"));
 process.env.CLINE_PROVIDER_SETTINGS_PATH = path.join(root, "providers.json");
 process.env.CLINE_MCP_STATUS_PATH = path.join(root, "shared-status.json");
+process.env.CLINE_MCP_CATALOG_PATH = path.join(root, "shared-catalog.json");
+process.env.CLINE_MCP_STATE_PATH = path.join(root, "shared-state.json");
+process.env.CLINE_MCP_TRACE_DIR = path.join(root, "traces");
 after(() => rm(root, { recursive: true, force: true }));
 
 const NOW = Date.parse("2026-11-09T10:00:00.000Z");

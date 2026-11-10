@@ -18,6 +18,9 @@ import { TraceRecorder } from "../trace.js";
 const root = await mkdtemp(path.join(os.tmpdir(), "cline-tasks-test-"));
 process.env.CLINE_MCP_STATUS_PATH = path.join(root, "provider-status.json");
 process.env.CLINE_PROVIDER_SETTINGS_PATH = path.join(root, "providers.json");
+process.env.CLINE_MCP_CATALOG_PATH = path.join(root, "catalog.json");
+process.env.CLINE_MCP_STATE_PATH = path.join(root, "state.json");
+process.env.CLINE_MCP_TRACE_DIR = path.join(root, "traces-default");
 after(() => rm(root, { recursive: true, force: true }));
 let counter = 0;
 const traceBase = () => path.join(root, `traces-${++counter}`);
@@ -750,13 +753,15 @@ test("P1 long poll does not starve a resume: status races pending settled promis
 
   // Timer scheduled during resuming must fire and not be starved by concurrent status long poll
   let timerFired = false;
-  setTimeout(() => { timerFired = true; }, 20);
+  const timerPromise = new Promise<void>(resolve => {
+    setTimeout(() => { timerFired = true; resolve(); }, 10);
+  });
 
   // Long poll status call with waitSeconds > 0
   const statusP = m.status(t.taskId, 2);
 
-  // Allow timer to fire
-  await new Promise(r => setTimeout(r, 60));
+  // Allow timer to fire while statusP is actively waiting
+  await timerPromise;
   assert.equal(timerFired, true, "event loop timer fired while status was long polling a resuming task");
 
   // Release git diff to let run 2 launch

@@ -45,15 +45,15 @@ Status values: `todo`, `in progress`, `done`, `blocked`, `skipped`.
 | 7.3 | Update CLAUDE.md contract and README | done | 2026-11-10 | CLAUDE.md: required provider/model incl. `cline_start`, pick unit format, task flow, log_run_hint; README Tools section rewritten for all 10 tools (AGY) |
 | 7.R | Verify: code review | done | 2026-11-10 | Claude reviewed (Codex dropped by the user): round 1 found pick could choose a model missing from the catalog or quota-exhausted → AGY fixed; picker 3080 pass / 1 skip, bridge 186 tests 184 pass / 2 skip |
 | 7.L | Verify: live check against Cline | done | 2026-11-10 | New code from the repos: bridge wrote catalog.json (5 free ids); `pick` → `cline/cline-free/nemotron-3.5-super-vl/fixed` and `cline-task/...` with `cline_start`; `cline_start` on it → done in 14 s, hint ok; `log_run` recorded it (temp ledger; the running picker loads the new config after a restart) |
-| 8.1 | Local state file + lock + sync hook | todo | | |
-| 8.2 | Catalog reload on CLI change | todo | | |
-| 8.3 | Picker: catalog models pickable | todo | | |
-| 8.4 | Dashboard: last real result, refresh pings | todo | | |
-| 8.5 | Daily update check on first call | todo | | |
-| 8.6 | Safe update with rollback | todo | | |
-| 8.7 | CLI status in replies and dashboard | todo | | |
-| 8.R | Verify: code review | todo | | |
-| 8.L | Verify: live check against Cline | todo | | |
+| 8.1 | Local state file + lock + sync hook | done | 2026-11-10 | `src/clistate.ts`: `~/.cline-mcp/state.json` v1 (machine_id, cli version/state/failed versions), atomic + locked, no-op `syncHook` for Supabase (AGY) |
+| 8.2 | Catalog reload on CLI change | done | 2026-11-10 | Installed CLI / `@cline/llms` versions checked per call (mtime cache); catalog reloaded with cache-busted import, no restart |
+| 8.3 | Picker: catalog models pickable | done | 2026-11-10 | model-picker adds catalog models at runtime (mtime cache, lock); absent or evidenced-unavailable models not picked (AGY) |
+| 8.4 | Dashboard: last real result, refresh pings | done | 2026-11-10 | Dashboard rebuilt by Claude with ui-ux-pro-max: every catalog model with last result + time, "לא נבדק" without one, card unavailable only with evidence; `backend_status(force)` runs `dist/pingall.js` once |
+| 8.5 | Daily update check on first call | done | 2026-11-10 | First call after 24 h starts `npm view cline version` in the background; failed versions never retried, only newer ones |
+| 8.6 | Safe update with rollback | done | 2026-11-10 | Install only with no live run (journal) under the settings mutex; self-check pings up to 3 candidates (last-available first); version verified on disk; rollback or `broken` |
+| 8.7 | CLI status in replies and dashboard | done | 2026-11-10 | `cli` field in replies when not ok (always in `cline_list_models`); dashboard CLI line with text + tone + marker shape |
+| 8.R | Verify: code review | done | 2026-11-10 | Claude reviewed: round 1 — self-check pinged an unusable model (would roll back every update), state could claim an uninstalled version, hard-coded default version; round 2 — a test overwrote the real `catalog.json`, 4 flaky tests → all fixed by AGY; bridge 207 tests 205 pass / 2 skip (×3, real files untouched), picker 3100 pass / 1 skip |
+| 8.L | Verify: live check against Cline | done | 2026-11-10 | Live via MCP: state.json created, daily check ran (latest 3.0.74 = installed, ok), no `cli` field when ok; `pingall` pinged 5 models; forced `backend_status` (42 s) → 3 available, beam/laguna unavailable with evidence, `pick` → explicit model; real-data dashboard rendered. Rollback / `updating` verified by unit tests only (no newer CLI exists; a real failed install is not forced) |
 
 | X.1 | `ask_cline` no-tools notice + Windows length guard (D-21) | done | 2026-11-09 | Codex analysis + review (3 rounds: Windows command-line length, UTF-16 count) PASS; 139 tests; live 0 tool calls / 1 iteration |
 

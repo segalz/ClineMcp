@@ -1,9 +1,10 @@
 import path from "node:path";
-import { readFile, realpath } from "node:fs/promises";
+import { readFile, realpath, stat } from "node:fs/promises";
 import { pathToFileURL } from "node:url";
 import { ClineRunError, resolveClineEntry } from "./runner.js";
 import { PROHIBITED_NAMES } from "./settings.js";
 import { atomicWriteJson, readStatusEntry, resolveCatalogPath, resolveStatusPath, type StatusEntry } from "./status.js";
+import { formatCliReplyStatus, readStateFile, resolveStatePath, type CliReplyStatus } from "./clistate.js";
 
 export { resolveCatalogPath };
 
@@ -26,6 +27,7 @@ export interface FreeModelList {
   models: FreeModel[];
   source: { package: string; version?: string; cliVersion?: string };
   note: string;
+  cli?: CliReplyStatus;
 }
 
 export interface ModelCatalogDeps {
@@ -34,6 +36,100 @@ export interface ModelCatalogDeps {
   /** Test seam: replaces the dynamic import of the catalog module. */
   importModule?: (url: string) => Promise<unknown>;
   statusPath?: string;
+  statePath?: string | null;
+  /** Appends `?v=<version>` to the catalog module URL to bust Node's ESM module cache. */
+  cacheBust?: boolean | string;
+  stat?: typeof stat;
+  readFile?: typeof readFile;
+}
+
+interface CachedPackageVersion {
+  mtimeMs: number;
+  ctimeMs: number;
+  size: number;
+  version: string | undefined;
+}
+
+const packageVersionCache = new Map<string, CachedPackageVersion>();
+const lastImportedVersionsByRoot = new Map<string, { cliVersion?: string; llmsVersion?: string }>();
+
+export function clearVersionCache(): void {
+  packageVersionCache.clear();
+}
+
+export async function readPackageVersionCached(
+  packageJsonPath: string,
+  fsDeps?: { stat?: typeof stat; readFile?: typeof readFile }
+): Promise<string | undefined> {
+  const resolved = path.resolve(packageJsonPath);
+  const statFn = fsDeps?.stat ?? stat;
+  const readFileFn = fsDeps?.readFile ?? readFile;
+  try {
+    const st = await statFn(resolved);
+    const cached = packageVersionCache.get(resolved);
+    if (
+      cached &&
+      cached.mtimeMs === st.mtimeMs &&
+      cached.ctimeMs === st.ctimeMs &&
+      cached.size === st.size
+    ) {
+      return cached.version;
+    }
+    const raw = await readFileFn(resolved, "utf8");
+    const parsed = JSON.parse(raw);
+    const version = typeof parsed?.version === "string" ? parsed.version : undefined;
+    packageVersionCache.set(resolved, {
+      mtimeMs: st.mtimeMs,
+      ctimeMs: st.ctimeMs,
+      size: st.size,
+      version
+    });
+    return version;
+  } catch {
+    packageVersionCache.delete(resolved);
+    return undefined;
+  }
+}
+
+export interface InstalledCliVersions {
+  cliRoot: string;
+  packageRoot: string;
+  cliPackageJsonPath: string;
+  llmsPackageJsonPath: string;
+  cliVersion?: string;
+  catalogVersion?: string;
+}
+
+export async function readInstalledCliVersions(
+  deps: Pick<ModelCatalogDeps, "entryPath" | "stat" | "readFile"> = {}
+): Promise<InstalledCliVersions | undefined> {
+  const configured = resolveClineEntry(deps.entryPath);
+  if (!configured) return undefined;
+  let entry: string;
+  try {
+    entry = await realpath(configured);
+  } catch {
+    return undefined;
+  }
+  const cliRoot = path.dirname(path.dirname(entry));
+  const packageRoot = path.join(cliRoot, "node_modules", "@cline", "llms");
+  const cliPackageJsonPath = path.join(cliRoot, "package.json");
+  const llmsPackageJsonPath = path.join(packageRoot, "package.json");
+  const [cliVersion, catalogVersion] = await Promise.all([
+    readPackageVersionCached(cliPackageJsonPath, deps),
+    readPackageVersionCached(llmsPackageJsonPath, deps)
+  ]);
+  if (cliVersion === undefined && catalogVersion === undefined) {
+    return undefined;
+  }
+  return {
+    cliRoot,
+    packageRoot,
+    cliPackageJsonPath,
+    llmsPackageJsonPath,
+    cliVersion,
+    catalogVersion
+  };
 }
 
 function unavailable(message: string): ClineRunError {
@@ -42,11 +138,6 @@ function unavailable(message: string): ClineRunError {
 }
 
 const isObject = (v: unknown): v is Record<string, any> => typeof v === "object" && v !== null && !Array.isArray(v);
-
-async function readVersion(packageJson: string): Promise<string | undefined> {
-  try { const v = JSON.parse(await readFile(packageJson, "utf8")).version; return typeof v === "string" ? v : undefined; }
-  catch { return undefined; }
-}
 
 /**
  * Lists the models Cline itself advertises as free, read from the installed CLI's catalog package
@@ -63,7 +154,30 @@ export async function listFreeModels(deps: ModelCatalogDeps = {}): Promise<FreeM
   catch (err: any) { throw unavailable(`the Cline CLI entry ${configured} is not readable (${err?.code ?? err?.message ?? String(err)}).`); }
   const cliRoot = path.dirname(path.dirname(entry));
   const packageRoot = path.join(cliRoot, "node_modules", "@cline", "llms");
-  const moduleUrl = pathToFileURL(path.join(packageRoot, "dist", "index.js")).href;
+  const [llmsVersion, cliVersion] = await Promise.all([
+    readPackageVersionCached(path.join(packageRoot, "package.json"), deps),
+    readPackageVersionCached(path.join(cliRoot, "package.json"), deps)
+  ]);
+
+  const baseModuleUrl = pathToFileURL(path.join(packageRoot, "dist", "index.js")).href;
+  const prevImported = lastImportedVersionsByRoot.get(packageRoot);
+  const versionChangedSinceLastImport =
+    prevImported !== undefined &&
+    (prevImported.llmsVersion !== llmsVersion || prevImported.cliVersion !== cliVersion);
+
+  let moduleUrl = baseModuleUrl;
+  if (deps.cacheBust || versionChangedSinceLastImport) {
+    const bustToken =
+      typeof deps.cacheBust === "string" && deps.cacheBust
+        ? deps.cacheBust
+        : prevImported && prevImported.llmsVersion !== llmsVersion && llmsVersion
+          ? llmsVersion
+          : prevImported && prevImported.cliVersion !== cliVersion && cliVersion
+            ? cliVersion
+            : llmsVersion ?? cliVersion ?? "reload";
+    moduleUrl = `${baseModuleUrl}?v=${encodeURIComponent(bustToken)}`;
+  }
+  lastImportedVersionsByRoot.set(packageRoot, { cliVersion, llmsVersion });
 
   let mod: unknown;
   try { mod = await (deps.importModule ?? (url => import(url)))(moduleUrl); }
@@ -104,16 +218,36 @@ export async function listFreeModels(deps: ModelCatalogDeps = {}): Promise<FreeM
     }
   }
 
+  let cli: CliReplyStatus = {
+    state: "ok",
+    version: cliVersion ?? "unknown"
+  };
+  const resolvedStatePath = resolveStatePath(deps.statePath);
+  if (resolvedStatePath) {
+    try {
+      const stateFile = await readStateFile(resolvedStatePath, {
+        entryPath: deps.entryPath,
+        stat: deps.stat,
+        readFile: deps.readFile
+      });
+      if (cliVersion) stateFile.cli.version = cliVersion;
+      cli = formatCliReplyStatus(stateFile);
+    } catch {
+      // Fallback to default cli status
+    }
+  }
+
   return {
     provider: CLINE_PROVIDER,
     models,
     source: {
       package: packageRoot,
-      version: await readVersion(path.join(packageRoot, "package.json")),
-      cliVersion: await readVersion(path.join(cliRoot, "package.json"))
+      version: llmsVersion,
+      cliVersion
     },
     note: "Free models as advertised by the installed Cline CLI. The list rotates; being listed does not prove the " +
-      "model answers right now - check with cline_ping."
+      "model answers right now - check with cline_ping.",
+    cli
   };
 }
 

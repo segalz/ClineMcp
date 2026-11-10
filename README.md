@@ -133,7 +133,7 @@ cline_list_models({})
 
 - Reads `GENERATED_CLINE_RECOMMENDED_MODELS.free` (enriched from `getGeneratedModelsForProvider("cline")`) from the installed CLI's `@cline/llms` package; fails with `catalog_unavailable` if unreadable and never guesses model IDs.
 - Attaches `last_status` (`state`, `reason`, `checked_at`, `expires_at`, `source`) from `status.json` when available.
-- Returns `{ provider: "cline", models: [{ provider, id, name, description?, contextWindow?, capabilities?, last_status? }], source: { package, version?, cliVersion? }, note }`.
+- Returns `{ provider: "cline", models: [{ provider, id, name, description?, contextWindow?, capabilities?, last_status? }], source: { package, version?, cliVersion? }, note, cli }`.
 - Every successful call atomically refreshes the local catalog snapshot file (`~/.cline-mcp/catalog.json` or `CLINE_MCP_CATALOG_PATH`), which is also written once in the background at bridge startup.
 
 ### 6. `cline_start`
@@ -304,3 +304,12 @@ If Cline exits with code 0 but stdout contains a `run_result` with `finishReason
 - Transient errors and timeouts on synchronous tools (`ask_cline`, `apply_cline_edits`, `ask_cline_workspace`) trigger a single automatic retry (`maxAttempts: 2`) with a short backoff when sufficient budget remains (`cline_ping` and async tasks run a single attempt with no automatic retry).
 - Non-transient errors (syntax errors, invalid flags, authentication rejections, daily quota exhaustion) are never retried.
 - For `apply_cline_edits`, a retry is only attempted if the first attempt produced no tool calls and no working tree / HEAD modifications; if any change occurred or if uncertain, edits are not retried.
+
+## CLI State, Self-Healing Updates, and Dashboard Ping Script
+
+- **State file (`~/.cline-mcp/state.json` or `CLINE_MCP_STATE_PATH`)**: Tracks `machine_id`, installed `cli.version`, `cli.catalog_version`, `cli.update_state` (`"ok"` | `"update_available"` | `"updating"` | `"rolled_back"` | `"broken"`), `latest_known_version`, `last_check_at`, `previous_version`, `last_error` (≤240 chars, redacted), and `failed_versions`. Written atomically under a lock file (`state.json.lock`) and calls `syncHook(state)` after every write.
+- **Catalog follows the CLI**: On every tool call, the bridge checks the mtime-cached `cline` and `@cline/llms` `package.json` versions; when either changes, it cache-busts the dynamic `@cline/llms` import (`?v=<version>`), rewrites `catalog.json`, and updates `state.json` without restarting.
+- **Daily check & safe background update**: When `last_check_at` is older than 24 h, the first tool call starts a background `npm view cline version` (30 s timeout). If a version newer than installed and newer than all `failed_versions` is found, `update_state` becomes `"update_available"`. When the settings journal has no live runs across the machine, one bridge acquires the settings mutex (`acquireSettingsMutex`, so new runs wait up to 60 s), runs `npm install -g cline@<v>` (300 s timeout), verifies the on-disk `package.json` version, and runs a self-check with `listFreeModels()` + `clinePing` on up to 3 candidate models (preferring models whose last observation in `status.json` is `"available"`, newest `checked_at` first, then catalog order). On failure, it reinstalls and verifies the previous version (`"rolled_back"` and records `failed_versions`, or `"broken"` if rollback also fails). Stale `"updating"` locks (>15 min with a dead PID) are recovered automatically, and bridge shutdown waits for an active install within the 120 s shutdown budget.
+- **`cli` status in replies**: `cline_list_models` always includes `cli: { state, version, latest?, failed? }`; all other tools include `cli` whenever `update_state !== "ok"`.
+- **Refresh ping script (`node dist/pingall.js`)**: Lists the free model catalog and runs `clinePing` sequentially once per model (`provider: "cline"`, `force: true`) within a 120 s total cap, updating `~/.cline-mcp/status.json`, printing a one-line JSON summary, and exiting `0`.
+

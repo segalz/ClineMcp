@@ -173,6 +173,11 @@ rolls back automatically on failure; a failed version is never retried, only a n
 **Why:** Requested by the user. A 60 s observation expiry made every model look unavailable after a restart; periodic
 pings cost quota for nothing; a human approval step would stall remote processes.
 
+### D-29 — 2026-11-10 — Stage 8 roles: AGY codes, Claude reviews; the dashboard UI is Claude's
+**Decision:** AGY (`gemini-4-argon-high`) implemented the bridge and the picker data layer; Claude reviewed every round.
+At the user's request Claude built the dashboard design itself with the `ui-ux-pro-max` skill (status text never by
+colour alone, chips that do not wrap, 4.5:1 contrast).
+
 ### Open risk — settings restore vs. a concurrent token refresh
 The restore reads the freshest settings file and rewrites it. If another Cline client (the desktop app)
 rotates the login token in the milliseconds between that read and write, the rotation could be lost and

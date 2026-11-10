@@ -10,6 +10,9 @@ import { ClineRunError, formatErrorAsText, runCline } from "../runner.js";
 const root = await mkdtemp(path.join(os.tmpdir(), "cline-trace-"));
 process.env.CLINE_MCP_STATUS_PATH = path.join(root, "provider-status.json");
 process.env.CLINE_PROVIDER_SETTINGS_PATH = path.join(root, "providers.json");
+process.env.CLINE_MCP_CATALOG_PATH = path.join(root, "catalog.json");
+process.env.CLINE_MCP_STATE_PATH = path.join(root, "state.json");
+process.env.CLINE_MCP_TRACE_DIR = path.join(root, "traces");
 after(() => rm(root, { recursive: true, force: true }));
 let counter = 0;
 const base = () => path.join(root, `base-${++counter}`);
@@ -105,8 +108,10 @@ test("recorder persists events in order with attempt numbers, skips deltas, and 
 
 test("a secret split across streaming deltas never reaches the status or event file", async () => {
   const rec = new TraceRecorder({ base: base(), statusIntervalMs: 1 });
+  await rec.idle();
   rec.line(JSON.stringify(agent({ type: "content_start", contentType: "reasoning", reasoning: 'config {"password":"hunter2' })), 1);
-  await new Promise(r => setTimeout(r, 30)); // a status write happens before the closing quote arrives
+  await new Promise(r => setTimeout(r, 20)); // a status write happens before the closing quote arrives
+  await rec.idle();
   const mid = await readFile(rec.info.status, "utf8");
   assert.ok(!mid.includes("hunter2"), "status written mid-block must not contain the partial secret");
   rec.line(JSON.stringify(agent({ type: "content_start", contentType: "reasoning", reasoning: '"} done' })), 1);

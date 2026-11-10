@@ -25,6 +25,9 @@ import {
 const isolatedSettingsDir = await mkdtemp(path.join(os.tmpdir(), "cline-runner-isolated-"));
 process.env.CLINE_PROVIDER_SETTINGS_PATH = path.join(isolatedSettingsDir, "providers.json");
 process.env.CLINE_MCP_STATUS_PATH = path.join(isolatedSettingsDir, "status.json");
+process.env.CLINE_MCP_CATALOG_PATH = path.join(isolatedSettingsDir, "catalog.json");
+process.env.CLINE_MCP_STATE_PATH = path.join(isolatedSettingsDir, "state.json");
+process.env.CLINE_MCP_TRACE_DIR = path.join(isolatedSettingsDir, "traces");
 after(() => rm(isolatedSettingsDir, { recursive: true, force: true }));
 
 function createMockChild() {
@@ -1709,10 +1712,18 @@ function fakeClock() {
       const observed = promise.finally(() => { done = true; });
       // Consume rejection while fake timers and asynchronous filesystem operations settle.
       observed.catch(() => {});
+      let idleSpins = 0;
       for (let i = 0; !done && i < 5000; i++) {
         await new Promise<void>(resolve => setImmediate(resolve));
         const next = [...tasks.entries()].sort((a, b) => a[1].at - b[1].at)[0];
-        if (next) { tasks.delete(next[0]); time = Math.max(time, next[1].at); next[1].fn(); }
+        if (next) {
+          idleSpins = 0;
+          tasks.delete(next[0]);
+          time = Math.max(time, next[1].at);
+          next[1].fn();
+        } else if (!done && ++idleSpins >= 10) {
+          await new Promise<void>(resolve => setTimeout(resolve, 2));
+        }
       }
       assert.equal(done, true, "fake-clock request must settle");
       assert.equal(tasks.size, 0, "all timers must be cleared");
@@ -1727,7 +1738,7 @@ test("one deadline includes mutex wait, hung child, kill and settlement grace", 
   let spawnAt: number | undefined;
   let calls = 0;
   let acquisitions = 0;
-  const work = runCline({ prompt: "test", provider: "fake", model: "fake" }, undefined, { deps: {
+  const work = runCline({ prompt: "test", provider: "fake", model: "fake" }, undefined, { recordStatus: false, deps: {
     entryPath: "fake", access: async () => {}, providerSettingsPath: path.join(isolatedSettingsDir, "deadline.json"),
     now: clock.now, setTimeout: clock.schedule, clearTimeout: clock.clear, sleep: clock.sleep,
     totalBudgetMs: 100, minRetryBudgetMs: 15,
@@ -1755,8 +1766,8 @@ test("kill and settlement grace use remaining time when termination starts", asy
   const clock = fakeClock();
   let treeKilledAt: number | undefined;
   let calls = 0;
-  const work = runCline({ provider: "test-provider", model: "test-model", prompt: "test" }, undefined, { deps: {
-    platform: "linux", entryPath: "fake", access: async () => {}, now: clock.now,
+  const work = runCline({ provider: "test-provider", model: "test-model", prompt: "test" }, undefined, { recordStatus: false, deps: {
+    platform: "linux", entryPath: "fake", access: async () => {}, acquireSettingsMutex: async () => async () => {}, now: clock.now,
     setTimeout: clock.schedule, clearTimeout: clock.clear, sleep: clock.sleep,
     totalBudgetMs: 100, minRetryBudgetMs: 50, timeoutMs: 10,
     killGracePeriodMs: 500, settlementDeadlineMs: 1500,
@@ -1773,8 +1784,8 @@ test("kill and settlement grace use remaining time when termination starts", asy
 
 test("exit-without-close grace is clamped when exit arrives near the deadline", async () => {
   const clock = fakeClock();
-  const work = runCline({ provider: "test-provider", model: "test-model", prompt: "test" }, undefined, { deps: {
-    entryPath: "fake", access: async () => {}, now: clock.now,
+  const work = runCline({ provider: "test-provider", model: "test-model", prompt: "test" }, undefined, { recordStatus: false, deps: {
+    entryPath: "fake", access: async () => {}, acquireSettingsMutex: async () => async () => {}, now: clock.now,
     setTimeout: clock.schedule, clearTimeout: clock.clear, sleep: clock.sleep,
     totalBudgetMs: 100, minRetryBudgetMs: 1000, closeGracePeriodMs: 500,
     spawn: (() => {
@@ -1794,8 +1805,8 @@ test("exit-without-close grace is clamped when exit arrives near the deadline", 
 test("retry backoff preserves minimum retry budget within the same deadline", async () => {
   const clock = fakeClock();
   const spawnTimes: number[] = [];
-  const work = runCline({ provider: "test-provider", model: "test-model", prompt: "test" }, undefined, { deps: {
-    entryPath: "fake", access: async () => {}, now: clock.now,
+  const work = runCline({ provider: "test-provider", model: "test-model", prompt: "test" }, undefined, { recordStatus: false, deps: {
+    entryPath: "fake", access: async () => {}, acquireSettingsMutex: async () => async () => {}, now: clock.now,
     setTimeout: clock.schedule, clearTimeout: clock.clear, sleep: clock.sleep,
     totalBudgetMs: 100, minRetryBudgetMs: 30, backoffMs: 200,
     spawn: (() => {
@@ -1821,8 +1832,8 @@ test("retry backoff preserves minimum retry budget within the same deadline", as
 test("attempt timeout is calculated after entry access consumes global budget", async () => {
   const clock = fakeClock();
   let flags: string[] = [];
-  const work = runCline({ provider: "test-provider", model: "test-model", prompt: "test", timeoutSeconds: 100 }, undefined, { deps: {
-    entryPath: "fake", access: async () => { clock.advance(70_000); }, now: clock.now,
+  const work = runCline({ provider: "test-provider", model: "test-model", prompt: "test", timeoutSeconds: 100 }, undefined, { recordStatus: false, deps: {
+    entryPath: "fake", access: async () => { clock.advance(70_000); }, acquireSettingsMutex: async () => async () => {}, now: clock.now,
     setTimeout: clock.schedule, clearTimeout: clock.clear, sleep: clock.sleep,
     totalBudgetMs: 100_000, minRetryBudgetMs: 15_000,
     killTree: () => {},
@@ -1838,9 +1849,10 @@ test("attempt timeout is calculated after entry access consumes global budget", 
 test("retry permission check cannot consume the minimum retry budget and still launch again", async () => {
   const clock = fakeClock(); let calls = 0;
   const work = runCline({ provider: "test-provider", model: "test-model", prompt: "test" }, undefined, {
+    recordStatus: false,
     canRetry: async () => { clock.advance(80); return true; },
     deps: {
-      entryPath: "fake", access: async () => {}, now: clock.now,
+      entryPath: "fake", access: async () => {}, acquireSettingsMutex: async () => async () => {}, now: clock.now,
       setTimeout: clock.schedule, clearTimeout: clock.clear, sleep: clock.sleep,
       totalBudgetMs: 100, minRetryBudgetMs: 30,
       spawn: (() => {
@@ -1866,8 +1878,8 @@ test("POSIX default tree kill signals the negative process-group PID", t => {
 test("Windows kills the live tree first and never kills the root separately", async () => {
   const clock = fakeClock(); const calls: string[] = [];
   let child: any;
-  const work = runCline({ provider: "test-provider", model: "test-model", prompt: "test" }, undefined, { deps: {
-    platform: "win32", entryPath: "fake", access: async () => {}, now: clock.now,
+  const work = runCline({ provider: "test-provider", model: "test-model", prompt: "test" }, undefined, { recordStatus: false, deps: {
+    platform: "win32", entryPath: "fake", access: async () => {}, acquireSettingsMutex: async () => async () => {}, now: clock.now,
     setTimeout: clock.schedule, clearTimeout: clock.clear,
     totalBudgetMs: 100, timeoutMs: 10, minRetryBudgetMs: 1000,
     killTree: pid => {
@@ -1887,8 +1899,8 @@ test("Windows kills the live tree first and never kills the root separately", as
 
 test("POSIX spawns a process group then sends TERM and KILL to the injectable tree killer", async () => {
   const clock = fakeClock(); const signals: Array<NodeJS.Signals | undefined> = [];
-  const work = runCline({ provider: "test-provider", model: "test-model", prompt: "test" }, undefined, { deps: {
-    platform: "linux", entryPath: "fake", access: async () => {}, now: clock.now,
+  const work = runCline({ provider: "test-provider", model: "test-model", prompt: "test" }, undefined, { recordStatus: false, deps: {
+    platform: "linux", entryPath: "fake", access: async () => {}, acquireSettingsMutex: async () => async () => {}, now: clock.now,
     setTimeout: clock.schedule, clearTimeout: clock.clear,
     totalBudgetMs: 100, timeoutMs: 10, minRetryBudgetMs: 1000,
     killGracePeriodMs: 10, settlementDeadlineMs: 30,
@@ -1907,7 +1919,7 @@ test("POSIX spawns a process group then sends TERM and KILL to the injectable tr
 test("POSIX kills the remaining group once after root exit even when stdio never closes", async () => {
   const clock = fakeClock(); const signals: Array<NodeJS.Signals | undefined> = [];
   let child: any;
-  const work = runCline({ provider: "test-provider", model: "test-model", prompt: "test" }, undefined, { deps: {
+  const work = runCline({ provider: "test-provider", model: "test-model", prompt: "test" }, undefined, { recordStatus: false, deps: {
     platform: "linux", entryPath: "fake", access: async () => {}, acquireSettingsMutex: async () => async () => {}, now: clock.now,
     setTimeout: clock.schedule, clearTimeout: clock.clear,
     totalBudgetMs: 100, timeoutMs: 10, minRetryBudgetMs: 1000,
@@ -1926,7 +1938,7 @@ test("POSIX kills the remaining group once after root exit even when stdio never
 
 test("timeout after an observed exit never signals the exited PID", async () => {
   const clock = fakeClock();
-  const work = runCline({ provider: "test-provider", model: "test-model", prompt: "test" }, undefined, { deps: {
+  const work = runCline({ provider: "test-provider", model: "test-model", prompt: "test" }, undefined, { recordStatus: false, deps: {
     platform: "win32", entryPath: "fake", access: async () => {}, acquireSettingsMutex: async () => async () => {}, now: clock.now,
     setTimeout: clock.schedule, clearTimeout: clock.clear,
     totalBudgetMs: 100, timeoutMs: 10, minRetryBudgetMs: 1000, closeGracePeriodMs: 100,
@@ -1942,7 +1954,7 @@ test("timeout after an observed exit never signals the exited PID", async () => 
 
 test("POSIX kills the group once after normal root exit, without killing the exited root", async () => {
   const clock = fakeClock(); const signals: Array<NodeJS.Signals | undefined> = [];
-  const work = runCline({ provider: "test-provider", model: "test-model", prompt: "test" }, undefined, { deps: {
+  const work = runCline({ provider: "test-provider", model: "test-model", prompt: "test" }, undefined, { recordStatus: false, deps: {
     platform: "linux", entryPath: "fake", access: async () => {}, acquireSettingsMutex: async () => async () => {}, now: clock.now,
     setTimeout: clock.schedule, clearTimeout: clock.clear,
     totalBudgetMs: 100, minRetryBudgetMs: 1000, closeGracePeriodMs: 10,

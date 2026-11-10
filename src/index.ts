@@ -9,8 +9,43 @@ import { listFreeModels, writeCatalogSnapshot } from "./models.js";
 import { cleanupTraces } from "./trace.js";
 import { TaskManager, MAX_TASK_TIMEOUT_SECONDS, MAX_WAIT_SECONDS } from "./tasks.js";
 import { PROHIBITED_NAMES, resolveProviderSettingsPath, recoverProviderSettingsJournal } from "./settings.js";
+import {
+  attachCliToObject,
+  attachCliToText,
+  mutateStateFile,
+  notifyCliStateShutdown,
+  onToolCall,
+  readStateFile,
+  resolveStatePath,
+  waitForActiveCliUpdate
+} from "./clistate.js";
 
 const server = new McpServer({ name: "cline-local-bridge", version: "1.0.0" });
+
+async function beforeToolCall(): Promise<void> {
+  await onToolCall().catch(() => {});
+}
+
+async function replyJson(
+  payload: Record<string, unknown>,
+  options?: { alwaysIncludeCli?: boolean; isError?: boolean }
+) {
+  const state = await readStateFile().catch(() => undefined);
+  const body = attachCliToObject(payload, state, { always: options?.alwaysIncludeCli });
+  return {
+    content: [{ type: "text" as const, text: JSON.stringify(body, null, 2) }],
+    ...(options?.isError ? { isError: true } : {})
+  };
+}
+
+async function replyErrorText(error: unknown, fallback: string) {
+  const state = await readStateFile().catch(() => undefined);
+  const message = attachCliToText(formatErrorAsText(error, fallback), state);
+  return {
+    content: [{ type: "text" as const, text: message }],
+    isError: true
+  };
+}
 
 /**
  * Synchronous tool calls in flight. On shutdown each is aborted (killing its Cline process tree) and awaited,
@@ -59,6 +94,7 @@ server.registerTool(
     }
   },
   async (input, extra) => {
+    await beforeToolCall();
     try {
       const result = await track(extra.signal, signal => askCline(input, signal, { trace: true }));
       const response = {
@@ -70,10 +106,9 @@ server.registerTool(
         ...(result.warnings && result.warnings.length > 0 ? { warnings: result.warnings } : {}),
         ...(result.trace ? { trace: result.trace } : {})
       };
-      return { content: [{ type: "text", text: JSON.stringify(response, null, 2) }] };
+      return await replyJson(response);
     } catch (error) {
-      const message = formatErrorAsText(error, "The local Cline bridge failed unexpectedly.");
-      return { content: [{ type: "text", text: message }], isError: true };
+      return await replyErrorText(error, "The local Cline bridge failed unexpectedly.");
     }
   }
 );
@@ -92,77 +127,55 @@ server.registerTool(
     }
   },
   async (input, extra) => {
+    await beforeToolCall();
     try {
       const result = await track(extra.signal, signal => applyClineEdits(input, signal, { trace: true }));
-      return {
-        content: [{
-          type: "text",
-          text: JSON.stringify({
-            text: result.text,
-            ...(result.model ? { model: result.model } : {}),
-            durationMs: result.durationMs,
-            ...(result.usage ? { usage: result.usage } : {}),
-            ...(result.cost !== undefined ? { cost: result.cost } : {}),
-            gitDiff: result.gitDiff,
-            status: result.status,
-            headBefore: result.headBefore,
-            headAfter: result.headAfter,
-            commitWasReverted: result.commitWasReverted,
-            ...(result.warnings && result.warnings.length > 0 ? { warnings: result.warnings } : {}),
-            ...(result.trace ? { trace: result.trace } : {})
-          }, null, 2)
-        }]
-      };
+      return await replyJson({
+        text: result.text,
+        ...(result.model ? { model: result.model } : {}),
+        durationMs: result.durationMs,
+        ...(result.usage ? { usage: result.usage } : {}),
+        ...(result.cost !== undefined ? { cost: result.cost } : {}),
+        gitDiff: result.gitDiff,
+        status: result.status,
+        headBefore: result.headBefore,
+        headAfter: result.headAfter,
+        commitWasReverted: result.commitWasReverted,
+        ...(result.warnings && result.warnings.length > 0 ? { warnings: result.warnings } : {}),
+        ...(result.trace ? { trace: result.trace } : {})
+      });
     } catch (error) {
       if (error instanceof ClineEditsError) {
-        return {
-          content: [{
-            type: "text",
-            text: JSON.stringify({
-              kind: error.kind,
-              message: error.message,
-              ...(error.exitCode !== undefined && error.exitCode !== null ? { exitCode: error.exitCode } : {}),
-              ...(error.attempts !== undefined ? { attempts: error.attempts } : {}),
-              ...(error.stderrTail ? { stderrTail: error.stderrTail } : {}),
-              ...(error.stdoutTail ? { stdoutTail: error.stdoutTail } : {}),
-              ...(error.trace ? { trace: error.trace } : {}),
-              ...error.evidence
-            }, null, 2)
-          }],
-          isError: true
-        };
+        return await replyJson({
+          kind: error.kind,
+          message: error.message,
+          ...(error.exitCode !== undefined && error.exitCode !== null ? { exitCode: error.exitCode } : {}),
+          ...(error.attempts !== undefined ? { attempts: error.attempts } : {}),
+          ...(error.stderrTail ? { stderrTail: error.stderrTail } : {}),
+          ...(error.stdoutTail ? { stdoutTail: error.stdoutTail } : {}),
+          ...(error.trace ? { trace: error.trace } : {}),
+          ...error.evidence
+        }, { isError: true });
       }
       if (error instanceof ClineRunError) {
-        return {
-          content: [{
-            type: "text",
-            text: JSON.stringify({
-              kind: error.kind,
-              message: error.message,
-              ...(error.exitCode !== undefined && error.exitCode !== null ? { exitCode: error.exitCode } : {}),
-              ...(error.attempts !== undefined ? { attempts: error.attempts } : {}),
-              ...(error.resetAt ? { resetAt: error.resetAt } : {}),
-              ...(error.retryAfterSeconds !== undefined ? { retryAfterSeconds: error.retryAfterSeconds } : {}),
-              ...(error.stderrTail ? { stderrTail: error.stderrTail } : {}),
-              ...(error.stdoutTail ? { stdoutTail: error.stdoutTail } : {}),
-              ...(error.trace ? { trace: error.trace } : {}),
-              ...(error.notes?.length ? { notes: error.notes } : {})
-            }, null, 2)
-          }],
-          isError: true
-        };
+        return await replyJson({
+          kind: error.kind,
+          message: error.message,
+          ...(error.exitCode !== undefined && error.exitCode !== null ? { exitCode: error.exitCode } : {}),
+          ...(error.attempts !== undefined ? { attempts: error.attempts } : {}),
+          ...(error.resetAt ? { resetAt: error.resetAt } : {}),
+          ...(error.retryAfterSeconds !== undefined ? { retryAfterSeconds: error.retryAfterSeconds } : {}),
+          ...(error.stderrTail ? { stderrTail: error.stderrTail } : {}),
+          ...(error.stdoutTail ? { stdoutTail: error.stdoutTail } : {}),
+          ...(error.trace ? { trace: error.trace } : {}),
+          ...(error.notes?.length ? { notes: error.notes } : {})
+        }, { isError: true });
       }
-      return {
-        content: [{
-          type: "text",
-          text: JSON.stringify({
-            kind: "unexpected",
-            message: error instanceof Error ? error.message : "The Cline editing request failed unexpectedly.",
-            ...((error as { trace?: unknown } | undefined)?.trace ? { trace: (error as { trace: unknown }).trace } : {})
-          }, null, 2)
-        }],
-        isError: true
-      };
+      return await replyJson({
+        kind: "unexpected",
+        message: error instanceof Error ? error.message : "The Cline editing request failed unexpectedly.",
+        ...((error as { trace?: unknown } | undefined)?.trace ? { trace: (error as { trace: unknown }).trace } : {})
+      }, { isError: true });
     }
   }
 );
@@ -181,25 +194,20 @@ server.registerTool(
     }
   },
   async (input, extra) => {
+    await beforeToolCall();
     try {
       const result = await track(extra.signal, signal => askClineWorkspace(input, signal, { trace: true }));
-      return {
-        content: [{
-          type: "text",
-          text: JSON.stringify({
-            text: result.text,
-            ...(result.model ? { model: result.model } : {}),
-            durationMs: result.durationMs,
-            ...(result.usage ? { usage: result.usage } : {}),
-            ...(result.cost !== undefined ? { cost: result.cost } : {}),
-            ...(result.warnings && result.warnings.length > 0 ? { warnings: result.warnings } : {}),
-            ...(result.trace ? { trace: result.trace } : {})
-          }, null, 2)
-        }]
-      };
+      return await replyJson({
+        text: result.text,
+        ...(result.model ? { model: result.model } : {}),
+        durationMs: result.durationMs,
+        ...(result.usage ? { usage: result.usage } : {}),
+        ...(result.cost !== undefined ? { cost: result.cost } : {}),
+        ...(result.warnings && result.warnings.length > 0 ? { warnings: result.warnings } : {}),
+        ...(result.trace ? { trace: result.trace } : {})
+      });
     } catch (error) {
-      const message = formatErrorAsText(error, "The isolated Cline workspace review failed unexpectedly.");
-      return { content: [{ type: "text", text: message }], isError: true };
+      return await replyErrorText(error, "The isolated Cline workspace review failed unexpectedly.");
     }
   }
 );
@@ -217,12 +225,12 @@ server.registerTool(
     }
   },
   async (input, extra) => {
+    await beforeToolCall();
     try {
       const result = await track(extra.signal, signal => clinePing(input, signal));
-      return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
+      return await replyJson({ ...result });
     } catch (error) {
-      const message = formatErrorAsText(error, "The Cline ping failed unexpectedly.");
-      return { content: [{ type: "text", text: message }], isError: true };
+      return await replyErrorText(error, "The Cline ping failed unexpectedly.");
     }
   }
 );
@@ -236,6 +244,7 @@ server.registerTool(
     inputSchema: {}
   },
   async () => {
+    await beforeToolCall();
     try {
       const list = await listFreeModels();
       try {
@@ -243,10 +252,14 @@ server.registerTool(
       } catch (err: any) {
         console.error(`Failed to write catalog snapshot: ${(err?.message ?? String(err)).split(/\r?\n/)[0]}`);
       }
-      return { content: [{ type: "text", text: JSON.stringify(list, null, 2) }] };
+      await mutateStateFile(resolveStatePath(), (curr) => {
+        if (list.source.cliVersion) curr.cli.version = list.source.cliVersion;
+        if (list.source.version) curr.cli.catalog_version = list.source.version;
+        return curr;
+      }).catch(() => {});
+      return await replyJson({ ...list }, { alwaysIncludeCli: true });
     } catch (error) {
-      const message = formatErrorAsText(error, "Listing Cline models failed unexpectedly.");
-      return { content: [{ type: "text", text: message }], isError: true };
+      return await replyErrorText(error, "Listing Cline models failed unexpectedly.");
     }
   }
 );
@@ -261,9 +274,8 @@ try {
 // --- Async tasks --------------------------------------------------------------------------------------------
 
 const tasks = new TaskManager();
-const asText = (value: unknown) => ({ content: [{ type: "text" as const, text: JSON.stringify(value, null, 2) }] });
-const asError = (error: unknown, fallback: string) =>
-  ({ content: [{ type: "text" as const, text: formatErrorAsText(error, fallback) }], isError: true });
+const asText = (value: unknown) => replyJson((value && typeof value === "object" ? value : { value }) as Record<string, unknown>);
+const asError = (error: unknown, fallback: string) => replyErrorText(error, fallback);
 
 server.registerTool(
   "cline_start",
@@ -284,11 +296,12 @@ server.registerTool(
     }
   },
   async ({ waitSeconds, ...input }) => {
+    await beforeToolCall();
     try {
       const started = tasks.start(input);
-      return asText(await tasks.status(started.taskId, waitSeconds ?? 3));
+      return await asText(await tasks.status(started.taskId, waitSeconds ?? 3));
     } catch (error) {
-      return asError(error, "Starting the Cline task failed unexpectedly.");
+      return await asError(error, "Starting the Cline task failed unexpectedly.");
     }
   }
 );
@@ -304,8 +317,9 @@ server.registerTool(
     }
   },
   async ({ taskId, waitSeconds }) => {
-    try { return asText(await tasks.status(taskId, waitSeconds ?? 20)); }
-    catch (error) { return asError(error, "Reading the task status failed unexpectedly."); }
+    await beforeToolCall();
+    try { return await asText(await tasks.status(taskId, waitSeconds ?? 20)); }
+    catch (error) { return await asError(error, "Reading the task status failed unexpectedly."); }
   }
 );
 
@@ -320,11 +334,12 @@ server.registerTool(
     }
   },
   async ({ taskId, message, waitSeconds }) => {
+    await beforeToolCall();
     try {
       await tasks.send(taskId, message);
-      return asText(await tasks.status(taskId, waitSeconds ?? 3));
+      return await asText(await tasks.status(taskId, waitSeconds ?? 3));
     } catch (error) {
-      return asError(error, "Sending message to the Cline task failed unexpectedly.");
+      return await asError(error, "Sending message to the Cline task failed unexpectedly.");
     }
   }
 );
@@ -336,8 +351,9 @@ server.registerTool(
     inputSchema: { taskId: z.string().uuid() }
   },
   async ({ taskId }) => {
-    try { return asText(await tasks.cancel(taskId)); }
-    catch (error) { return asError(error, "Cancelling the task failed unexpectedly."); }
+    await beforeToolCall();
+    try { return await asText(await tasks.cancel(taskId)); }
+    catch (error) { return await asError(error, "Cancelling the task failed unexpectedly."); }
   }
 );
 
@@ -349,8 +365,9 @@ server.registerTool(
     inputSchema: { taskId: z.string().uuid(), keepTrace: z.boolean().optional() }
   },
   async ({ taskId, keepTrace }) => {
-    try { return asText(await tasks.result(taskId, keepTrace ?? false)); }
-    catch (error) { return asError(error, "Reading the task result failed unexpectedly."); }
+    await beforeToolCall();
+    try { return await asText(await tasks.result(taskId, keepTrace ?? false)); }
+    catch (error) { return await asError(error, "Reading the task result failed unexpectedly."); }
   }
 );
 
@@ -363,10 +380,11 @@ const SHUTDOWN_WAIT_MS = 120_000;
 const shutdown = async () => {
   if (shuttingDown) return;
   shuttingDown = true;
+  notifyCliStateShutdown();
   for (const call of activeCalls) call.controller.abort();
   let timer: NodeJS.Timeout | undefined;
   await Promise.race([
-    Promise.allSettled([tasks.shutdown(SHUTDOWN_WAIT_MS), ...[...activeCalls].map(c => c.done)]),
+    Promise.allSettled([tasks.shutdown(SHUTDOWN_WAIT_MS), waitForActiveCliUpdate(), ...[...activeCalls].map(c => c.done)]),
     new Promise<void>(resolve => { timer = setTimeout(resolve, SHUTDOWN_WAIT_MS); })
   ]);
   if (timer) clearTimeout(timer);

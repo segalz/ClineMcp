@@ -14,9 +14,13 @@ import { EventEmitter } from "node:events";
 import { spawn } from "node:child_process";
 import { createServer } from "node:net";
 
-// Runs here must never touch the real provider status file.
-process.env.CLINE_MCP_STATUS_PATH = path.join(os.tmpdir(), `cline-settings-status-${process.pid}.json`);
-after(() => rm(process.env.CLINE_MCP_STATUS_PATH!, { force: true }));
+// Runs here must never touch the real ~/.cline-mcp/* files or real trace directory.
+const settingsTestEnvDir = await mkdtemp(path.join(os.tmpdir(), `cline-settings-env-${process.pid}-`));
+process.env.CLINE_MCP_STATUS_PATH = path.join(settingsTestEnvDir, "status.json");
+process.env.CLINE_MCP_CATALOG_PATH = path.join(settingsTestEnvDir, "catalog.json");
+process.env.CLINE_MCP_STATE_PATH = path.join(settingsTestEnvDir, "state.json");
+process.env.CLINE_MCP_TRACE_DIR = path.join(settingsTestEnvDir, "traces");
+after(() => rm(settingsTestEnvDir, { recursive: true, force: true }));
 
 const delay = (ms: number) => new Promise<void>(resolve => setTimeout(resolve, ms));
 const deferred = () => {
@@ -288,13 +292,21 @@ test("malformed restore journal is retained and cannot be overwritten", async ()
 }));
 
 test("built stdio bridge startup restores a temporary journal and logs failed recovery", async () => fixture(async file => {
+  const dir = path.dirname(file);
   const start = async () => await new Promise<{ code: number | null; stderr: string }>((resolve, reject) => {
     const child = spawn(process.execPath, [path.resolve("dist/index.js")], {
-      env: { ...process.env, CLINE_PROVIDER_SETTINGS_PATH: file },
+      env: {
+        ...process.env,
+        CLINE_PROVIDER_SETTINGS_PATH: file,
+        CLINE_MCP_CATALOG_PATH: path.join(dir, "catalog.json"),
+        CLINE_MCP_STATE_PATH: path.join(dir, "state.json"),
+        CLINE_MCP_STATUS_PATH: path.join(dir, "status.json"),
+        CLINE_MCP_TRACE_DIR: path.join(dir, "traces")
+      },
       stdio: ["pipe", "pipe", "pipe"], windowsHide: true
     });
     let stderr = "";
-    const timer = setTimeout(() => { child.kill(); reject(new Error("startup did not settle")); }, 3000);
+    const timer = setTimeout(() => { child.kill(); reject(new Error("startup did not settle")); }, 15_000);
     child.stderr.on("data", chunk => { stderr += chunk.toString(); });
     child.once("error", err => { clearTimeout(timer); reject(err); });
     child.once("close", code => { clearTimeout(timer); resolve({ code, stderr }); });

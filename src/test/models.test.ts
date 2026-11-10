@@ -9,6 +9,11 @@ import { ClineRunError, resolveClineEntry } from "../runner.js";
 import { buildEntry, writeStatusEntry, resolveCatalogPath } from "../status.js";
 
 const root = await mkdtemp(path.join(os.tmpdir(), "cline-models-"));
+process.env.CLINE_MCP_STATUS_PATH = path.join(root, "default-status.json");
+process.env.CLINE_MCP_CATALOG_PATH = path.join(root, "default-catalog.json");
+process.env.CLINE_MCP_STATE_PATH = path.join(root, "default-state.json");
+process.env.CLINE_PROVIDER_SETTINGS_PATH = path.join(root, "default-providers.json");
+process.env.CLINE_MCP_TRACE_DIR = path.join(root, "traces");
 after(() => rm(root, { recursive: true, force: true }));
 let counter = 0;
 
@@ -21,7 +26,13 @@ async function fakeInstall(cliVersion = "3.0.74", llmsVersion = "0.2.0") {
   await writeFile(path.join(cli, "package.json"), JSON.stringify({ version: cliVersion }));
   await writeFile(path.join(llms, "package.json"), JSON.stringify({ version: llmsVersion }));
   await writeFile(path.join(cli, "bin", "cline"), "// fake entry");
-  return { cli, entryPath: path.join(cli, "bin", "cline"), llms, statusPath: path.join(cli, "status.json") };
+  return {
+    cli,
+    entryPath: path.join(cli, "bin", "cline"),
+    llms,
+    statusPath: path.join(cli, "status.json"),
+    statePath: path.join(cli, "state.json")
+  };
 }
 
 const catalogModule = {
@@ -42,7 +53,7 @@ const catalogModule = {
 test("lists Cline's advertised free models, enriched from the provider catalog", async () => {
   const install = await fakeInstall();
   let importedUrl = "";
-  const result = await listFreeModels({ entryPath: install.entryPath, statusPath: install.statusPath,
+  const result = await listFreeModels({ entryPath: install.entryPath, statusPath: install.statusPath, statePath: install.statePath,
     importModule: async url => { importedUrl = url; return catalogModule; } });
   assert.equal(importedUrl, pathToFileURL(path.join(await realpath(install.cli), "node_modules", "@cline", "llms", "dist", "index.js")).href);
   assert.equal(result.provider, CLINE_PROVIDER);
@@ -63,7 +74,7 @@ test("joins the bridge's last recorded status per model", async () => {
   const now = Date.now();
   await writeStatusEntry(install.statusPath, buildEntry({ provider: "cline", model: "reflection/beam-free",
     classification: { state: "available" }, reason: "replied PONG", source: "ping" }, now));
-  const result = await listFreeModels({ entryPath: install.entryPath, statusPath: install.statusPath, importModule: async () => catalogModule });
+  const result = await listFreeModels({ entryPath: install.entryPath, statusPath: install.statusPath, statePath: install.statePath, importModule: async () => catalogModule });
   const beam = result.models.find(m => m.id === "reflection/beam-free");
   assert.equal(beam?.last_status?.state, "available");
   assert.equal(beam?.last_status?.source, "ping");
@@ -72,7 +83,7 @@ test("joins the bridge's last recorded status per model", async () => {
 
 test("catalog enrichment failure still lists the free ids", async () => {
   const install = await fakeInstall();
-  const result = await listFreeModels({ entryPath: install.entryPath, statusPath: install.statusPath, importModule: async () => ({
+  const result = await listFreeModels({ entryPath: install.entryPath, statusPath: install.statusPath, statePath: install.statePath, importModule: async () => ({
     ...catalogModule, getGeneratedModelsForProvider: () => { throw new Error("registry not ready"); }
   }) });
   assert.equal(result.models.length, 3);
@@ -90,13 +101,14 @@ test("an unreadable or changed catalog fails with catalog_unavailable and never 
     ...["__proto__", "constructor", "PROTOTYPE"].map(id => async () => ({ GENERATED_CLINE_RECOMMENDED_MODELS: { free: [{ id }] } }))
   ];
   for (const importModule of cases) {
-    await assert.rejects(listFreeModels({ entryPath: install.entryPath, statusPath: install.statusPath, importModule }),
+    await assert.rejects(listFreeModels({ entryPath: install.entryPath, statusPath: install.statusPath, statePath: install.statePath, importModule }),
       (err: unknown) => err instanceof ClineRunError && err.kind === "catalog_unavailable" && /does not guess/.test(err.message));
   }
 });
 
 test("a missing CLI entry fails with catalog_unavailable before importing anything", async () => {
   await assert.rejects(listFreeModels({ entryPath: path.join(root, "nowhere", "bin", "cline"),
+    statusPath: path.join(root, "nowhere-status.json"), statePath: path.join(root, "nowhere-state.json"),
     importModule: async () => assert.fail("must not import") }),
     (err: unknown) => err instanceof ClineRunError && err.kind === "catalog_unavailable");
 });
@@ -109,7 +121,7 @@ test("a symlinked CLI entry loads the catalog from the real install, not the lin
   try { await symlink(real.entryPath, link, "file"); }
   catch (err: any) { return t.skip(`symlinks not permitted here (${err.code})`); }
   let importedUrl = "";
-  await listFreeModels({ entryPath: link, statusPath: real.statusPath, importModule: async url => { importedUrl = url; return catalogModule; } });
+  await listFreeModels({ entryPath: link, statusPath: real.statusPath, statePath: real.statePath, importModule: async url => { importedUrl = url; return catalogModule; } });
   assert.equal(importedUrl, pathToFileURL(path.join(await realpath(real.cli), "node_modules", "@cline", "llms", "dist", "index.js")).href);
 });
 
@@ -118,7 +130,7 @@ test("installed Cline CLI exposes a non-empty free list (skipped when Cline is n
   if (!entry) return t.skip("no Cline install path on this platform");
   try { await access(path.join(path.dirname(path.dirname(entry)), "node_modules", "@cline", "llms", "dist", "index.js")); }
   catch { return t.skip("Cline CLI not installed"); }
-  const result = await listFreeModels({ statusPath: path.join(root, "real-status.json") });
+  const result = await listFreeModels({ statusPath: path.join(root, "real-status.json"), statePath: path.join(root, "real-state.json") });
   assert.ok(result.models.length > 0);
   assert.ok(result.models.every(m => m.provider === "cline" && /^[A-Za-z0-9._:/@-]+$/.test(m.id)));
 });

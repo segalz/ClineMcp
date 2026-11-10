@@ -187,9 +187,10 @@ export async function verifySocketOwnership(
     socket.once("close", () => finish(false));
   });
 }
+export const DEFAULT_LOCK_TIMEOUT_MS = 60_000;
 export async function acquireSettingsMutex(settingsPath: string, signal?: AbortSignal, options: MutexOptions = {}): Promise<ReleaseSettingsMutex> {
   const now = options.nowFn ?? (() => performance.now());
-  const deadline = Math.min(options.deadline ?? Infinity, now() + (options.lockTimeoutMs ?? 30_000));
+  const deadline = Math.min(options.deadline ?? Infinity, now() + (options.lockTimeoutMs ?? DEFAULT_LOCK_TIMEOUT_MS));
   const address = getSettingsMutexPath(settingsPath);
   await mkdir(path.dirname(settingsPath), { recursive: true });
   let backoff = 10;
@@ -376,7 +377,7 @@ async function readJournal(settingsPath: string): Promise<RestoreJournal | undef
       (data.targetProvider !== undefined && !validProviderId(data.targetProvider))) throw new Error("Invalid settings restore journal.");
   return { version: 2, base: baselineFrom({ ...data, settingsPath, skipRestore: false } as ProviderSettingsSnapshot), runs: {} };
 }
-function isProcessAlive(pid: number): boolean {
+export function isProcessAlive(pid: number): boolean {
   if (pid === process.pid) return true;
   try { process.kill(pid, 0); return true; }
   catch (err: any) { return err?.code === "EPERM"; }
@@ -384,14 +385,40 @@ function isProcessAlive(pid: number): boolean {
 /** Runs of this process that finished but could not be removed from the journal (cleanup failed). */
 const finishedRuns = new Set<string>();
 /** Drops runs that finished, whose bridge process is gone, or that are older than MAX_RUN_AGE_MS. */
-function pruneDeadRuns(journal: RestoreJournal, nowMs: number, alive: (pid: number) => boolean): RestoreJournal {
+export function pruneDeadRuns(journal: RestoreJournal, nowMs: number, alive: (pid: number) => boolean): RestoreJournal {
   const runs: Record<string, JournalRun> = {};
   for (const [id, run] of Object.entries(journal.runs)) {
     if (!finishedRuns.has(id) && nowMs - run.startedAtMs < MAX_RUN_AGE_MS && alive(run.pid)) runs[id] = run;
   }
   return { ...journal, runs };
 }
-interface JournalOptions { wallNow?: () => number; isProcessAlive?: (pid: number) => boolean; }
+export interface JournalOptions { wallNow?: () => number; isProcessAlive?: (pid: number) => boolean; }
+/**
+ * Caller holds the settings mutex. Prunes dead runs and returns true if any live Cline run
+ * remains in the restore journal (or if the journal cannot be safely read/recovered).
+ */
+export async function hasActiveRunsLocked(settingsPath: string, options: JournalOptions = {}): Promise<boolean> {
+  try {
+    const journal = await readJournal(settingsPath);
+    if (!journal) return false;
+    const pruned = pruneDeadRuns(journal, (options.wallNow ?? Date.now)(), options.isProcessAlive ?? isProcessAlive);
+    if (Object.keys(pruned.runs).length > 0) {
+      if (Object.keys(pruned.runs).length !== Object.keys(journal.runs).length) {
+        await atomicWrite(getJournalPath(settingsPath), pruned);
+      }
+      return true;
+    }
+    const result = await restoreBaseline(settingsPath, journal.base);
+    if (result !== "failed") {
+      await unlink(getJournalPath(settingsPath)).catch((err: NodeJS.ErrnoException) => {
+        if (err.code !== "ENOENT") throw err;
+      });
+    }
+    return false;
+  } catch {
+    return true;
+  }
+}
 /**
  * Caller holds the mutex. Prunes dead runs; restores the baseline and removes the journal only when no
  * live run remains. Never restores while another live bridge run still relies on its override.
@@ -436,7 +463,7 @@ export async function withProviderOverride<T extends { warnings?: string[] }>(
   const wallNow = options.wallNow ?? Date.now;
   const acquire = options.acquireSettingsMutex ?? acquireSettingsMutex;
   const journalPath = getJournalPath(settingsPath);
-  const deadline = Math.min(options.deadline ?? Infinity, now() + (options.lockTimeoutMs ?? 30_000));
+  const deadline = Math.min(options.deadline ?? Infinity, now() + (options.lockTimeoutMs ?? DEFAULT_LOCK_TIMEOUT_MS));
   const runId = randomUUID();
   let selection: { provider?: string; model?: string } | undefined;
   while (!selection) {
