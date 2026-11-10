@@ -177,6 +177,9 @@ parallel-safe synchronous bridge and can be released before 4–6.
 
 ## Stage 9 — Micro-steps (planned, from D-08)
 
+Built together with Cline: every step is designed against real Cline runs (how it splits, where it
+loops), not only fakes; each 9.x has a live run with Cline before review.
+
 Lesson from 2026-11-10: one long Cline run (4 CLIs, 62 tool calls, ~374k input tokens) lost focus and
 looped on a failed search-and-replace. Short, focused runs did well.
 
