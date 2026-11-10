@@ -3,10 +3,11 @@ import { randomUUID } from "node:crypto";
 import { spawn } from "node:child_process";
 import { rm } from "node:fs/promises";
 import {
-  askCline, ClineRunError, defaultKillTree, formatErrorAsText, requireSelection,
+  askCline, ClineRunError, defaultKillTree, formatErrorAsText, redactSecrets, requireSelection,
   resolveClineEntry, windowsCommandLineLength, WINDOWS_COMMAND_LINE_LIMIT, NO_TOOLS_PREAMBLE,
   type AskClineInput, type ClineInvocationOptions, type ClineResponse
 } from "./runner.js";
+import { formatReportSummary, type GuardOptions, type GuardReport } from "./guard.js";
 import { askClineWorkspace, WORKSPACE_SYSTEM_PROMPT, WORKTREE_BASE } from "./workspace.js";
 import { applyClineEdits, EDIT_SYSTEM_PROMPT } from "./edits.js";
 import { resolveTraceBase, type TraceInfo, type TraceRecorder, type TraceStatus } from "./trace.js";
@@ -22,6 +23,7 @@ export interface StartTaskInput {
   cwd?: string;
   thinking?: AskClineInput["thinking"];
   timeoutSeconds?: number;
+  guard?: GuardOptions;
 }
 
 /** Async tasks may run longer than the sync tools' 300 s. */
@@ -101,14 +103,68 @@ export function parseQuestionFromText(text: string): { question: string; options
   return undefined;
 }
 
-export function minimumPrompt(latestQA: TaskQA): string {
+export function minimumPrompt(latestQA: TaskQA, guardNotice?: string): string {
   const parts: string[] = [];
+  if (guardNotice) {
+    parts.push(guardNotice);
+  }
   if (latestQA.question.trim()) parts.push(`Cline question:\n${latestQA.question.trim()}`);
   if (latestQA.options && latestQA.options.length > 0) {
     parts.push(`Options: ${latestQA.options.join(" | ")}`);
   }
   parts.push(`Caller answer:\n${latestQA.answer.trim()}`);
   return parts.join("\n\n");
+}
+
+export function formatGuardContext(params: {
+  summary?: string;
+  report?: GuardReport;
+  compact?: boolean;
+  maxErrors?: number;
+  maxErrorLen?: number;
+  includeAssistantText?: boolean;
+  includeDetails?: boolean;
+}): string | undefined {
+  const summary = params.summary ?? (params.report ? formatReportSummary(params.report) : undefined);
+  if (!summary && !params.report) return undefined;
+
+  const sumText = summary || "loop or budget exceeded";
+  const mainNotice = `Previous run was stopped by the bridge: ${sumText}; do not repeat the same failing action.`;
+
+  if (params.compact || params.includeDetails === false || !params.report) {
+    return mainNotice;
+  }
+
+  const r = params.report;
+  const details: string[] = [];
+  if (r.tool || r.target) {
+    const parts = [r.tool ? `tool: ${r.tool}` : "", r.target ? `target: ${r.target}` : ""].filter(Boolean);
+    details.push(`- Tool & target: ${parts.join(", ")}`);
+  }
+  if (r.lastErrors && r.lastErrors.length > 0) {
+    const maxErrors = params.maxErrors ?? 3;
+    const maxLen = params.maxErrorLen ?? 200;
+    const errList = r.lastErrors.slice(-maxErrors).map(e => {
+      const red = redactSecrets(e).trim();
+      const truncated = red.length > maxLen ? red.slice(0, maxLen) + "..." : red;
+      return `  * ${truncated}`;
+    });
+    details.push(`- Last errors:\n${errList.join("\n")}`);
+  }
+  if (r.filesTouched && r.filesTouched.length > 0) {
+    details.push(`- Files touched: ${r.filesTouched.map(f => redactSecrets(f)).join(", ")}`);
+  }
+  if (params.includeAssistantText !== false && r.lastAssistantText) {
+    const textRed = redactSecrets(r.lastAssistantText).trim();
+    const excerpt = textRed.length > 400 ? textRed.slice(-400) : textRed;
+    details.push(`- Last assistant text excerpt:\n${excerpt}`);
+  }
+
+  if (details.length > 0) {
+    return `${mainNotice}\n\nGuard report:\n${details.join("\n")}`;
+  }
+
+  return mainNotice;
 }
 
 export function isPromptTooLarge(
@@ -163,6 +219,8 @@ export function buildResumedPrompt(params: {
   qaHistory: TaskQA[];
   task: Task;
   preamble: string;
+  guardReportSummary?: string;
+  guardReport?: GuardReport;
   platform?: NodeJS.Platform;
   deps?: { entryPath?: string };
 }): string {
@@ -175,8 +233,14 @@ export function buildResumedPrompt(params: {
   const latestQA = history[history.length - 1];
   let priorQAs = history.slice(0, -1);
 
-  // If latest question + answer alone exceeds limits, reject immediately
-  if (isPromptTooLarge(minimumPrompt(latestQA), params.task, params.preamble, platform, params.deps)) {
+  const guardReport = params.guardReport ?? params.task.guardReport;
+  const guardSummary = params.guardReportSummary ?? params.task.guardReportSummary ?? (guardReport ? formatReportSummary(guardReport) : undefined);
+  const minGuardNotice = (guardSummary || guardReport)
+    ? "Previous run was stopped by the bridge: loop or budget exceeded; do not repeat the same failing action."
+    : undefined;
+
+  // Reserve room for mandatory guard notice before checking the minimum
+  if (isPromptTooLarge(minimumPrompt(latestQA, minGuardNotice), params.task, params.preamble, platform, params.deps)) {
     throw new ClineRunError("launch_failed", "The question and caller answer together exceed the prompt or command line limit.", { attempts: 0 });
   }
 
@@ -203,16 +267,19 @@ export function buildResumedPrompt(params: {
     return parts.join("\n\n");
   };
 
-  const assemble = (o: string, p: string, d: string | undefined, priors: TaskQA[]): string => {
+  let guardBlock = formatGuardContext({ summary: guardSummary, report: guardReport });
+
+  const assemble = (o: string, p: string, d: string | undefined, priors: TaskQA[], gBlock: string | undefined): string => {
     const parts: string[] = [];
     if (o) parts.push(`Original task:\n${o}`);
     if (p) parts.push(`Previous answer (what was done so far):\n${p}`);
     if (d) parts.push(`Working directory diff stat:\n${d}`);
+    if (gBlock) parts.push(gBlock);
     parts.push(formatQA(priors, latestQA));
     return parts.join("\n\n");
   };
 
-  let candidate = assemble(orig, prev, diff, priorQAs);
+  let candidate = assemble(orig, prev, diff, priorQAs, guardBlock);
   if (!isPromptTooLarge(candidate, params.task, params.preamble, platform, params.deps)) {
     return candidate;
   }
@@ -220,10 +287,10 @@ export function buildResumedPrompt(params: {
   // Step 1: Trim diffStat and previousAnswer first (keep tail of previous answer)
   if (diff && isPromptTooLarge(candidate, params.task, params.preamble, platform, params.deps)) {
     diff = diff.slice(0, 500);
-    candidate = assemble(orig, prev, diff, priorQAs);
+    candidate = assemble(orig, prev, diff, priorQAs, guardBlock);
     if (isPromptTooLarge(candidate, params.task, params.preamble, platform, params.deps)) {
       diff = undefined;
-      candidate = assemble(orig, prev, diff, priorQAs);
+      candidate = assemble(orig, prev, diff, priorQAs, guardBlock);
     }
   }
 
@@ -235,7 +302,7 @@ export function buildResumedPrompt(params: {
     } else {
       prev = `[...]\n${params.previousAnswer.trim().slice(-prevLen)}`;
     }
-    candidate = assemble(orig, prev, diff, priorQAs);
+    candidate = assemble(orig, prev, diff, priorQAs, guardBlock);
   }
 
   if (!isPromptTooLarge(candidate, params.task, params.preamble, platform, params.deps)) {
@@ -245,7 +312,7 @@ export function buildResumedPrompt(params: {
   // Step 2: Trim older Q&A pairs (newest kept in full, oldest dropped first)
   while (priorQAs.length > 0 && isPromptTooLarge(candidate, params.task, params.preamble, platform, params.deps)) {
     priorQAs = priorQAs.slice(1);
-    candidate = assemble(orig, prev, diff, priorQAs);
+    candidate = assemble(orig, prev, diff, priorQAs, guardBlock);
   }
 
   if (!isPromptTooLarge(candidate, params.task, params.preamble, platform, params.deps)) {
@@ -261,7 +328,42 @@ export function buildResumedPrompt(params: {
     } else {
       orig = `${params.originalPrompt.trim().slice(0, origLen)}\n[...]`;
     }
-    candidate = assemble(orig, prev, diff, priorQAs);
+    candidate = assemble(orig, prev, diff, priorQAs, guardBlock);
+  }
+
+  if (!isPromptTooLarge(candidate, params.task, params.preamble, platform, params.deps)) {
+    return candidate;
+  }
+
+  // Step 4: Compact the guard context if still oversized (never fail a resume that fit before)
+  if (guardBlock) {
+    // 4a. Drop assistant text excerpt
+    guardBlock = formatGuardContext({ summary: guardSummary, report: guardReport, includeAssistantText: false });
+    candidate = assemble(orig, prev, diff, priorQAs, guardBlock);
+    if (!isPromptTooLarge(candidate, params.task, params.preamble, platform, params.deps)) {
+      return candidate;
+    }
+
+    // 4b. Compact to single error (<= 100 chars) without files touched
+    guardBlock = formatGuardContext({ summary: guardSummary, report: guardReport, maxErrors: 1, maxErrorLen: 100, includeAssistantText: false });
+    candidate = assemble(orig, prev, diff, priorQAs, guardBlock);
+    if (!isPromptTooLarge(candidate, params.task, params.preamble, platform, params.deps)) {
+      return candidate;
+    }
+
+    // 4c. Compact to single-line notice
+    guardBlock = formatGuardContext({ summary: guardSummary, compact: true });
+    candidate = assemble(orig, prev, diff, priorQAs, guardBlock);
+    if (!isPromptTooLarge(candidate, params.task, params.preamble, platform, params.deps)) {
+      return candidate;
+    }
+
+    // 4d. Compact notice summary to minimal notice
+    guardBlock = minGuardNotice;
+    candidate = assemble(orig, prev, diff, priorQAs, guardBlock);
+    if (!isPromptTooLarge(candidate, params.task, params.preamble, platform, params.deps)) {
+      return candidate;
+    }
   }
 
   if (isPromptTooLarge(candidate, params.task, params.preamble, platform, params.deps)) {
@@ -271,7 +373,14 @@ export function buildResumedPrompt(params: {
   return candidate;
 }
 
-interface Task {
+export interface TaskRunHistoryItem {
+  run: number;
+  trace: TraceInfo;
+  guard?: GuardReport;
+  error?: string;
+}
+
+export interface Task {
   id: string;
   mode: TaskMode;
   state: TaskState;
@@ -299,6 +408,10 @@ interface Task {
   timeoutSeconds?: number;
   originalPrompt: string;
   qaHistory: TaskQA[];
+  guard?: GuardOptions;
+  guardReport?: GuardReport;
+  guardReportSummary?: string;
+  runHistory?: TaskRunHistoryItem[];
 }
 
 /** What model-picker's log_run needs; null when the run must not be logged (cancelled by the caller). */
@@ -311,6 +424,8 @@ export interface TaskStatusView {
   elapsedMs: number;
   run: number;
   runs: TraceInfo[];
+  runHistory?: TaskRunHistoryItem[];
+  guard?: GuardReport;
   /** Live progress from the trace: attempt, step, current tool, last complete reasoning, files, question. */
   progress?: Omit<TraceStatus, "runId" | "pid" | "state" | "startedAt" | "updatedAt" | "elapsedMs">;
   question?: { question: string; options?: string[] };
@@ -350,7 +465,7 @@ function errorText(error: unknown): string {
   return formatErrorAsText(error, "The task failed.").replace(/\n\nTrace: [^\n]*/g, "");
 }
 
-function hintFor(task: Task): LogRunHint | null {
+export function hintFor(task: Task): LogRunHint | null {
   const activeDuration = task.activeMs || ((task.endedAt ?? Date.now()) - task.startedAt);
   const duration_s = Math.round(activeDuration / 100) / 10;
   if (task.state === "done") return { ok: true, duration_s };
@@ -362,6 +477,9 @@ function hintFor(task: Task): LogRunHint | null {
       return { ok: false, error_kind: "quota", ...(err.retryAfterSeconds ? { retry_after_s: err.retryAfterSeconds } : {}), error_text: text, duration_s };
     }
     if (err.kind === "timeout") return { ok: false, error_kind: "timeout", error_text: text, duration_s };
+    if (err.kind === "loop_detected" || err.kind === "budget_exceeded") {
+      return { ok: false, error_kind: "crash", error_text: text, duration_s };
+    }
     return { ok: false, error_kind: "crash", error_text: text, duration_s };
   }
   return { ok: false, error_kind: "crash", error_text: String((err as Error)?.message ?? err).slice(0, 300), duration_s };
@@ -497,6 +615,7 @@ export class TaskManager {
       onTraceStart: recorder => { task.recorder = recorder; }
     };
     if (this.deps.traceBase) options.deps = { ...options.deps, traceBase: this.deps.traceBase };
+    if (task.guard) options.guard = task.guard;
 
     const runInput: AskClineInput = {
       prompt,
@@ -504,7 +623,8 @@ export class TaskManager {
       model: task.model,
       cwd: task.cwd,
       thinking: task.thinking,
-      timeoutSeconds: task.timeoutSeconds ?? DEFAULT_TASK_TIMEOUT_SECONDS
+      timeoutSeconds: task.timeoutSeconds ?? DEFAULT_TASK_TIMEOUT_SECONDS,
+      guard: task.guard
     };
 
     let run: Promise<ClineResponse & Record<string, unknown>>;
@@ -519,6 +639,8 @@ export class TaskManager {
       result => {
         task.result = result;
         task.previousRunAnswer = result.text ?? "";
+        task.runHistory = task.runHistory ?? [];
+        task.runHistory.push({ run: task.run, trace });
         const q = parseQuestionFromText(result.text ?? "");
         if (q) {
           task.state = "input_required";
@@ -530,7 +652,30 @@ export class TaskManager {
       },
       err => {
         task.error = err;
-        task.state = err instanceof ClineRunError && err.kind === "cancelled" ? "cancelled" : "failed";
+        task.runHistory = task.runHistory ?? [];
+        if (err instanceof ClineRunError && (err.kind === "loop_detected" || err.kind === "budget_exceeded")) {
+          task.state = "input_required";
+          task.guardReport = err.guard;
+          task.guardReportSummary = formatReportSummary(err.guard, err.message);
+          const detail = err.message.replace(/^Stopped by the bridge:\s*/i, "").replace(/\.\s*$/, "");
+          task.question = {
+            question: `QUESTION: Stopped by the bridge: ${detail}. How should it continue (a different approach, skip this file, or stop)?`,
+            options: ["a different approach", "skip this file", "stop"]
+          };
+          task.runHistory.push({
+            run: task.run,
+            trace,
+            guard: err.guard,
+            error: err.message
+          });
+        } else {
+          task.state = err instanceof ClineRunError && err.kind === "cancelled" ? "cancelled" : "failed";
+          task.runHistory.push({
+            run: task.run,
+            trace,
+            error: err instanceof Error ? err.message : String(err)
+          });
+        }
       }
     ).finally(() => {
       const now = this.wallNow();
@@ -575,7 +720,8 @@ export class TaskManager {
       thinking: input.thinking,
       timeoutSeconds: input.timeoutSeconds,
       originalPrompt: input.prompt,
-      qaHistory: []
+      qaHistory: [],
+      guard: input.guard
     };
     this.tasks.set(id, task);
     this.executeRun(task, input.prompt, trace);
@@ -602,8 +748,11 @@ export class TaskManager {
       ...(options && options.length > 0 ? { options } : {})
     };
 
-    // Check upfront: latest question + answer alone must fit (Defects 2 & 3)
-    if (isPromptTooLarge(minimumPrompt(latestQA), task, preamble, platform, this.deps.runOptions?.deps)) {
+    // Check upfront: latest question + answer + reserved room for mandatory guard notice alone must fit
+    const minGuardLine = (task.guardReportSummary || task.guardReport)
+      ? "Previous run was stopped by the bridge: loop or budget exceeded; do not repeat the same failing action."
+      : undefined;
+    if (isPromptTooLarge(minimumPrompt(latestQA, minGuardLine), task, preamble, platform, this.deps.runOptions?.deps)) {
       throw new ClineRunError("launch_failed", "The question and caller answer together exceed the prompt or command line limit.", { attempts: 0 });
     }
 
@@ -623,6 +772,8 @@ export class TaskManager {
 
     // Defect 1 & Defect 4: Clear old trace data & reserve synchronously before any await
     const savedQuestion = task.question;
+    const savedGuardReport = task.guardReport;
+    const savedGuardReportSummary = task.guardReportSummary;
     task.state = "resuming";
     task.controller = new AbortController();
     task.recorder = undefined;
@@ -631,6 +782,8 @@ export class TaskManager {
     task.reportedQuestion = undefined;
     task.result = undefined;
     task.error = undefined;
+    task.guardReport = undefined;
+    task.guardReportSummary = undefined;
 
     const candidateQAs = [...task.qaHistory, latestQA];
 
@@ -678,12 +831,16 @@ export class TaskManager {
         qaHistory: candidateQAs,
         task,
         preamble,
+        guardReportSummary: savedGuardReportSummary,
+        guardReport: savedGuardReport,
         platform,
         deps: this.deps.runOptions?.deps
       });
     } catch (err) {
       task.state = "input_required";
       task.question = savedQuestion;
+      task.guardReport = savedGuardReport;
+      task.guardReportSummary = savedGuardReportSummary;
       task.resolveSettled?.();
       task.resolveSettled = undefined;
       throw err;
@@ -725,6 +882,8 @@ export class TaskManager {
       elapsedMs: (task.endedAt ?? this.wallNow()) - task.startedAt,
       run: task.run ?? 1,
       runs: task.runs ?? [task.trace],
+      ...(task.runHistory && task.runHistory.length > 0 ? { runHistory: task.runHistory } : {}),
+      ...(task.guardReport ? { guard: task.guardReport } : {}),
       ...(progress ? { progress } : {}),
       ...(task.question ? { question: task.question } : {}),
       ...(task.autoAnswered ? { autoAnswered: task.autoAnswered } : {}),
@@ -778,6 +937,7 @@ export class TaskManager {
 
   /** Final result of a settled task. Removes the task and, unless keepTrace, its trace folders. */
   async result(taskId: string, keepTrace = false): Promise<{ state: TaskState; result?: Record<string, unknown>; error?: string;
+    guard?: GuardReport; runHistory?: TaskRunHistoryItem[];
     log_run_hint: LogRunHint | null; log_run_note?: string; trace?: TraceInfo }> {
     const task = this.get(taskId);
     if (task.state === "running" || task.state === "resuming") {
@@ -788,6 +948,8 @@ export class TaskManager {
       state: task.state,
       ...(task.result ? { result: { ...task.result, trace: undefined } } : {}),
       ...(task.error !== undefined ? { error: errorText(task.error) } : {}),
+      ...(task.guardReport ? { guard: task.guardReport } : {}),
+      ...(task.runHistory && task.runHistory.length > 0 ? { runHistory: task.runHistory } : {}),
       log_run_hint: hint,
       ...(noteFor(task) ? { log_run_note: noteFor(task) } : {}),
       ...(keepTrace ? { trace: task.trace } : {})

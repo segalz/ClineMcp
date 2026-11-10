@@ -1,7 +1,7 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
-import { askCline, ClineRunError, formatErrorAsText } from "./runner.js";
+import { askCline, ClineRunError, formatErrorAsText, guardOptionsSchema } from "./runner.js";
 import { applyClineEdits, ClineEditsError } from "./edits.js";
 import { askClineWorkspace } from "./workspace.js";
 import { clinePing } from "./ping.js";
@@ -75,7 +75,7 @@ const providerModelSchema = z
   })
   .describe("Required. Provider \"cline\" with a model id from cline_list_models (free models), or another configured provider/model.");
 
-export { formatErrorAsText };
+export { formatErrorAsText, guardOptionsSchema };
 
 server.registerTool(
   "ask_cline",
@@ -116,20 +116,23 @@ server.registerTool(
 server.registerTool(
   "apply_cline_edits",
   {
-    description: "Have Cline implement a development task directly in the current Git checkout. Files may change, but commits are forbidden and the resulting diff is returned.",
+    description: "Have Cline implement a development task directly in the current Git checkout. Files may change, but commits are forbidden and the resulting diff is returned. " +
+      "The bridge automatically stops a run on repeated failures or budget.",
     inputSchema: {
       prompt: z.string().min(1).max(20_000),
       cwd: z.string().min(1),
       thinking: z.enum(["none", "low", "medium", "high", "xhigh"]).optional(),
       timeoutSeconds: z.number().int().min(1).max(300).optional(),
       provider: providerModelSchema,
-      model: providerModelSchema
+      model: providerModelSchema,
+      guard: guardOptionsSchema.optional()
     }
   },
   async (input, extra) => {
     await beforeToolCall();
     try {
-      const result = await track(extra.signal, signal => applyClineEdits(input, signal, { trace: true }));
+      const { guard, ...rest } = input;
+      const result = await track(extra.signal, signal => applyClineEdits(rest, signal, { trace: true, ...(guard ? { guard } : {}) }));
       return await replyJson({
         text: result.text,
         ...(result.model ? { model: result.model } : {}),
@@ -154,6 +157,7 @@ server.registerTool(
           ...(error.stderrTail ? { stderrTail: error.stderrTail } : {}),
           ...(error.stdoutTail ? { stdoutTail: error.stdoutTail } : {}),
           ...(error.trace ? { trace: error.trace } : {}),
+          ...(error.guard ? { guard: error.guard } : {}),
           ...error.evidence
         }, { isError: true });
       }
@@ -168,13 +172,15 @@ server.registerTool(
           ...(error.stderrTail ? { stderrTail: error.stderrTail } : {}),
           ...(error.stdoutTail ? { stdoutTail: error.stdoutTail } : {}),
           ...(error.trace ? { trace: error.trace } : {}),
+          ...(error.guard ? { guard: error.guard } : {}),
           ...(error.notes?.length ? { notes: error.notes } : {})
         }, { isError: true });
       }
       return await replyJson({
         kind: "unexpected",
         message: error instanceof Error ? error.message : "The Cline editing request failed unexpectedly.",
-        ...((error as { trace?: unknown } | undefined)?.trace ? { trace: (error as { trace: unknown }).trace } : {})
+        ...((error as { trace?: unknown } | undefined)?.trace ? { trace: (error as { trace: unknown }).trace } : {}),
+        ...((error as { guard?: unknown } | undefined)?.guard ? { guard: (error as { guard: unknown }).guard } : {})
       }, { isError: true });
     }
   }
@@ -183,20 +189,23 @@ server.registerTool(
 server.registerTool(
   "ask_cline_workspace",
   {
-    description: "Analyze a Git workspace through Cline in a disposable worktree. The worktree is always removed after the request.",
+    description: "Analyze a Git workspace through Cline in a disposable worktree. The worktree is always removed after the request. " +
+      "The bridge automatically stops a run on repeated failures or budget.",
     inputSchema: {
       prompt: z.string().min(1).max(20_000),
       cwd: z.string().min(1),
       thinking: z.enum(["none", "low", "medium", "high", "xhigh"]).optional(),
       timeoutSeconds: z.number().int().min(1).max(300).optional(),
       provider: providerModelSchema,
-      model: providerModelSchema
+      model: providerModelSchema,
+      guard: guardOptionsSchema.optional()
     }
   },
   async (input, extra) => {
     await beforeToolCall();
     try {
-      const result = await track(extra.signal, signal => askClineWorkspace(input, signal, { trace: true }));
+      const { guard, ...rest } = input;
+      const result = await track(extra.signal, signal => askClineWorkspace(rest, signal, { trace: true, ...(guard ? { guard } : {}) }));
       return await replyJson({
         text: result.text,
         ...(result.model ? { model: result.model } : {}),
@@ -283,7 +292,8 @@ server.registerTool(
     description: "Start a Cline task in the background and return its taskId at once. mode \"ask\": answer from the prompt, " +
       "no tools; \"workspace\": read a Git repository in a disposable worktree; \"edits\": change files in the checkout " +
       "(no commits; diff in the result). Then follow it with cline_status, stop it with cline_cancel, and collect it with " +
-      `cline_result. One attempt, no automatic retry; timeoutSeconds up to ${MAX_TASK_TIMEOUT_SECONDS}; at most 2 tasks at once.`,
+      `cline_result. One attempt, no automatic retry; timeoutSeconds up to ${MAX_TASK_TIMEOUT_SECONDS}; at most 2 tasks at once. ` +
+      "The bridge stops a run on repeated failures or budget and waits for guidance via cline_send.",
     inputSchema: {
       mode: z.enum(["ask", "workspace", "edits"]),
       prompt: z.string().min(1).max(20_000),
@@ -292,7 +302,8 @@ server.registerTool(
       cwd: z.string().min(1).optional().describe("Required for workspace and edits: a path inside a Git repository."),
       thinking: z.enum(["none", "low", "medium", "high", "xhigh"]).optional(),
       timeoutSeconds: z.number().int().min(1).max(MAX_TASK_TIMEOUT_SECONDS).optional(),
-      waitSeconds: z.number().int().min(0).max(30).optional().describe("Wait this long for first progress before returning (default 3).")
+      waitSeconds: z.number().int().min(0).max(30).optional().describe("Wait this long for first progress before returning (default 3)."),
+      guard: guardOptionsSchema.optional()
     }
   },
   async ({ waitSeconds, ...input }) => {

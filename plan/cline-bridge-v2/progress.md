@@ -55,12 +55,12 @@ Status values: `todo`, `in progress`, `done`, `blocked`, `skipped`.
 | 8.R | Verify: code review | done | 2026-11-10 | Claude reviewed: round 1 — self-check pinged an unusable model (would roll back every update), state could claim an uninstalled version, hard-coded default version; round 2 — a test overwrote the real `catalog.json`, 4 flaky tests → all fixed by AGY; bridge 207 tests 205 pass / 2 skip (×3, real files untouched), picker 3100 pass / 1 skip |
 | 8.L | Verify: live check against Cline | done | 2026-11-10 | Live via MCP: state.json created, daily check ran (latest 3.0.74 = installed, ok), no `cli` field when ok; `pingall` pinged 5 models; forced `backend_status` (42 s) → 3 available, beam/laguna unavailable with evidence, `pick` → explicit model; real-data dashboard rendered. Rollback / `updating` verified by unit tests only (no newer CLI exists; a real failed install is not forced) |
 | 9.0 | Research and agree the goal with the owner | done | 2026-11-11 | Codex static research of Cline 3.0.74; owner chose option B (bridge-side guard) |
-| 9.1 | Detector over events | todo |  |  |
-| 9.2 | Stop and report | todo |  |  |
-| 9.3 | Async: input_required instead of failure | todo |  |  |
-| 9.4 | Guard params and docs | todo |  |  |
-| 9.R | Verify: code review | todo |  |  |
-| 9.L | Verify: live check against Cline | todo |  |  |
+| 9.1 | Detector over events | done | 2026-11-11 | AGY: src/guard.ts pure detector; signature = tool + target (paths, apply_patch headers, failing command text); 3 failures within 10 calls; tool-call and token budgets |
+| 9.2 | Stop and report | done | 2026-11-11 | Runner stops Cline through the existing tree kill, kind loop_detected / budget_exceeded with a redacted report, never retried; trace marker guard_trip; hint crash |
+| 9.3 | Async: input_required instead of failure | done | 2026-11-11 | Tasks go to input_required with a bridge question; cline_send resumes with a bounded report and 'do not repeat' |
+| 9.4 | Guard params and docs | done | 2026-11-11 | Optional guard params on cline_start, ask_cline_workspace, apply_cline_edits (zod); README section; 241 tests pass / 2 skip |
+| 9.R | Verify: code review | done | 2026-11-11 | Codex: 6 bugs reproduced on real 3.0.74 shapes (apply_patch targets, double-counted tokens, run_commands failures, path redaction, resume budget, report content) → fixed by AGY |
+| 9.L | Verify: live check against Cline | done | 2026-11-11 | Live on real Cline: a normal run (Cline stopped after 2 failures by itself) untouched; a forced run tripped loop_detected on the 3rd failing `editor` edit, task → input_required with the report |
 
 | X.1 | `ask_cline` no-tools notice + Windows length guard (D-21) | done | 2026-11-09 | Codex analysis + review (3 rounds: Windows command-line length, UTF-16 count) PASS; 139 tests; live 0 tool calls / 1 iteration |
 

@@ -1,7 +1,9 @@
 import { spawn } from "node:child_process";
 import { access } from "node:fs/promises";
 import path from "node:path";
+import { z } from "zod";
 import { LineSplitter, TraceRecorder, type TraceInfo } from "./trace.js";
+import { createGuard, buildGuardTripMessage, type GuardOptions, type GuardReport, type GuardVerdict } from "./guard.js";
 import {
   JsonlParseError,
   parseClineJsonl,
@@ -37,13 +39,59 @@ export interface AskClineInput {
   systemPrompt?: string;
   provider?: string;
   model?: string;
+  guard?: GuardOptions;
 }
+
+export const guardOptionsSchema = z
+  .object({
+    maxRepeatedFailures: z
+      .number()
+      .int()
+      .min(2)
+      .max(20)
+      .optional()
+      .describe("Trip after this many repeated failures on the same tool+target (default 3, range 2..20)."),
+    window: z
+      .number()
+      .int()
+      .min(3)
+      .max(50)
+      .optional()
+      .describe("Sliding window of recent tool calls to inspect for repeated failures (default 10, range 3..50). Must be >= maxRepeatedFailures."),
+    maxToolCalls: z
+      .number()
+      .int()
+      .min(10)
+      .max(1000)
+      .optional()
+      .describe("Trip if cumulative tool calls exceed this limit (default 150, range 10..1000)."),
+    maxInputTokens: z
+      .number()
+      .int()
+      .min(10_000)
+      .max(20_000_000)
+      .optional()
+      .describe("Trip if cumulative input tokens exceed this limit (default 1,500,000, range 10,000..20,000,000).")
+  })
+  .refine(
+    (val) => {
+      const failures = val.maxRepeatedFailures ?? 3;
+      const win = val.window ?? 10;
+      return win >= failures;
+    },
+    {
+      message: "window must be greater than or equal to maxRepeatedFailures",
+      path: ["window"]
+    }
+  );
 
 export type ClineErrorKind =
   | "settings_lock_timeout"
   | "settings_restore_failed"
   | "timeout"
   | "cancelled"
+  | "loop_detected"
+  | "budget_exceeded"
   | "non_zero_exit"
   | "transient_provider_error"
   | "cline_updating"
@@ -71,6 +119,7 @@ export interface ClineRunErrorDetails {
   providerState?: ProviderState;
   resetAt?: string;
   retryAfterSeconds?: number;
+  guard?: GuardReport;
 }
 
 export class ClineRunError extends Error {
@@ -82,6 +131,7 @@ export class ClineRunError extends Error {
   public readonly providerState?: ProviderState;
   public readonly resetAt?: string;
   public readonly retryAfterSeconds?: number;
+  public readonly guard?: GuardReport;
   /** Where the failed run's trace was written, when one was recorded. */
   public trace?: TraceInfo;
   /** Secondary problems that happened after this error, e.g. a cleanup that also failed. */
@@ -103,6 +153,7 @@ export class ClineRunError extends Error {
       this.providerState = details.providerState;
       this.resetAt = details.resetAt;
       this.retryAfterSeconds = details.retryAfterSeconds;
+      this.guard = details.guard;
     }
   }
 }
@@ -175,6 +226,7 @@ export interface ClineInvocationOptions {
   /** Refuse without launching while a cached daily-quota lock is active (default true). */
   respectQuotaLock?: boolean;
   canRetry?: (attemptOutput: { stdout: string; stderr: string; attempt: number }) => Promise<boolean> | boolean;
+  guard?: GuardOptions;
 }
 
 export interface ClineResponse extends ClineFinalResult {
@@ -299,6 +351,9 @@ export function formatErrorAsText(error: unknown, fallbackMessage: string): stri
     }
     if (error.trace) {
       lines.push(`Trace: ${error.trace.dir}`);
+    }
+    if (error.guard) {
+      lines.push(`Guard Report:\n${JSON.stringify(error.guard, null, 2)}`);
     }
     for (const note of error.notes ?? []) {
       lines.push(`Note: ${note}`);
@@ -532,7 +587,8 @@ export async function runCline(
     cwd: options.cwd ?? input.cwd,
     systemPrompt: options.systemPrompt ?? input.systemPrompt,
     provider: options.provider ?? input.provider,
-    model: options.model ?? input.model
+    model: options.model ?? input.model,
+    guard: options.guard ?? input.guard
   };
   requireSelection(effectiveInput);
   const timeoutSeconds = effectiveInput.timeoutSeconds ?? DEFAULT_TIMEOUT_SECONDS;
@@ -732,9 +788,32 @@ export async function runCline(
         // Per-attempt line splitting for the live trace; fragments never join across attempts.
         const thisAttempt = attempt;
         recorder?.attemptStarted(thisAttempt);
-        const splitter = recorder
-          ? new LineSplitter(line => recorder.line(line, thisAttempt), () => recorder.oversizedLine(thisAttempt))
-          : undefined;
+        const guard = createGuard(options.guard ?? effectiveInput.guard);
+        const guardState: { verdict: GuardVerdict | null } = { verdict: null };
+        let terminateChild!: (reason: "timeout" | "cancelled" | "guard") => void;
+        const splitter = new LineSplitter(
+          line => {
+            recorder?.line(line, thisAttempt);
+            if (guardState.verdict) return;
+            try {
+              const parsed = JSON.parse(line.trim());
+              if (parsed && typeof parsed === "object") {
+                const verdict = guard.observe(parsed);
+                if (verdict) {
+                  guardState.verdict = verdict;
+                  recorder?.line(JSON.stringify({
+                    attempt: thisAttempt,
+                    type: "guard_trip",
+                    kind: verdict.kind,
+                    report: verdict
+                  }), thisAttempt);
+                  terminateChild("guard");
+                }
+              }
+            } catch {}
+          },
+          () => recorder?.oversizedLine(thisAttempt)
+        );
         let timedOut = false;
         let cancelled = false;
 
@@ -771,10 +850,10 @@ export async function runCline(
             return true;
           };
 
-          const terminateChild = (isTimeout: boolean) => {
-            if (isTimeout) {
+          terminateChild = (reason: "timeout" | "cancelled" | "guard") => {
+            if (reason === "timeout") {
               timedOut = true;
-            } else {
+            } else if (reason === "cancelled") {
               cancelled = true;
             }
             if (settled || settlementTimer) return;
@@ -807,7 +886,7 @@ export async function runCline(
               if (cleanup()) {
                 resolve({
                   code: exitCode,
-                  signal: exitSignal ?? (isTimeout ? "SIGTERM" : null),
+                  signal: exitSignal ?? (reason === "timeout" ? "SIGTERM" : (reason === "guard" ? "SIGKILL" : null)),
                   error: spawnError
                 });
               }
@@ -815,14 +894,14 @@ export async function runCline(
           };
 
           const timer = schedule(() => {
-            terminateChild(true);
+            terminateChild("timeout");
           }, Math.min(attemptTimerMs, getRemainingBudgetMs()));
           if (!deps.timeoutMs) {
             timer.unref();
           }
 
           const abort = () => {
-            terminateChild(false);
+            terminateChild("cancelled");
           };
           signal?.addEventListener("abort", abort, { once: true });
 
@@ -927,6 +1006,18 @@ export async function runCline(
         const stdoutTail = getTail(redactSecrets(stdout));
         const stderrTail = getTail(redactSecrets(stderr));
         const effectiveCode = code !== null ? code : -1;
+
+        if (guardState.verdict) {
+          const verdict = guardState.verdict;
+          const summary = buildGuardTripMessage(verdict, options.guard);
+          throw new ClineRunError(verdict.kind, summary, {
+            exitCode: code,
+            stderrTail,
+            stdoutTail,
+            attempts: attempt,
+            guard: verdict
+          });
+        }
 
         if (cancelled || signal?.aborted) {
           const cancelSummary = "The Cline request was cancelled.";

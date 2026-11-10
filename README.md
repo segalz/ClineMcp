@@ -64,7 +64,7 @@ ask_cline({
 
 ### 2. `apply_cline_edits`
 
-Have Cline implement a development task directly in the current Git checkout. Files may change, but commits are forbidden and the resulting diff is returned.
+Have Cline implement a development task directly in the current Git checkout. Files may change, but commits are forbidden and the resulting diff is returned. The bridge automatically stops a run on repeated failures or budget.
 
 ```ts
 apply_cline_edits({
@@ -73,19 +73,26 @@ apply_cline_edits({
   provider: string,
   model: string,
   thinking?: "none" | "low" | "medium" | "high" | "xhigh",
-  timeoutSeconds?: number
+  timeoutSeconds?: number,
+  guard?: {
+    maxRepeatedFailures?: number,
+    window?: number,
+    maxToolCalls?: number,
+    maxInputTokens?: number
+  }
 })
 ```
 
 - `provider`, `model`, and `cwd` (path inside a Git checkout) are required; there is no saved-default fallback.
 - Runs with `--auto-approve true` and `EDIT_SYSTEM_PROMPT`; Git commits and branch/history changes are forbidden (an accidental commit is soft-reset and rejected with `commit_created`).
 - `prompt` is `1`–`20,000` characters (subject to the `32,000` UTF-16 unit Windows command-line limit); `timeoutSeconds` defaults to `180` (`1`–`300`); `thinking` defaults to `"none"`.
+- Optional `guard` configuration overrides default loop/budget detection thresholds.
 - Returns `{ text, model?, durationMs, usage?, cost?, gitDiff, status, headBefore, headAfter, commitWasReverted, warnings?, trace? }` (`gitDiff` is truncated at `48,000` characters).
-- Errors return structured JSON with `kind`, `message`, `exitCode`, `attempts`, `resetAt`, `retryAfterSeconds`, `stderrTail`, `stdoutTail`, `trace`, `notes`, and Git evidence.
+- Errors return structured JSON with `kind`, `message`, `exitCode`, `attempts`, `resetAt`, `retryAfterSeconds`, `stderrTail`, `stdoutTail`, `trace`, `notes`, Git evidence, and `guard` report.
 
 ### 3. `ask_cline_workspace`
 
-Analyze a Git workspace through Cline in a disposable detached worktree that is always removed after the request.
+Analyze a Git workspace through Cline in a disposable detached worktree that is always removed after the request. The bridge automatically stops a run on repeated failures or budget.
 
 ```ts
 ask_cline_workspace({
@@ -94,7 +101,13 @@ ask_cline_workspace({
   provider: string,
   model: string,
   thinking?: "none" | "low" | "medium" | "high" | "xhigh",
-  timeoutSeconds?: number
+  timeoutSeconds?: number,
+  guard?: {
+    maxRepeatedFailures?: number,
+    window?: number,
+    maxToolCalls?: number,
+    maxInputTokens?: number
+  }
 })
 ```
 
@@ -102,6 +115,7 @@ ask_cline_workspace({
 - Creates a detached worktree at `HEAD` under `%TEMP%\cline-mcp-worktrees\review-<uuid>` and runs Cline with `--auto-approve true` and `WORKSPACE_SYSTEM_PROMPT` (read/search/inspection only).
 - Always removes and prunes the temporary worktree after the run completes or fails.
 - `prompt` is `1`–`20,000` characters (subject to the `32,000` UTF-16 unit Windows command-line limit); `timeoutSeconds` defaults to `180` (`1`–`300`); `thinking` defaults to `"none"`.
+- Optional `guard` configuration overrides default loop/budget detection thresholds.
 - Returns `{ text, model?, durationMs, usage?, cost?, warnings?, trace? }`.
 
 ### 4. `cline_ping`
@@ -138,7 +152,7 @@ cline_list_models({})
 
 ### 6. `cline_start`
 
-Start a Cline task asynchronously in the background and return its initial `TaskStatusView`.
+Start a Cline task asynchronously in the background and return its initial `TaskStatusView`. The bridge stops a run on repeated failures or budget and waits for guidance via `cline_send`.
 
 ```ts
 cline_start({
@@ -149,15 +163,23 @@ cline_start({
   cwd?: string,
   thinking?: "none" | "low" | "medium" | "high" | "xhigh",
   timeoutSeconds?: number,
-  waitSeconds?: number
+  waitSeconds?: number,
+  guard?: {
+    maxRepeatedFailures?: number,
+    window?: number,
+    maxToolCalls?: number,
+    maxInputTokens?: number
+  }
 })
 ```
 
 - `mode`, `prompt` (`1`–`20,000` chars), `provider`, and `model` are required (no saved-default fallback; `cwd` is required for `"workspace"` and `"edits"`).
 - Runs a single attempt (`maxAttempts: 1`, no automatic retry) with `timeoutSeconds` defaulting to `600` (`1`–`1800`); waits up to `waitSeconds` (default `3`, `0`–`30`) for first progress before returning.
+- Optional `guard` configuration overrides default loop/budget detection thresholds.
 - Caps and retention: at most `2` concurrent active (`"running"` or `"resuming"`) tasks (`MAX_RUNNING_TASKS`; exceeding throws `task_limit`), a `1 hour` TTL (`UNCOLLECTED_TTL_MS`) for settled uncollected tasks, and at most `20` retained settled tasks (`MAX_SETTLED_TASKS`).
 - Task states: `"running"`, `"resuming"`, `"input_required"`, `"done"`, `"failed"`, and `"cancelled"`.
 - Prepends `TASK_QUESTION_PREAMBLE` instructing Cline never to call `ask_question` and instead to stop and end its response with `QUESTION: <one question>` and an optional following line `OPTIONS: a | b | c` (matched only on the final non-empty lines with at most 3 leading spaces and no tabs, up to 5 options), which places the task in `"input_required"`.
+- When the loop guard trips, the task enters `"input_required"` with a bridge question and options rather than failing, allowing guidance via `cline_send`.
 
 ### 7. `cline_status`
 
@@ -221,6 +243,52 @@ cline_result({
 - Returns `{ state, result?, error?, log_run_hint, log_run_note?, trace? }`.
 - `log_run_hint` is `{ ok, error_kind?: "timeout" | "quota" | "crash", retry_after_s?, error_text?, duration_s }` for `model-picker`'s `log_run`, or `null` (with `log_run_note`) when the task was `"cancelled"`, is in `"input_required"`, or failed locally before/around the model run (`workspace_not_git`, `workspace_setup_failed`, `workspace_cleanup_failed`, `settings_lock_timeout`, `settings_restore_failed`, `launch_failed`, `catalog_unavailable`, `edits_inspection_failed`, `cline_updating`, `task_*`).
 - For settled tasks (`"done"`, `"failed"`, `"cancelled"`), removes the task from memory and deletes its trace directories unless `keepTrace: true` (default `false`); for `"input_required"`, keeps the task and traces so it can be resumed with `cline_send`.
+
+## Loop and Budget Guard
+
+The bridge monitors Cline runs in real time for repetitive failure loops and resource budgets, terminating or pausing problematic executions before wasting tokens or hang time:
+
+### What trips it
+- **`loop_detected`**: Triggered when the same failure signature occurs `maxRepeatedFailures` or more times within the sliding `window` of recent tool calls.
+  - For file-modifying tools (`replace_in_file`, `write_to_file`, `apply_patch`), the signature is `toolName` + normalized file target path (canonicalized across slashes and patch headers).
+  - For `run_commands` / `execute_command`, the signature is `toolName` + normalized command string.
+  - For other tools without a file path, the signature is `toolName` + a stable hash of sorted input JSON keys.
+  - Successes and calls to other tools in between count toward the sliding window but do not reset the failure counter.
+- **`budget_exceeded`**: Triggered when cumulative tool calls exceed `maxToolCalls`, or cumulative input tokens exceed `maxInputTokens`.
+  - Token tracking counts incremental `usage` events alongside cumulative `done`/`run_result` totals without double-counting.
+
+### Guard Parameters and Defaults
+Available as an optional `guard` object on `apply_cline_edits`, `ask_cline_workspace`, and `cline_start` (`ask_cline` runs with no tools and has no `guard` parameter):
+- `maxRepeatedFailures`: Integer between `2` and `20` (default `3`).
+- `window`: Integer between `3` and `50` (default `10`). Must be greater than or equal to `maxRepeatedFailures`.
+- `maxToolCalls`: Integer between `10` and `1000` (default `150`).
+- `maxInputTokens`: Integer between `10,000` and `20,000,000` (default `1,500,000`).
+
+### The Guard Report
+When tripped (or inspected via task history), a `GuardReport` object is attached (`err.guard` or `task.guard`):
+- `kind`: `"loop_detected"` or `"budget_exceeded"`.
+- `tool`: The tool involved in the loop (e.g. `"replace_in_file"`, `"run_commands"`).
+- `target`: The failing file path or command (secrets redacted).
+- `count`: Number of times the failure signature appeared in the window.
+- `window`: Configured window size.
+- `lastErrors`: Up to 3 recent error messages (each ≤ 300 characters, secrets redacted).
+- `totalToolCalls`: Total tool calls observed during the run.
+- `totalInputTokens`: Total input tokens observed.
+- `filesTouched`: Successfully modified/written file paths (secrets redacted).
+- `lastAssistantText`: Last assistant text excerpt (≤ 400 characters).
+
+### Task Behavior vs Synchronous Tools
+- **Async tasks (`cline_start`)**:
+  - A tripped guard does **not** fail the task. The task enters `"input_required"` state with a bridge-generated question:
+    `QUESTION: Stopped by the bridge: <message>. How should it continue (a different approach, skip this file, or stop)?`
+    with options: `a different approach | skip this file | stop`.
+  - The task and its full run history are retained and can be inspected with `cline_status`.
+  - Calling `cline_send` resumes the task. The resumed prompt includes a bounded, redacted warning notice (`Previous run was stopped by the bridge: ...; do not repeat the same failing action.`) along with the failing tool, target, and recent error details (compacted dynamically if prompt limits require it).
+  - Subsequent trips during resumed runs pause again in `"input_required"`.
+- **Synchronous tools (`apply_cline_edits`, `ask_cline_workspace`)**:
+  - The Cline process tree is terminated immediately (`killTree`), and a `guard_trip` event is written to the trace.
+  - Fails with `ClineRunError` (kind `"loop_detected"` or `"budget_exceeded"`), attaching the `guard` report.
+  - Guard trips are never retried.
 
 ## Provider and Model Settings Coordination
 
@@ -293,6 +361,8 @@ Settlement listens for process `exit` as well as `close`. If Cline or a child da
 - `malformed_json` / `missing_final_result`: Process completed with code 0 but stdout did not produce a valid terminal result.
 - `workspace_not_git`, `workspace_setup_failed`, `workspace_cleanup_failed`: Worktree management failures.
 - `commit_created`, `edits_inspection_failed`: Git checkout modification failures.
+- `loop_detected`: Repeated tool failure on the same target/command tripped the loop detector within the sliding window.
+- `budget_exceeded`: Cumulative tool calls or cumulative input tokens exceeded the configured budget.
 
 ### Success Despite Non-Zero Exit or External Signal
 When Cline successfully answers but exits with code 1 or an external signal (for example, printing a completed `run_result` or an `agent_event` `done` with `reason:"completed"`, followed by `session not found` on stderr), the bridge recovers the completed text, returns success, and includes a `warnings` array (e.g. `["cline exited with code 1 after a completed result: session not found: <id>"]`).
