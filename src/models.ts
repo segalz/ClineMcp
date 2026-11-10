@@ -3,7 +3,9 @@ import { readFile, realpath } from "node:fs/promises";
 import { pathToFileURL } from "node:url";
 import { ClineRunError, resolveClineEntry } from "./runner.js";
 import { PROHIBITED_NAMES } from "./settings.js";
-import { readStatusEntry, resolveStatusPath, type StatusEntry } from "./status.js";
+import { atomicWriteJson, readStatusEntry, resolveCatalogPath, resolveStatusPath, type StatusEntry } from "./status.js";
+
+export { resolveCatalogPath };
 
 /** Provider id the CLI uses for Cline's own models, free ones included (`cline -P cline -m <id>`). */
 export const CLINE_PROVIDER = "cline";
@@ -113,4 +115,70 @@ export async function listFreeModels(deps: ModelCatalogDeps = {}): Promise<FreeM
     note: "Free models as advertised by the installed Cline CLI. The list rotates; being listed does not prove the " +
       "model answers right now - check with cline_ping."
   };
+}
+
+export interface CatalogSnapshotModel {
+  id: string;
+  name: string;
+  contextWindow?: number;
+  capabilities?: string[];
+}
+
+export interface CatalogSnapshot {
+  version: 1;
+  generated_at: string;
+  provider: string;
+  models: CatalogSnapshotModel[];
+  source: {
+    package: string;
+    version?: string;
+    cliVersion?: string;
+  };
+}
+
+/**
+ * Writes an atomic JSON snapshot of the free-model catalog to disk.
+ * Omits last_status and descriptions; directory is created if missing, and
+ * any temporary file is cleaned up on failure.
+ */
+export async function writeCatalogSnapshot(
+  list: FreeModelList,
+  catalogPath?: string,
+  now?: number | Date | string
+): Promise<void> {
+  const dest = catalogPath ? path.resolve(catalogPath) : resolveCatalogPath();
+  if (!dest) {
+    throw new Error("Catalog path could not be resolved.");
+  }
+  const iso = now instanceof Date
+    ? now.toISOString()
+    : (typeof now === "number" || typeof now === "string")
+      ? new Date(now).toISOString()
+      : new Date().toISOString();
+
+  const snapshot: CatalogSnapshot = {
+    version: 1,
+    generated_at: iso,
+    provider: list.provider || CLINE_PROVIDER,
+    models: list.models.map((m) => {
+      const model: CatalogSnapshotModel = {
+        id: m.id,
+        name: m.name
+      };
+      if (typeof m.contextWindow === "number") {
+        model.contextWindow = m.contextWindow;
+      }
+      if (Array.isArray(m.capabilities)) {
+        model.capabilities = m.capabilities;
+      }
+      return model;
+    }),
+    source: {
+      package: list.source.package,
+      ...(list.source.version !== undefined ? { version: list.source.version } : {}),
+      ...(list.source.cliVersion !== undefined ? { cliVersion: list.source.cliVersion } : {})
+    }
+  };
+
+  await atomicWriteJson(dest, snapshot);
 }

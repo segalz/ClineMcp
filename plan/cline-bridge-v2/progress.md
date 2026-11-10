@@ -40,11 +40,11 @@ Status values: `todo`, `in progress`, `done`, `blocked`, `skipped`.
 | 6.3 | `cline_send` → fresh run with context | done | 2026-11-10 | Same taskId, run counter + history; prompt = original + previous answer + `git diff --stat` + full Q&A history (with options), budgeted for 20k chars and the Windows command line |
 | 6.R | Verify: code review | done | 2026-11-10 | Codex 8 rounds (resume race, truncation, Windows budget, expiry, code-block questions, stale results, poll starvation, Q&A history, Git lifecycle, options) → PASS; AGY fixed every round; Claude verified each diff and test run |
 | 6.L | Verify: live check against Cline | done | 2026-11-10 | Via MCP: "hello world, which language?" → `input_required` with 5 options; result call kept the task; `cline_send("Go")` → run 2 → Hello World in Go; hint ok, 37.5 s |
-| 7.1 | model-picker: explicit models, `cline-task`, error_kind map | todo | | |
-| 7.2 | model-picker: free list from bridge | todo | | |
-| 7.3 | Update CLAUDE.md contract and README | todo | | |
-| 7.R | Verify: code review | todo | | |
-| 7.L | Verify: live check against Cline | todo | | |
+| 7.1 | model-picker: explicit models, `cline-task`, error_kind map | done | 2026-11-10 | AGY (D-27): 3 explicit Cline ids (model ids may contain `/`; unit split at first/last `/`), backend `cline-task` → `cline_start`; error_kind comes from the bridge's `log_run_hint` (picker instructions say pass it, skip when null) |
+| 7.2 | model-picker: free list from bridge | done | 2026-11-10 | Bridge writes `~/.cline-mcp/catalog.json` at startup and on `cline_list_models` (D-26); picker reads it, no globalState fallback; Cline models absent from the catalog or with a fresh non-available status are not picked |
+| 7.3 | Update CLAUDE.md contract and README | done | 2026-11-10 | CLAUDE.md: required provider/model incl. `cline_start`, pick unit format, task flow, log_run_hint; README Tools section rewritten for all 10 tools (AGY) |
+| 7.R | Verify: code review | done | 2026-11-10 | Claude reviewed (Codex dropped by the user): round 1 found pick could choose a model missing from the catalog or quota-exhausted → AGY fixed; picker 3080 pass / 1 skip, bridge 186 tests 184 pass / 2 skip |
+| 7.L | Verify: live check against Cline | done | 2026-11-10 | New code from the repos: bridge wrote catalog.json (5 free ids); `pick` → `cline/cline-free/nemotron-3.5-super-vl/fixed` and `cline-task/...` with `cline_start`; `cline_start` on it → done in 14 s, hint ok; `log_run` recorded it (temp ledger; the running picker loads the new config after a restart) |
 
 | X.1 | `ask_cline` no-tools notice + Windows length guard (D-21) | done | 2026-11-09 | Codex analysis + review (3 rounds: Windows command-line length, UTF-16 count) PASS; 139 tests; live 0 tool calls / 1 iteration |
 

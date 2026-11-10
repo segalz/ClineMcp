@@ -5,7 +5,7 @@ import { askCline, ClineRunError, formatErrorAsText } from "./runner.js";
 import { applyClineEdits, ClineEditsError } from "./edits.js";
 import { askClineWorkspace } from "./workspace.js";
 import { clinePing } from "./ping.js";
-import { listFreeModels } from "./models.js";
+import { listFreeModels, writeCatalogSnapshot } from "./models.js";
 import { cleanupTraces } from "./trace.js";
 import { TaskManager, MAX_TASK_TIMEOUT_SECONDS, MAX_WAIT_SECONDS } from "./tasks.js";
 import { PROHIBITED_NAMES, resolveProviderSettingsPath, recoverProviderSettingsJournal } from "./settings.js";
@@ -237,7 +237,13 @@ server.registerTool(
   },
   async () => {
     try {
-      return { content: [{ type: "text", text: JSON.stringify(await listFreeModels(), null, 2) }] };
+      const list = await listFreeModels();
+      try {
+        await writeCatalogSnapshot(list);
+      } catch (err: any) {
+        console.error(`Failed to write catalog snapshot: ${(err?.message ?? String(err)).split(/\r?\n/)[0]}`);
+      }
+      return { content: [{ type: "text", text: JSON.stringify(list, null, 2) }] };
     } catch (error) {
       const message = formatErrorAsText(error, "Listing Cline models failed unexpectedly.");
       return { content: [{ type: "text", text: message }], isError: true };
@@ -373,5 +379,15 @@ process.on("SIGTERM", () => { void shutdown(); });
 
 // Old finished traces and traces of dead bridge processes; never blocks startup.
 void cleanupTraces().catch(() => {});
+
+// Write initial free-model catalog snapshot in background; never blocks startup.
+void (async () => {
+  try {
+    const list = await listFreeModels();
+    await writeCatalogSnapshot(list);
+  } catch (err: any) {
+    console.error(`Failed to write catalog snapshot on startup: ${(err?.message ?? String(err)).split(/\r?\n/)[0]}`);
+  }
+})();
 
 await server.connect(new StdioServerTransport());

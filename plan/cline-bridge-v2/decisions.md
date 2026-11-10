@@ -153,6 +153,17 @@ are rejected. Accepted residual: an answer that ends inside an UNCLOSED fence wi
 **Why:** Codex review rounds 3–5 kept finding new nested-Markdown cases (4-backtick fences, fences in lists);
 a full CommonMark parser is out of proportion, and the trailing-block rule covers well-formed Markdown.
 
+### D-26 — 2026-11-10 — The bridge publishes its free list as a file; the picker trusts it for Cline
+**Decision:** The bridge writes `~/.cline-mcp/catalog.json` (env `CLINE_MCP_CATALOG_PATH`) atomically at startup and
+after each `cline_list_models`, without statuses. model-picker reads only that file (no `globalState.json`
+fallback). Configured Cline models absent from a valid catalog, or with a fresh non-available bridge status, are not
+picked; a missing or invalid catalog blocks nothing. The picker's model list stays static in TOML.
+**Why:** Python cannot import `@cline/llms` without duplicating the bridge's install resolution; a file keeps one source.
+
+### D-27 — 2026-11-10 — Stage 7: AGY implements, Claude reviews; AGY on its strong model
+**Decision:** At the user's request Codex is out for Stage 7; Claude does the analysis and review. AGY implements,
+from review round 1 on `gemini-4-argon-high` (added to model-picker's `agy` backend, quota family "Gemini 4 Argon").
+
 ### Open risk — settings restore vs. a concurrent token refresh
 The restore reads the freshest settings file and rewrites it. If another Cline client (the desktop app)
 rotates the login token in the milliseconds between that read and write, the rotation could be lost and

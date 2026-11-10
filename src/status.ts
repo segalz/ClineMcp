@@ -49,6 +49,16 @@ export function resolveStatusPath(overridePath?: string | null): string | undefi
   return path.join(os.homedir(), ".cline-mcp", "status.json");
 }
 
+export function resolveCatalogPath(overridePath: null): undefined;
+export function resolveCatalogPath(overridePath?: string): string;
+export function resolveCatalogPath(overridePath?: string | null): string | undefined;
+export function resolveCatalogPath(overridePath?: string | null): string | undefined {
+  if (overridePath === null) return undefined;
+  if (overridePath) return path.resolve(overridePath);
+  if (process.env.CLINE_MCP_CATALOG_PATH) return path.resolve(process.env.CLINE_MCP_CATALOG_PATH);
+  return path.join(os.homedir(), ".cline-mcp", "catalog.json");
+}
+
 export function statusKey(provider?: string, model?: string): string {
   return `${provider || "default"}|${model || "default"}`;
 }

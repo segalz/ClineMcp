@@ -1,12 +1,12 @@
 import assert from "node:assert/strict";
 import test, { after } from "node:test";
-import { access, mkdir, mkdtemp, realpath, rm, symlink, writeFile } from "node:fs/promises";
+import { access, mkdir, mkdtemp, readdir, readFile, realpath, rm, symlink, writeFile } from "node:fs/promises";
 import { pathToFileURL } from "node:url";
 import os from "node:os";
 import path from "node:path";
-import { listFreeModels, CLINE_PROVIDER } from "../models.js";
+import { listFreeModels, writeCatalogSnapshot, CLINE_PROVIDER, type FreeModelList } from "../models.js";
 import { ClineRunError, resolveClineEntry } from "../runner.js";
-import { buildEntry, writeStatusEntry } from "../status.js";
+import { buildEntry, writeStatusEntry, resolveCatalogPath } from "../status.js";
 
 const root = await mkdtemp(path.join(os.tmpdir(), "cline-models-"));
 after(() => rm(root, { recursive: true, force: true }));
@@ -121,4 +121,149 @@ test("installed Cline CLI exposes a non-empty free list (skipped when Cline is n
   const result = await listFreeModels({ statusPath: path.join(root, "real-status.json") });
   assert.ok(result.models.length > 0);
   assert.ok(result.models.every(m => m.provider === "cline" && /^[A-Za-z0-9._:/@-]+$/.test(m.id)));
+});
+
+test("snapshot content: writes catalog snapshot without last_status or descriptions", async () => {
+  const targetPath = path.join(root, `catalog-content-${++counter}.json`);
+  const now = "2026-11-10T07:00:00.000Z";
+  const list: FreeModelList = {
+    provider: CLINE_PROVIDER,
+    models: [
+      {
+        provider: "cline",
+        id: "cline-free/test-model-1",
+        name: "Test Model 1",
+        description: "A description that must not appear in snapshot",
+        contextWindow: 1048576,
+        capabilities: ["tools", "reasoning"],
+        last_status: {
+          state: "available",
+          reason: "replied PONG",
+          checked_at: "2026-11-10T06:55:00.000Z",
+          expires_at: "2026-11-10T06:56:00.000Z",
+          source: "ping"
+        }
+      },
+      {
+        provider: "cline",
+        id: "cline-free/test-model-2",
+        name: "Test Model 2",
+        description: "Another description that must not appear in snapshot",
+        last_status: {
+          state: "rate_limited",
+          reason: "429 Too many requests",
+          checked_at: "2026-11-10T06:55:00.000Z",
+          expires_at: "2026-11-10T06:58:00.000Z",
+          source: "run"
+        }
+      }
+    ],
+    source: {
+      package: path.join(root, "node_modules", "@cline", "llms"),
+      version: "0.2.0",
+      cliVersion: "3.0.74"
+    },
+    note: "Free models as advertised by the installed Cline CLI"
+  };
+
+  await writeCatalogSnapshot(list, targetPath, now);
+
+  const raw = await readFile(targetPath, "utf8");
+  const data = JSON.parse(raw);
+
+  assert.equal(data.version, 1);
+  assert.equal(data.generated_at, now);
+  assert.equal(data.provider, "cline");
+  assert.deepEqual(data.source, {
+    package: path.join(root, "node_modules", "@cline", "llms"),
+    version: "0.2.0",
+    cliVersion: "3.0.74"
+  });
+  assert.equal("note" in data, false, "note must not be included");
+  assert.equal("last_status" in data, false, "last_status must not be included at top level");
+
+  assert.equal(data.models.length, 2);
+
+  // Model 1: preserves contextWindow and capabilities, omits description and last_status
+  assert.deepEqual(data.models[0], {
+    id: "cline-free/test-model-1",
+    name: "Test Model 1",
+    contextWindow: 1048576,
+    capabilities: ["tools", "reasoning"]
+  });
+  assert.equal("last_status" in data.models[0], false);
+  assert.equal("description" in data.models[0], false);
+  assert.equal("provider" in data.models[0], false);
+
+  // Model 2: omits optional fields, omits description and last_status
+  assert.deepEqual(data.models[1], {
+    id: "cline-free/test-model-2",
+    name: "Test Model 2"
+  });
+  assert.equal("last_status" in data.models[1], false);
+  assert.equal("description" in data.models[1], false);
+  assert.equal("contextWindow" in data.models[1], false);
+  assert.equal("capabilities" in data.models[1], false);
+  assert.equal("provider" in data.models[1], false);
+});
+
+test("atomic write into a temp dir: creates missing directory and cleans temp on failure", async () => {
+  const targetDir = path.join(root, `atomic-test-${++counter}`, "sub");
+  const targetPath = path.join(targetDir, "catalog.json");
+  const list: FreeModelList = {
+    provider: "cline",
+    models: [{ provider: "cline", id: "atomic-model", name: "Atomic Model" }],
+    source: { package: "/pkg" },
+    note: "note"
+  };
+
+  // 1. Target directory does not exist initially; write creates directory and writes file atomically
+  await writeCatalogSnapshot(list, targetPath);
+  const data = JSON.parse(await readFile(targetPath, "utf8"));
+  assert.equal(data.version, 1);
+  assert.equal(data.models[0].id, "atomic-model");
+
+  // Verify only catalog.json exists and no leftover .tmp files
+  const files = await readdir(targetDir);
+  assert.deepEqual(files, ["catalog.json"]);
+
+  // 2. Failure case: rename over a directory fails, and temporary file is unlinked in finally
+  const conflictDir = path.join(root, `conflict-${++counter}`);
+  await mkdir(conflictDir, { recursive: true });
+  await assert.rejects(writeCatalogSnapshot(list, conflictDir));
+
+  const parentEntries = await readdir(root);
+  const strayTemps = parentEntries.filter(f => f.startsWith(`conflict-${counter}`) && f.endsWith(".tmp"));
+  assert.equal(strayTemps.length, 0, "temporary file must be removed on failure");
+});
+
+test("resolveCatalogPath respects CLINE_MCP_CATALOG_PATH override and defaults to ~/.cline-mcp/catalog.json", async () => {
+  const originalEnv = process.env.CLINE_MCP_CATALOG_PATH;
+  try {
+    delete process.env.CLINE_MCP_CATALOG_PATH;
+    assert.equal(resolveCatalogPath(), path.join(os.homedir(), ".cline-mcp", "catalog.json"));
+    assert.equal(resolveCatalogPath(null), undefined);
+    assert.equal(resolveCatalogPath("custom/sub/catalog.json"), path.resolve("custom/sub/catalog.json"));
+
+    const overridePath = path.join(root, `env-catalog-${++counter}.json`);
+    process.env.CLINE_MCP_CATALOG_PATH = overridePath;
+    assert.equal(resolveCatalogPath(), path.resolve(overridePath));
+
+    // writeCatalogSnapshot writes to CLINE_MCP_CATALOG_PATH when path argument is omitted
+    const list: FreeModelList = {
+      provider: "cline",
+      models: [{ provider: "cline", id: "env-model", name: "Env Model" }],
+      source: { package: "/pkg" },
+      note: "note"
+    };
+    await writeCatalogSnapshot(list);
+    const data = JSON.parse(await readFile(overridePath, "utf8"));
+    assert.equal(data.models[0].id, "env-model");
+  } finally {
+    if (originalEnv !== undefined) {
+      process.env.CLINE_MCP_CATALOG_PATH = originalEnv;
+    } else {
+      delete process.env.CLINE_MCP_CATALOG_PATH;
+    }
+  }
 });
