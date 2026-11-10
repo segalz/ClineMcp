@@ -190,3 +190,8 @@ looped on a failed search-and-replace. Short, focused runs did well.
 | 9.3 | Loop guard: the same failing tool call repeated N times stops the step and reports it. | Test with a repeated failing edit. |
 | 9.4 | Final merge step writes the result once. | Tests. |
 | 9.R / 9.L | Review; live run of a multi-part research task. | No loop; every step short. |
+
+## Later — the same micro-steps for OpenCode (owner's idea, 2026-11-10)
+
+Once Stage 9 works with Cline, apply it to the OpenCode helper (`C:\Develop\openCodeHelperMcp`), where
+each step can use a different free model by role: one to plan, one to execute, one to review.
