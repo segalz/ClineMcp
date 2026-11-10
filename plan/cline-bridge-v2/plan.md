@@ -185,6 +185,7 @@ looped on a failed search-and-replace. Short, focused runs did well.
 
 | Step | Work | Done when |
 |---|---|---|
+| 9.0 | **Research and agreement first (owner, 2026-11-10):** it is not yet settled exactly what Stage 9 should do and what we want from it. Research how Cline splits work today, what other agents do, and options; agree the goal with the owner before any 9.x step. | Owner approves the goal and scope. |
 | 9.1 | Planning run: Cline returns a short list of steps as JSON in a temp file (bridge forces the shape, Cline decides the content). | Test with fake Cline. |
 | 9.2 | Each step runs as its own short task with a small context (original goal + its step + results so far). | Tests. |
 | 9.3 | Loop guard: the same failing tool call repeated N times stops the step and reports it. | Test with a repeated failing edit. |
