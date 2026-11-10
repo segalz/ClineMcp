@@ -184,6 +184,14 @@ rotates the login token in the milliseconds between that read and write, the rot
 Cline would ask for re-authentication. Pre-existing in v1; not shown to be the cause of the 2026-11-09
 expiry. Revisit if re-authentication repeats.
 
+### D-30 — 2026-11-11 — Stage 9 is a bridge-side loop guard, not micro-steps
+**Decision:** Option B from `stage9-research.md`: the bridge watches Cline's tool events, stops a run on repeated
+failures of the same tool+target (3 within 10 calls) or on a tool-call / token budget, and reports. Async tasks
+then wait for guidance (`input_required`) instead of failing. Micro-steps (option C) wait until B proves
+insufficient.
+**Why:** Cline's own loop detection counts consecutive identical calls only and is not configurable headless;
+the observed loop varied its inputs. Agreed with the owner on 2026-11-11.
+
 ### D-13 — 2026-11-09 — Codex replaces Grok; Grok is out
 **Decision:** Pre-code analysis and `n.R` code review go to Codex (`codex_ask`, read-only sandbox).
 Fallback: AGY, then OpenCode. Grok is not used in this project. Supersedes the Grok parts of D-12.

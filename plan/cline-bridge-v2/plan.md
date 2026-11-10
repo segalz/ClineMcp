@@ -175,22 +175,22 @@ Cross-machine sharing is future work: [future-supabase.md](future-supabase.md).
 Stage 0 → 1 → 2 → 3 (2.2 uses 3) → 4 → 5 → 6 → 7 → 8. Stages 1–3 alone already restore a working,
 parallel-safe synchronous bridge and can be released before 4–6.
 
-## Stage 9 — Micro-steps (planned, from D-08)
+## Stage 9 — Loop guard (option B, agreed with the owner on 2026-11-11)
 
-Built together with Cline: every step is designed against real Cline runs (how it splits, where it
-loops), not only fakes; each 9.x has a live run with Cline before review.
-
-Lesson from 2026-11-10: one long Cline run (4 CLIs, 62 tool calls, ~374k input tokens) lost focus and
-looped on a failed search-and-replace. Short, focused runs did well.
+Research: [stage9-research.md](stage9-research.md). Cline's own guards count only consecutive identical calls
+and are not configurable headless; the 2026-11-10 loop (61 failing edits with small variations, interleaved
+with reads) slipped through. Micro-steps (option C) are deferred until the guard proves insufficient.
+Built against real Cline runs: each step ends with a live run before review. Roles: AGY codes, Codex reviews.
 
 | Step | Work | Done when |
 |---|---|---|
-| 9.0 | **Research and agreement first (owner, 2026-11-10):** it is not yet settled exactly what Stage 9 should do and what we want from it. Research how Cline splits work today, what other agents do, and options; agree the goal with the owner before any 9.x step. | Owner approves the goal and scope. |
-| 9.1 | Planning run: Cline returns a short list of steps as JSON in a temp file (bridge forces the shape, Cline decides the content). | Test with fake Cline. |
-| 9.2 | Each step runs as its own short task with a small context (original goal + its step + results so far). | Tests. |
-| 9.3 | Loop guard: the same failing tool call repeated N times stops the step and reports it. | Test with a repeated failing edit. |
-| 9.4 | Final merge step writes the result once. | Tests. |
-| 9.R / 9.L | Review; live run of a multi-part research task. | No loop; every step short. |
+| 9.0 | Research and agreement with the owner. | Done 2026-11-11: option B. |
+| 9.1 | Detector over the `--json` events (pure function, no I/O): a failed tool call's signature = tool name + normalised target (path); trip when the same signature fails 3 times within the last 10 tool calls (not only consecutive). Budgets: max tool calls and max input tokens per run (defaults generous, overridable). | Tests with synthetic event streams, incl. the 2026-11-10 pattern. |
+| 9.2 | On a trip, the runner stops Cline (existing tree kill) and returns kind `loop_detected` or `budget_exceeded` with a report: the repeated tool and target, the last errors (short, redacted), counts, files touched, last text. `log_run_hint` = `crash` with that reason. | Tests; sync tools return the report. |
+| 9.3 | Async tasks: a trip does not end the task; it becomes `input_required` with a bridge question ("Stopped: N failed edits on X. How should it continue?"). `cline_send` resumes with the report in context (Stage 6 path). | Tests; a trip then `cline_send` continues. |
+| 9.4 | Optional `guard` params on `cline_start` and the sync tools (`maxToolCalls`, `maxInputTokens`, `maxRepeatedFailures`); README and tool descriptions. | Docs match code. |
+| 9.R | Codex review per step. | No open findings. |
+| 9.L | Live: a real Cline run that repeats a failing edit is stopped by the guard and reported; a normal run is untouched. | Both behave as specified. |
 
 ## Later — the same micro-steps for OpenCode (owner's idea, 2026-11-10)
 
