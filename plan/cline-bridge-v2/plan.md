@@ -153,7 +153,24 @@ It is only the system under test, reached through the bridge's MCP tools in `n.L
 | 7.R | Code review of the model-picker diff. | No open blocking findings. |
 | 7.L | Live: `pick` for an analysis task returns an explicit `cline-free/...` model; calling the bridge with it succeeds; `log_run` records the outcome. | End-to-end flow works. |
 
+## Stage 8 — Reliable dashboard and safe CLI updates (local only)
+
+Everything runs on demand: no timers, no background polling. Each machine manages its own CLI.
+Cross-machine sharing is future work: [future-supabase.md](future-supabase.md).
+
+| Step | Work | Done when |
+|---|---|---|
+| 8.1 | Local state file `~/.cline-mcp/state.json` (machine id, CLI and catalog version, update state `ok` / `update_available` / `updating` / `rolled_back` / `broken`, failed versions with reason, last real result per model). Shaped like the future Supabase rows; one sync hook that is a no-op. Written atomically under a local lock shared by all bridges on the machine. | Tests: concurrent bridges, atomic writes, schema. |
+| 8.2 | Catalog follows the installed CLI without a restart: on each call the bridge compares the CLI / `@cline/llms` version and reloads the catalog and rewrites `catalog.json` when it changed. | Test: version change → new catalog, no restart. |
+| 8.3 | model-picker picks free models from the catalog: a catalog model missing from `backends.toml` is added at runtime with default Cline priors; a model gone from the catalog is not picked. | Picker tests. |
+| 8.4 | Dashboard shows facts: each Cline model's last real result with its time (no 60 s expiry for display); "not checked" when none; never "unavailable" without evidence. A dashboard refresh pings every catalog model once. | Dashboard tests; refresh is the only extra ping. |
+| 8.5 | Daily CLI update check, started by the first real call of the day, in the background (never delays that call). Never retries a failed version; only a newer one. | Tests with a fake registry. |
+| 8.6 | Safe update: install only when no Cline run is active on the machine (lock); calls arriving meanwhile wait up to 60 s; after install, load the catalog and ping one free model; on failure roll back to the previous version and record the failed version and reason. | Tests: busy → deferred; failure → rollback; lock → one updater. |
+| 8.7 | Status everywhere: every bridge reply carries a short `cli` field when the state is not `ok`; the dashboard shows the CLI version (green: current or newer available; yellow: rolled back, with the failed version and reason). | Tests; docs updated. |
+| 8.R | Code review of the Stage 8 diffs (bridge and model-picker). | No open blocking findings. |
+| 8.L | Live: restart → dashboard shows last results, not "unavailable"; refresh pings; a simulated failed update rolls back and shows yellow; a second bridge sees `updating`. | All behave as specified. |
+
 ## Order and dependencies
 
-Stage 0 → 1 → 2 → 3 (2.2 uses 3) → 4 → 5 → 6 → 7. Stages 1–3 alone already restore a working,
+Stage 0 → 1 → 2 → 3 (2.2 uses 3) → 4 → 5 → 6 → 7 → 8. Stages 1–3 alone already restore a working,
 parallel-safe synchronous bridge and can be released before 4–6.

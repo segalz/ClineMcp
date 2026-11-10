@@ -45,6 +45,15 @@ Status values: `todo`, `in progress`, `done`, `blocked`, `skipped`.
 | 7.3 | Update CLAUDE.md contract and README | done | 2026-11-10 | CLAUDE.md: required provider/model incl. `cline_start`, pick unit format, task flow, log_run_hint; README Tools section rewritten for all 10 tools (AGY) |
 | 7.R | Verify: code review | done | 2026-11-10 | Claude reviewed (Codex dropped by the user): round 1 found pick could choose a model missing from the catalog or quota-exhausted → AGY fixed; picker 3080 pass / 1 skip, bridge 186 tests 184 pass / 2 skip |
 | 7.L | Verify: live check against Cline | done | 2026-11-10 | New code from the repos: bridge wrote catalog.json (5 free ids); `pick` → `cline/cline-free/nemotron-3.5-super-vl/fixed` and `cline-task/...` with `cline_start`; `cline_start` on it → done in 14 s, hint ok; `log_run` recorded it (temp ledger; the running picker loads the new config after a restart) |
+| 8.1 | Local state file + lock + sync hook | todo | | |
+| 8.2 | Catalog reload on CLI change | todo | | |
+| 8.3 | Picker: catalog models pickable | todo | | |
+| 8.4 | Dashboard: last real result, refresh pings | todo | | |
+| 8.5 | Daily update check on first call | todo | | |
+| 8.6 | Safe update with rollback | todo | | |
+| 8.7 | CLI status in replies and dashboard | todo | | |
+| 8.R | Verify: code review | todo | | |
+| 8.L | Verify: live check against Cline | todo | | |
 
 | X.1 | `ask_cline` no-tools notice + Windows length guard (D-21) | done | 2026-11-09 | Codex analysis + review (3 rounds: Windows command-line length, UTF-16 count) PASS; 139 tests; live 0 tool calls / 1 iteration |
 

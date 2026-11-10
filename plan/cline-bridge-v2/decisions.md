@@ -164,6 +164,15 @@ picked; a missing or invalid catalog blocks nothing. The picker's model list sta
 **Decision:** At the user's request Codex is out for Stage 7; Claude does the analysis and review. AGY implements,
 from review round 1 on `gemini-4-argon-high` (added to model-picker's `agy` backend, quota family "Gemini 4 Argon").
 
+### D-28 — 2026-11-10 — Stage 8: facts on the dashboard, on-demand checks, self-healing CLI updates
+**Decision:** No timers or background polling. The dashboard shows each model's last real result with its time and
+"not checked" otherwise; a refresh pings the catalog models once. The CLI update check runs once a day, triggered by
+the first real call; an update installs only when no run is active, is verified by a catalog load and one ping, and
+rolls back automatically on failure; a failed version is never retried, only a newer one. State lives per machine in
+`~/.cline-mcp/state.json`, shaped for a later Supabase sync (`future-supabase.md`).
+**Why:** Requested by the user. A 60 s observation expiry made every model look unavailable after a restart; periodic
+pings cost quota for nothing; a human approval step would stall remote processes.
+
 ### Open risk — settings restore vs. a concurrent token refresh
 The restore reads the freshest settings file and rewrites it. If another Cline client (the desktop app)
 rotates the login token in the milliseconds between that read and write, the rotation could be lost and
