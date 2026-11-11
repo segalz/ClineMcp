@@ -208,6 +208,23 @@ Roles: Codex codes, AGY reviews. All prompts and replies with other models in En
 | 10.R | AGY review. | No open findings. |
 | 10.L | Live: the same task in three variants (today, rules, rules + map); compare tokens, time and success. | Fewer tokens or re-reads, same or better result. |
 
+## Stage 11 — Micro-steps (option C; proposed 2026-11-12, waiting for the owner)
+
+Research: [stage11-research.md](stage11-research.md). The caller plans (any model), Cline executes one small step per
+run, the bridge verifies and can roll back. Built on Stage 9 (guard) and Stage 10 (rules, code map). Roles: Codex codes,
+AGY reviews.
+
+| Step | Work | Done when |
+|---|---|---|
+| 11.0 | Research and proposal. | Owner agrees. |
+| 11.1 | `steps` on `cline_start` (mode edits): `{id, instruction, paths?, verify?: {command, args, timeoutSeconds}}`. One fresh Cline run per step with the objective, the current step, a short ledger of verified steps and the code map. `cline_status` shows the current step. | Tests with fake runs. |
+| 11.2 | Bridge-run verification after each step (no shell, timeout, exit code, output tail). Pass → next step; fail → `input_required` with evidence; `cline_send` answers retry / skip / stop / free guidance. | Tests. |
+| 11.3 | Snapshot before each step outside the checkout (no commit, no HEAD or index change); restore a failed step only, keeping earlier verified steps and the owner's own dirty, staged and untracked files. | Tests incl. untracked and pre-existing dirty files. |
+| 11.4 | Budgets per step and per plan; README. | Docs match code. |
+| 11.R | AGY review. | No open findings. |
+| 11.L | Live on a throwaway repo: a 3-4 step change as micro-steps vs one run; compare success, time and tokens. | Micro-steps succeed at least as often, with smaller contexts. |
+| Later | (a) `cline_plan`: Cline or another model drafts the steps. | — |
+
 ## Later — the same micro-steps for OpenCode (owner's idea, 2026-11-10)
 
 Once Stage 9 works with Cline, apply it to the OpenCode helper (`C:\Develop\openCodeHelperMcp`), where

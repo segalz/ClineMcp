@@ -67,6 +67,13 @@ Status values: `todo`, `in progress`, `done`, `blocked`, `skipped`.
 | 10.3 | Code map | done | 2026-11-12 | Codex: src/codemap.ts, git ls-files + regex symbols, 6,000-char cap clamped to the Windows command line, 1.5 s / 3,000 files; codeMap param (default true). Also fixed: trace redacted numeric token counts |
 | 10.R | Verify: code review | done | 2026-11-12 | AGY approved both rounds; two low notes left as is (snake_case token keys unused by Cline; extreme cwd already rejected by limits) |
 | 10.L | Verify: live before/after | done | 2026-11-12 | 22 live runs, free model; see stage10-results.md. Hard task: today 0/2, rules+map 5/5 |
+| 11.0 | Research and proposal | in progress | 2026-11-12 | stage11-research.md; waiting for the owner |
+| 11.1 | Steps on cline_start | todo |  |  |
+| 11.2 | Verification per step | todo |  |  |
+| 11.3 | Snapshot and rollback | todo |  |  |
+| 11.4 | Budgets and docs | todo |  |  |
+| 11.R | Verify: code review | todo |  |  |
+| 11.L | Verify: live comparison | todo |  |  |
 
 | X.1 | `ask_cline` no-tools notice + Windows length guard (D-21) | done | 2026-11-09 | Codex analysis + review (3 rounds: Windows command-line length, UTF-16 count) PASS; 139 tests; live 0 tool calls / 1 iteration |
 
