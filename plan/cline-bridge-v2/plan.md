@@ -204,8 +204,9 @@ Roles: Codex codes, AGY reviews. All prompts and replies with other models in En
 | 10.0 | Research: what Cline 3.0.74 already offers (rules files, line-range reads, search tools, how the bridge builds the prompt today). Short proposal to the owner. | Owner agrees. |
 | 10.1 | Working rules: search before reading, read line ranges, continue a truncated read instead of re-reading, stop and ask after 2 failures on the same thing, a closing summary (files read/changed, not verified, open). Delivered through the mechanism 10.0 picks. | Tests; the rules reach Cline in every mode. |
 | 10.2 | Definition of done in the task prompt: required output shape per mode. | Tests. |
+| 10.3 | Code map: before a workspace/edits run the bridge builds a compact map (files, top-level symbols with line numbers, regex per language, no new dependency) within a token cap (~2k) and puts it at the top of the task. Idea taken in part from LLMTooling/code-search-mcp (symbol search) without adding its server or tools to Cline. | Tests; capped; skipped cleanly on huge or unknown repos. |
 | 10.R | AGY review. | No open findings. |
-| 10.L | Live: the same task before and after; compare tokens, time and success. | Fewer tokens or re-reads, same or better result. |
+| 10.L | Live: the same task in three variants (today, rules, rules + map); compare tokens, time and success. | Fewer tokens or re-reads, same or better result. |
 
 ## Later — the same micro-steps for OpenCode (owner's idea, 2026-11-10)
 

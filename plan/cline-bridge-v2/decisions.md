@@ -192,6 +192,16 @@ insufficient.
 **Why:** Cline's own loop detection counts consecutive identical calls only and is not configurable headless;
 the observed loop varied its inputs. Agreed with the owner on 2026-11-11.
 
+### D-31 — 2026-11-12 — Working rules in --system plus a bridge-built code map
+**Decision:** Keep the bridge's own `--system` prompt and extend it with an environment line (cwd, OS) and six working
+rules; add a code map (files + top-level symbols with line numbers) before the caller's prompt in workspace/edits
+modes, on by default (`codeMap: false` opts out). Part of LLMTooling/code-search-mcp's idea (symbol search) is taken
+without adding its server or tools to Cline.
+**Why:** Live A/B: moving instructions out of `--system` was worse; without an environment line Cline guessed Unix
+paths and commands; the first rule text ("read ranges") made Cline page in small slices and cost more. On the hard
+task the old setup failed 0/2, rules + map succeeded 5/5. Approved by the owner on 2026-11-11 ("change what is
+needed for optimisation").
+
 ### D-13 — 2026-11-09 — Codex replaces Grok; Grok is out
 **Decision:** Pre-code analysis and `n.R` code review go to Codex (`codex_ask`, read-only sandbox).
 Fallback: AGY, then OpenCode. Grok is not used in this project. Supersedes the Grok parts of D-12.

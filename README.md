@@ -33,6 +33,29 @@ Build first, then add this server to an MCP client that supports stdio servers:
 }
 ```
 
+## Working rules and code map
+
+Workspace and edits runs keep their instructions in `--system`, beginning with the run's working directory
+and OS. Shared working rules batch independent operations, search across files in one call, use code-map
+locations directly, read files under about 600 lines whole, and use ranges of at least 200 lines for
+longer files. They forbid paging in small slices or repeating reads, require a new approach after two
+failures, and stop when the requested output is complete.
+Edits still end with a summary of changed files and verification; ask mode is unchanged.
+
+`ask_cline_workspace`, `apply_cline_edits`, and `cline_start` accept `codeMap?: boolean` (default `true`,
+ignored for ask mode). A bridge-generated map precedes the caller's prompt, listing tracked paths,
+line counts, and regex-detected declarations with 1-based line numbers. Prompt-mentioned paths come first.
+The map is built in the disposable worktree for workspace runs and the current checkout for edits,
+and rebuilt on resumed runs. In edits mode, dirty tracked files reflect their current contents despite
+the map's `line numbers at HEAD` header; untracked files are not included.
+
+Scanning is limited to 3,000 files, 512 KB per file, and 1,500 ms; generated/vendor directories,
+minified files, lockfiles, and binaries are skipped. The default map limit is 6,000 characters,
+further reduced to leave a 1,000-character Windows command-line margin after escaping. Maps are omitted
+if fewer than 800 characters remain or generation fails. Symbols from lower-priority files are dropped
+first, then omitted paths are counted in `... and N more files`. This is a navigation hint, not a parser;
+set `codeMap: false` to disable it, including subsequent resumes of an async task.
+
 ## Tools
 
 Every tool that runs Cline (`ask_cline`, `apply_cline_edits`, `ask_cline_workspace`, `cline_ping`, `cline_start`) **requires** both `provider` and `model` (`^[A-Za-z0-9._:/@-]{1,120}$`, passed as `-P <provider> -m <model>`; `__proto__`, `constructor`, and `prototype` are rejected). There is **no saved-default fallback**: the bridge never runs on Cline's saved default selection. For Cline's free models, pass `provider: "cline"` and a model `id` returned by `cline_list_models`.
@@ -69,6 +92,7 @@ Have Cline implement a development task directly in the current Git checkout. Fi
 ```ts
 apply_cline_edits({
   prompt: string,
+  codeMap?: boolean,
   cwd: string,
   provider: string,
   model: string,
@@ -97,6 +121,7 @@ Analyze a Git workspace through Cline in a disposable detached worktree that is 
 ```ts
 ask_cline_workspace({
   prompt: string,
+  codeMap?: boolean,
   cwd: string,
   provider: string,
   model: string,
@@ -156,6 +181,7 @@ Start a Cline task asynchronously in the background and return its initial `Task
 
 ```ts
 cline_start({
+  codeMap?: boolean,
   mode: "ask" | "workspace" | "edits",
   prompt: string,
   provider: string,

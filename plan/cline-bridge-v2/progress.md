@@ -61,11 +61,12 @@ Status values: `todo`, `in progress`, `done`, `blocked`, `skipped`.
 | 9.4 | Guard params and docs | done | 2026-11-11 | Optional guard params on cline_start, ask_cline_workspace, apply_cline_edits (zod); README section; 241 tests pass / 2 skip |
 | 9.R | Verify: code review | done | 2026-11-11 | Codex: 6 bugs reproduced on real 3.0.74 shapes (apply_patch targets, double-counted tokens, run_commands failures, path redaction, resume budget, report content) → fixed by AGY |
 | 9.L | Verify: live check against Cline | done | 2026-11-11 | Live on real Cline: a normal run (Cline stopped after 2 failures by itself) untouched; a forced run tripped loop_detected on the 3rd failing `editor` edit, task → input_required with the report |
-| 10.0 | Research and proposal | in progress | 2026-11-11 | stage10-research.md; waiting for the owner on option A + the --system check |
-| 10.1 | Working rules | todo |  |  |
-| 10.2 | Definition of done | todo |  |  |
-| 10.R | Verify: code review | todo |  |  |
-| 10.L | Verify: live before/after | todo |  |  |
+| 10.0 | Research and proposal | done | 2026-11-11 | stage10-research.md; owner approved option A and full autonomy for the optimisation (2026-11-11 night) |
+| 10.1 | Working rules | done | 2026-11-12 | Codex: src/rules.ts; per-run environment line (cwd + OS) because the bridge's --system replaces Cline's default prompt; rule text v2 tuned live (v1 made Cline page in small slices) |
+| 10.2 | Definition of done | done | 2026-11-12 | Rule 6: stop when the requested output is complete, follow the format exactly; edit mode keeps its closing summary |
+| 10.3 | Code map | done | 2026-11-12 | Codex: src/codemap.ts, git ls-files + regex symbols, 6,000-char cap clamped to the Windows command line, 1.5 s / 3,000 files; codeMap param (default true). Also fixed: trace redacted numeric token counts |
+| 10.R | Verify: code review | done | 2026-11-12 | AGY approved both rounds; two low notes left as is (snake_case token keys unused by Cline; extreme cwd already rejected by limits) |
+| 10.L | Verify: live before/after | done | 2026-11-12 | 22 live runs, free model; see stage10-results.md. Hard task: today 0/2, rules+map 5/5 |
 
 | X.1 | `ask_cline` no-tools notice + Windows length guard (D-21) | done | 2026-11-09 | Codex analysis + review (3 rounds: Windows command-line length, UTF-16 count) PASS; 139 tests; live 0 tool calls / 1 iteration |
 

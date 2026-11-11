@@ -80,11 +80,13 @@ const SENSITIVE_KEY = /token|secret|password|passwd|passphrase|api[-_]?key|^key$
 /**
  * Best-effort redaction of decoded values (see D-18: the trace is local and owner-only, like Cline's own
  * session files; this is defense in depth, not a security boundary). A sensitive key redacts its whole
- * subtree, whatever the value type. Secrets inside JSON embedded as text in free-form reasoning are only
+ * subtree; finite numeric Tokens/TokenCount fields are preserved outside sensitive subtrees.
+ * Secrets inside JSON embedded as text in free-form reasoning are only
  * caught by the text patterns.
  */
 export function redactValue(value: unknown, key = "", depth = 0, sensitive = false): unknown {
-  const hidden = sensitive || SENSITIVE_KEY.test(key);
+  const usageCount = typeof value === "number" && Number.isFinite(value) && /(?:Tokens|TokenCount)$/i.test(key);
+  const hidden = sensitive || (SENSITIVE_KEY.test(key) && !usageCount);
   if (hidden && value !== null && typeof value !== "object") return "[REDACTED]";
   if (typeof value === "string") return redactSecrets(value);
   if (depth >= MAX_REDACT_DEPTH && value && typeof value === "object") return "[TRUNCATED: nested too deeply]";

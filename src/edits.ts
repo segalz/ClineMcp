@@ -1,5 +1,7 @@
 import { spawn } from "node:child_process";
 import path from "node:path";
+import { buildEnvironmentLine, WORKING_RULES } from "./rules.js";
+import { withCodeMap } from "./codemap.js";
 import {
   defaultKillTree,
   ClineRunError,
@@ -17,6 +19,7 @@ export interface ApplyClineEditsInput {
   timeoutSeconds?: number;
   provider?: string;
   model?: string;
+  codeMap?: boolean;
 }
 
 export interface ClineEditsResponse extends ClineResponse {
@@ -51,8 +54,13 @@ export const EDIT_SYSTEM_PROMPT = [
   "You may inspect and edit only files needed for the requested task, then run safe, relevant verification commands.",
   "Never run git add, git commit, git merge, git rebase, git checkout, git restore, git reset, git stash, git clean, or change branches.",
   "Do not access credentials, make unrelated network requests, or modify files outside this checkout.",
-  "Leave all changes uncommitted and summarize the changed files and verification in your final response."
-].join(" ");
+  "Leave all changes uncommitted and summarize the changed files and verification in your final response.",
+  WORKING_RULES
+].join("\n");
+
+export function buildEditSystemPrompt(cwd: string, platform: NodeJS.Platform = process.platform): string {
+  return `${buildEnvironmentLine(cwd, "edits", platform)}\n${EDIT_SYSTEM_PROMPT}`;
+}
 
 function gitExecutable(): string {
   return process.platform === "win32" ? "git.exe" : "git";
@@ -125,7 +133,7 @@ export async function applyClineEdits(
   let repositoryRoot: string;
   let headBefore: string;
   try {
-    repositoryRoot = await runGit(requestedCwd, ["rev-parse", "--show-toplevel"], signal);
+    repositoryRoot = path.resolve(await runGit(requestedCwd, ["rev-parse", "--show-toplevel"], signal));
     headBefore = await runGit(repositoryRoot, ["rev-parse", "HEAD"], signal);
   } catch {
     if (signal?.aborted) throw new ClineRunError("cancelled", "The Cline request was cancelled.", { attempts: 0 });
@@ -157,15 +165,15 @@ export async function applyClineEdits(
   const result = await runCline(
     { ...input, cwd: repositoryRoot },
     signal,
-    {
+    await withCodeMap(repositoryRoot, input, {
       ...options,
       autoApprove: true,
       cwd: repositoryRoot,
-      systemPrompt: EDIT_SYSTEM_PROMPT,
+      systemPrompt: buildEditSystemPrompt(repositoryRoot),
       provider: input.provider,
       model: input.model,
       canRetry
-    }
+    }, signal)
   );
 
   try {

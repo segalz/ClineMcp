@@ -117,7 +117,7 @@ server.registerTool(
   "apply_cline_edits",
   {
     description: "Have Cline implement a development task directly in the current Git checkout. Files may change, but commits are forbidden and the resulting diff is returned. " +
-      "The bridge automatically stops a run on repeated failures or budget.",
+      "The bridge automatically stops a run on repeated failures or budget. codeMap defaults to true; set false to omit the generated code map.",
     inputSchema: {
       prompt: z.string().min(1).max(20_000),
       cwd: z.string().min(1),
@@ -125,6 +125,7 @@ server.registerTool(
       timeoutSeconds: z.number().int().min(1).max(300).optional(),
       provider: providerModelSchema,
       model: providerModelSchema,
+      codeMap: z.boolean().optional().describe("Include a bounded code map before the prompt (default true)."),
       guard: guardOptionsSchema.optional()
     }
   },
@@ -190,7 +191,7 @@ server.registerTool(
   "ask_cline_workspace",
   {
     description: "Analyze a Git workspace through Cline in a disposable worktree. The worktree is always removed after the request. " +
-      "The bridge automatically stops a run on repeated failures or budget.",
+      "The bridge automatically stops a run on repeated failures or budget. codeMap defaults to true; set false to omit the generated code map.",
     inputSchema: {
       prompt: z.string().min(1).max(20_000),
       cwd: z.string().min(1),
@@ -198,6 +199,7 @@ server.registerTool(
       timeoutSeconds: z.number().int().min(1).max(300).optional(),
       provider: providerModelSchema,
       model: providerModelSchema,
+      codeMap: z.boolean().optional().describe("Include a bounded code map before the prompt (default true)."),
       guard: guardOptionsSchema.optional()
     }
   },
@@ -293,7 +295,8 @@ server.registerTool(
       "no tools; \"workspace\": read a Git repository in a disposable worktree; \"edits\": change files in the checkout " +
       "(no commits; diff in the result). Then follow it with cline_status, stop it with cline_cancel, and collect it with " +
       `cline_result. One attempt, no automatic retry; timeoutSeconds up to ${MAX_TASK_TIMEOUT_SECONDS}; at most 2 tasks at once. ` +
-      "The bridge stops a run on repeated failures or budget and waits for guidance via cline_send.",
+      "The bridge stops a run on repeated failures or budget and waits for guidance via cline_send. " +
+      "codeMap defaults to true for workspace/edits, including resumed runs; ignored in ask mode.",
     inputSchema: {
       mode: z.enum(["ask", "workspace", "edits"]),
       prompt: z.string().min(1).max(20_000),
@@ -303,6 +306,7 @@ server.registerTool(
       thinking: z.enum(["none", "low", "medium", "high", "xhigh"]).optional(),
       timeoutSeconds: z.number().int().min(1).max(MAX_TASK_TIMEOUT_SECONDS).optional(),
       waitSeconds: z.number().int().min(0).max(30).optional().describe("Wait this long for first progress before returning (default 3)."),
+      codeMap: z.boolean().optional().describe("Include a bounded code map in workspace/edits runs (default true); ignored in ask mode."),
       guard: guardOptionsSchema.optional()
     }
   },

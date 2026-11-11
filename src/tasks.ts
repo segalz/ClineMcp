@@ -5,11 +5,12 @@ import { rm } from "node:fs/promises";
 import {
   askCline, ClineRunError, defaultKillTree, formatErrorAsText, redactSecrets, requireSelection,
   resolveClineEntry, windowsCommandLineLength, WINDOWS_COMMAND_LINE_LIMIT, NO_TOOLS_PREAMBLE,
+  MAX_SYSTEM_PROMPT_CHARACTERS, MAX_TOTAL_TEXT_CHARACTERS,
   type AskClineInput, type ClineInvocationOptions, type ClineResponse
 } from "./runner.js";
 import { formatReportSummary, type GuardOptions, type GuardReport } from "./guard.js";
-import { askClineWorkspace, WORKSPACE_SYSTEM_PROMPT, WORKTREE_BASE } from "./workspace.js";
-import { applyClineEdits, EDIT_SYSTEM_PROMPT } from "./edits.js";
+import { askClineWorkspace, buildWorkspaceSystemPrompt, WORKTREE_BASE } from "./workspace.js";
+import { applyClineEdits, buildEditSystemPrompt } from "./edits.js";
 import { resolveTraceBase, type TraceInfo, type TraceRecorder, type TraceStatus } from "./trace.js";
 
 export type TaskMode = "ask" | "workspace" | "edits";
@@ -24,6 +25,7 @@ export interface StartTaskInput {
   thinking?: AskClineInput["thinking"];
   timeoutSeconds?: number;
   guard?: GuardOptions;
+  codeMap?: boolean;
 }
 
 /** Async tasks may run longer than the sync tools' 300 s. */
@@ -172,24 +174,21 @@ export function isPromptTooLarge(
   task: Task,
   preamble: string,
   platform: NodeJS.Platform = process.platform,
-  deps?: { entryPath?: string }
+  deps?: { entryPath?: string },
+  codeMap = ""
 ): boolean {
   if (prompt.length > 20_000) return true;
+  // Workspace setup chooses a fresh path later; reserve a conservative worktree name for resume sizing.
+  const effectiveCwd = task.mode === "workspace"
+    ? path.join(WORKTREE_BASE, "w".repeat(64))
+    : task.cwd ? path.resolve(task.cwd) : process.cwd();
+  const sysPrompt = task.mode === "workspace" ? buildWorkspaceSystemPrompt(effectiveCwd, platform)
+    : task.mode === "edits" ? buildEditSystemPrompt(effectiveCwd, platform) : undefined;
+  if ((sysPrompt?.length ?? 0) > MAX_SYSTEM_PROMPT_CHARACTERS ||
+      prompt.length + (sysPrompt?.length ?? 0) > MAX_TOTAL_TEXT_CHARACTERS) return true;
   if (platform === "win32") {
     const windowsEntry = resolveClineEntry(deps?.entryPath) ??
       (process.env.APPDATA ? path.join(process.env.APPDATA, "npm", "node_modules", "cline", "bin", "cline") : "C:\\npm\\node_modules\\cline\\bin\\cline");
-
-    let sysPrompt: string | undefined;
-    if (task.mode === "workspace") sysPrompt = WORKSPACE_SYSTEM_PROMPT;
-    else if (task.mode === "edits") sysPrompt = EDIT_SYSTEM_PROMPT;
-
-    let effectiveCwd: string;
-    if (task.mode === "workspace") {
-      // Worktree base + 64 chars
-      effectiveCwd = path.join(WORKTREE_BASE, "w".repeat(64));
-    } else {
-      effectiveCwd = task.cwd ? path.resolve(task.cwd) : process.cwd();
-    }
 
     const args = [
       "--json",
@@ -201,7 +200,8 @@ export function isPromptTooLarge(
     if (task.model) args.push("-m", task.model);
     if (sysPrompt) args.push("--system", sysPrompt);
     if (effectiveCwd) args.push("--cwd", effectiveCwd);
-    args.push(preamble + prompt);
+    // Maps are normally built after resume context is sized; callers with an existing map must count it too.
+    args.push(codeMap + preamble + prompt);
 
     const spawnArgs = [windowsEntry, ...args];
     const len = windowsCommandLineLength(process.execPath, spawnArgs);
@@ -408,6 +408,7 @@ export interface Task {
   timeoutSeconds?: number;
   originalPrompt: string;
   qaHistory: TaskQA[];
+  codeMap?: boolean;
   guard?: GuardOptions;
   guardReport?: GuardReport;
   guardReportSummary?: string;
@@ -617,14 +618,15 @@ export class TaskManager {
     if (this.deps.traceBase) options.deps = { ...options.deps, traceBase: this.deps.traceBase };
     if (task.guard) options.guard = task.guard;
 
-    const runInput: AskClineInput = {
+    const runInput: AskClineInput & { codeMap?: boolean } = {
       prompt,
       provider: task.provider,
       model: task.model,
       cwd: task.cwd,
       thinking: task.thinking,
       timeoutSeconds: task.timeoutSeconds ?? DEFAULT_TASK_TIMEOUT_SECONDS,
-      guard: task.guard
+      guard: task.guard,
+      codeMap: task.codeMap
     };
 
     let run: Promise<ClineResponse & Record<string, unknown>>;
@@ -726,7 +728,8 @@ export class TaskManager {
       timeoutSeconds: input.timeoutSeconds,
       originalPrompt: input.prompt,
       qaHistory: [],
-      guard: input.guard
+      guard: input.guard,
+      codeMap: input.codeMap
     };
     this.tasks.set(id, task);
     this.executeRun(task, input.prompt, trace);

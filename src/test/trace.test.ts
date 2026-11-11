@@ -64,6 +64,32 @@ test("a sensitive key redacts its whole subtree, whatever the value type", () =>
   assert.ok(out.includes("visible"));
 });
 
+test("redaction preserves finite numeric usage counts only, never token strings or sensitive subtrees", () => {
+  assert.deepEqual(redactValue({
+    inputTokens: 123, totalInputTokens: 456, reasoningTokenCount: 7, OUTPUTTOKENS: 0,
+    accessToken: "access-secret", token: "token-secret", numericToken: 123,
+    nested: { inputTokens: "123", totalInputTokens: "secret", reasoningTokenCount: "7" },
+    invalid: { inputTokens: Infinity, totalInputTokens: NaN, reasoningTokenCount: -Infinity },
+    credentials: { inputTokens: 12 }, inputTokensObject: { inputTokens: 34 }
+  }), {
+    inputTokens: 123, totalInputTokens: 456, reasoningTokenCount: 7, OUTPUTTOKENS: 0,
+    accessToken: "[REDACTED]", token: "[REDACTED]", numericToken: "[REDACTED]",
+    nested: { inputTokens: "[REDACTED]", totalInputTokens: "[REDACTED]", reasoningTokenCount: "[REDACTED]" },
+    invalid: { inputTokens: "[REDACTED]", totalInputTokens: "[REDACTED]", reasoningTokenCount: "[REDACTED]" },
+    credentials: { inputTokens: "[REDACTED]" }, inputTokensObject: { inputTokens: "[REDACTED]" }
+  });
+});
+
+test("persisted usage events retain token counts and redact token credentials", async () => {
+  const rec = new TraceRecorder({ base: base() });
+  rec.line(JSON.stringify(agent({ type: "usage", inputTokens: 123, totalInputTokens: 456, reasoningTokenCount: 7,
+    accessToken: "access-secret", token: "token-secret", nested: { inputTokens: "string-secret" } })), 1);
+  const info = await rec.finish({ ok: true });
+  const events = await lines(info.events);
+  assert.deepEqual(events[0].event, { type: "usage", inputTokens: 123, totalInputTokens: 456, reasoningTokenCount: 7,
+    accessToken: "[REDACTED]", token: "[REDACTED]", nested: { inputTokens: "[REDACTED]" } });
+});
+
 test("an oversized line delivered in one chunk is dropped too", () => {
   const out: string[] = [];
   let oversized = 0;

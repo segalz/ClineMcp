@@ -12,7 +12,7 @@ import {
   ClineRunError, askCline, NO_TOOLS_PREAMBLE,
   windowsCommandLineLength, WINDOWS_COMMAND_LINE_LIMIT
 } from "../runner.js";
-import { applyClineEdits, EDIT_SYSTEM_PROMPT } from "../edits.js";
+import { applyClineEdits, buildEditSystemPrompt, EDIT_SYSTEM_PROMPT } from "../edits.js";
 import { TraceRecorder } from "../trace.js";
 
 const root = await mkdtemp(path.join(os.tmpdir(), "cline-tasks-test-"));
@@ -958,8 +958,8 @@ test("budget uses the exact system prompt that applyClineEdits passes", async ()
     }) as any
   };
 
-  await applyClineEdits({ prompt: "edit test", cwd: process.cwd(), ...sel }, undefined, { deps: mockDeps as any });
-  assert.equal(capturedSystemPrompt, EDIT_SYSTEM_PROMPT, "applyClineEdits passes EDIT_SYSTEM_PROMPT");
+  await applyClineEdits({ prompt: "edit test", cwd: process.cwd(), codeMap: false, ...sel }, undefined, { deps: mockDeps as any });
+  assert.equal(capturedSystemPrompt, buildEditSystemPrompt(process.cwd()), "applyClineEdits passes the per-run environment and mode prompt");
 
   // 2. Verify isPromptTooLarge for edits mode uses the exact EDIT_SYSTEM_PROMPT
   const task: any = { mode: "edits", provider: "p", model: "m", cwd: process.cwd(), thinking: "none", timeoutSeconds: 600 };
@@ -972,14 +972,15 @@ test("budget uses the exact system prompt that applyClineEdits passes", async ()
     "--timeout", "600",
     "-P", "p",
     "-m", "m",
-    "--system", EDIT_SYSTEM_PROMPT,
+    "--system", buildEditSystemPrompt(process.cwd(), "win32"),
     "--cwd", process.cwd(),
     preamble + prompt
   ];
 
-  // 15,533 quotes escaped on Windows equals exactly 32,000 characters with EDIT_SYSTEM_PROMPT
-  const quotePromptUnder = '"'.repeat(15_533);
-  const quotePromptOver = '"'.repeat(15_534);
+  // Each quote costs two UTF-16 units. Derive room from the real system prompt and machine paths.
+  const room = WINDOWS_COMMAND_LINE_LIMIT - windowsCommandLineLength(process.execPath, buildArgs(""));
+  const quotePromptUnder = '"'.repeat(Math.floor(room / 2)) + "x".repeat(room % 2);
+  const quotePromptOver = quotePromptUnder + '"';
 
   assert.equal(windowsCommandLineLength(process.execPath, buildArgs(quotePromptUnder)), WINDOWS_COMMAND_LINE_LIMIT);
   assert.equal(windowsCommandLineLength(process.execPath, buildArgs(quotePromptOver)), WINDOWS_COMMAND_LINE_LIMIT + 2);

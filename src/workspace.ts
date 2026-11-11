@@ -3,6 +3,8 @@ import os from "node:os";
 import path from "node:path";
 import { randomUUID } from "node:crypto";
 import { spawn } from "node:child_process";
+import { buildEnvironmentLine, WORKING_RULES } from "./rules.js";
+import { withCodeMap } from "./codemap.js";
 import {
   defaultKillTree,
   ClineRunError,
@@ -19,6 +21,7 @@ export interface AskClineWorkspaceInput {
   timeoutSeconds?: number;
   provider?: string;
   model?: string;
+  codeMap?: boolean;
 }
 
 export const WORKTREE_BASE = path.join(os.tmpdir(), "cline-mcp-worktrees");
@@ -27,8 +30,13 @@ export const WORKSPACE_SYSTEM_PROMPT = [
   "Do not create, edit, delete, rename, format, stage, commit, or restore files.",
   "Do not run commands that modify state, access credentials, or make network requests.",
   "You may use only read/search/inspection tools inside this worktree.",
-  "Return findings and recommendations as final response text only."
-].join(" ");
+  "Return findings and recommendations as final response text only.",
+  WORKING_RULES
+].join("\n");
+
+export function buildWorkspaceSystemPrompt(cwd: string, platform: NodeJS.Platform = process.platform): string {
+  return `${buildEnvironmentLine(cwd, "workspace", platform)}\n${WORKSPACE_SYSTEM_PROMPT}`;
+}
 
 function gitExecutable(): string {
   return process.platform === "win32" ? "git.exe" : "git";
@@ -143,14 +151,14 @@ export async function askClineWorkspace(
     result = await runCline(
       { ...input, cwd: worktreePath },
       signal,
-      {
+      await withCodeMap(worktreePath, input, {
         ...options,
         autoApprove: true,
         cwd: worktreePath,
-        systemPrompt: WORKSPACE_SYSTEM_PROMPT,
+        systemPrompt: buildWorkspaceSystemPrompt(worktreePath),
         provider: input.provider,
         model: input.model
-      }
+      }, signal)
     );
   } catch (err) {
     runError = err;
