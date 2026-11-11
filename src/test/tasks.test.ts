@@ -958,7 +958,9 @@ test("budget uses the exact system prompt that applyClineEdits passes", async ()
     }) as any
   };
 
-  await applyClineEdits({ prompt: "edit test", cwd: process.cwd(), codeMap: false, ...sel }, undefined, { deps: mockDeps as any });
+  await applyClineEdits({ prompt: "edit test", cwd: process.cwd(), codeMap: false, ...sel }, undefined, {
+    deps: mockDeps as any, checkoutLockDirectory: path.join(root, "locks")
+  });
   assert.equal(capturedSystemPrompt, buildEditSystemPrompt(process.cwd()), "applyClineEdits passes the per-run environment and mode prompt");
 
   // 2. Verify isPromptTooLarge for edits mode uses the exact EDIT_SYSTEM_PROMPT

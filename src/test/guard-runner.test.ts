@@ -1,7 +1,8 @@
 import assert from "node:assert/strict";
 import test, { after } from "node:test";
 import { EventEmitter } from "node:events";
-import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { spawnSync } from "node:child_process";
+import { mkdir, mkdtemp, readFile, rm } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import {
@@ -32,6 +33,17 @@ after(() => rm(root, { recursive: true, force: true }));
 let counter = 0;
 const traceBase = () => path.join(root, `traces-${++counter}`);
 const sel = { provider: "test-provider", model: "test-model" };
+const editsRepo = path.join(root, "edits-repo");
+await mkdir(editsRepo);
+assert.equal(spawnSync(process.platform === "win32" ? "git.exe" : "git", ["-C", editsRepo, "init", "--quiet"], { windowsHide: true }).status, 0);
+
+async function waitForEditsRun(c: ReturnType<typeof controllable>) {
+  const deadline = Date.now() + 5000;
+  while (!c.runs.length) {
+    assert.ok(Date.now() < deadline, "edits runner did not launch after lock acquisition");
+    await new Promise(resolve => setTimeout(resolve, 10));
+  }
+}
 
 function createMockChild() {
   const child = new EventEmitter() as any;
@@ -419,17 +431,19 @@ test("tasks: hintFor maps loop_detected and budget_exceeded to crash with error 
   });
 });
 
-test("tasks: run ending in loop_detected transitions to input_required with bridge question and history", async () => {
+test("tasks: run ending in loop_detected transitions to input_required with bridge question and history", async t => {
   const c = controllable();
-  const m = new TaskManager({ runners: { edits: c.runner }, traceBase: traceBase() });
+  const m = new TaskManager({ runners: { edits: c.runner }, traceBase: traceBase(), runOptions: { checkoutLockDirectory: path.join(root, "locks") } });
+  t.after(() => m.shutdown());
 
   const started = m.start({
     mode: "edits",
     prompt: "fix the bug in src/handler.ts",
-    cwd: "/fake/repo",
+    cwd: editsRepo,
     ...sel
   });
   assert.equal(started.state, "running");
+  await waitForEditsRun(c);
 
   const guardReport: GuardReport = {
     kind: "loop_detected",
@@ -452,7 +466,7 @@ test("tasks: run ending in loop_detected transitions to input_required with brid
   // Run 1 fails with guard trip
   await c.runs[0].fail(runErr);
 
-  const status = await m.status(started.taskId, 0);
+  const status = await m.status(started.taskId, 10);
   assert.equal(status.state, "input_required", "task goes to input_required instead of failed");
   assert.ok(status.question, "task has bridge question");
   assert.equal(
@@ -607,16 +621,19 @@ test("tasks: normal task run completes untouched", async () => {
   assert.equal((r.result as any).text, "All clean without trips.");
 });
 
-test("P2 resume content: resumed context includes tool + target, last errors (<=3x200), files touched, and last assistant text (<=400)", async () => {
+test("P2 resume content: resumed context includes tool + target, last errors (<=3x200), files touched, and last assistant text (<=400)", async t => {
   const c = controllable();
-  const m = new TaskManager({ runners: { edits: c.runner }, traceBase: traceBase() });
+  const m = new TaskManager({ runners: { edits: c.runner }, traceBase: traceBase(), runOptions: { checkoutLockDirectory: path.join(root, "locks") } });
+  t.after(() => m.shutdown());
 
   const started = m.start({
     mode: "edits",
     prompt: "update server endpoint",
-    cwd: "/fake/repo",
+    cwd: editsRepo,
     ...sel
   });
+
+  await waitForEditsRun(c);
 
   const tripReport: GuardReport = {
     kind: "loop_detected",
@@ -641,7 +658,7 @@ test("P2 resume content: resumed context includes tool + target, last errors (<=
     })
   );
 
-  const status = await m.status(started.taskId, 0);
+  const status = await m.status(started.taskId, 10);
   assert.equal(status.state, "input_required");
   assert.equal(status.guard?.lastAssistantText, "I tried applying the diff directly to src/server.ts using apply_patch.");
 

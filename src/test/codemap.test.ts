@@ -162,6 +162,7 @@ function fakeOptions(replies: string[] = ["done"]) {
   const calls: Array<{ executable: string; args: string[] }> = [];
   const options: Partial<ClineInvocationOptions> = {
     promptPreamble: "Existing preamble\n\n", maxAttempts: 1, recordStatus: false, respectQuotaLock: false,
+    checkoutLockDirectory: path.join(root, "locks"),
     deps: {
       entryPath: "mock/cline", access: async () => {},
       spawn: ((executable: string, args: string[]) => {

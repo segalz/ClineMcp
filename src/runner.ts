@@ -86,6 +86,7 @@ export const guardOptionsSchema = z
   );
 
 export type ClineErrorKind =
+  | "checkout_busy"
   | "settings_lock_timeout"
   | "settings_restore_failed"
   | "timeout"
@@ -203,6 +204,10 @@ export interface ClineDependencies {
 }
 
 export interface ClineInvocationOptions {
+  /** Internal task-owned lease; a sync run otherwise acquires its own lease. */
+  checkoutLock?: import("./checkoutlock.js").CheckoutRelease;
+  /** Override for isolated tests; production uses ~/.cline-mcp/locks. */
+  checkoutLockDirectory?: string;
   autoApprove?: boolean;
   cwd?: string;
   systemPrompt?: string;

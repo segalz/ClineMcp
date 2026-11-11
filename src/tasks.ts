@@ -10,7 +10,8 @@ import {
 } from "./runner.js";
 import { formatReportSummary, type GuardOptions, type GuardReport } from "./guard.js";
 import { askClineWorkspace, buildWorkspaceSystemPrompt, WORKTREE_BASE } from "./workspace.js";
-import { applyClineEdits, buildEditSystemPrompt } from "./edits.js";
+import { applyClineEdits, buildEditSystemPrompt, editsCheckoutRoot } from "./edits.js";
+import { acquire, type CheckoutRelease } from "./checkoutlock.js";
 import { resolveTraceBase, type TraceInfo, type TraceRecorder, type TraceStatus } from "./trace.js";
 
 export type TaskMode = "ask" | "workspace" | "edits";
@@ -381,6 +382,7 @@ export interface TaskRunHistoryItem {
 }
 
 export interface Task {
+  checkoutLock?: CheckoutRelease;
   id: string;
   mode: TaskMode;
   state: TaskState;
@@ -449,7 +451,7 @@ const runnerDefaults: Record<TaskMode, Runner> = {
 const LOCAL_FAILURE_KINDS = new Set([
   "workspace_not_git", "workspace_setup_failed", "workspace_cleanup_failed", "settings_lock_timeout",
   "settings_restore_failed", "launch_failed", "catalog_unavailable", "edits_inspection_failed", "cline_updating",
-  "task_limit", "task_not_found", "task_running", "task_not_waiting"
+  "task_limit", "task_not_found", "task_running", "task_not_waiting", "checkout_busy"
 ]);
 
 function noteFor(task: Task): string | undefined {
@@ -512,7 +514,7 @@ export class TaskManager {
   /** Drops settled, uncollected tasks that are too old or beyond the retention count. */
   private prune(excludeId?: string): void {
     const now = this.wallNow();
-    for (const t of [...this.tasks.values()].filter(t => t.state !== "running" && t.state !== "resuming" && t.id !== excludeId)) {
+    for (const t of [...this.tasks.values()].filter(t => t.state !== "running" && t.state !== "resuming" && t.state !== "input_required" && t.id !== excludeId)) {
       if (now - (t.endedAt ?? now) > UNCOLLECTED_TTL_MS) this.tasks.delete(t.id);
     }
     const settled = [...this.tasks.values()]
@@ -631,7 +633,17 @@ export class TaskManager {
 
     let run: Promise<ClineResponse & Record<string, unknown>>;
     try {
-      run = this.runners[task.mode](runInput, task.controller.signal, options);
+      if (task.mode === "edits" && !task.checkoutLock) {
+        run = (async () => {
+          if (!task.checkoutLock) {
+            const root = await editsCheckoutRoot(task.cwd!, task.controller.signal);
+            if (task.controller.signal.aborted) throw new ClineRunError("cancelled", "The task was cancelled.", { attempts: 0 });
+            task.checkoutLock = acquire(root, { lockDirectory: options.checkoutLockDirectory });
+          }
+          return this.runners.edits(runInput, task.controller.signal, { ...options, checkoutLock: task.checkoutLock });
+        })();
+      } else run = this.runners[task.mode](runInput, task.controller.signal,
+        task.mode === "edits" ? { ...options, checkoutLock: task.checkoutLock } : options);
     } catch (err) {
       run = Promise.reject(err);
     }
@@ -685,6 +697,7 @@ export class TaskManager {
         }
       }
     ).finally(() => {
+      if (task.state !== "input_required") this.releaseCheckout(task);
       const now = this.wallNow();
       task.endedAt = now;
       task.activeMs += (now - runStartedAt);
@@ -699,6 +712,11 @@ export class TaskManager {
     });
 
     task.settled = onSettled;
+  }
+
+  private releaseCheckout(task: Task): void {
+    task.checkoutLock?.();
+    task.checkoutLock = undefined;
   }
 
   start(input: StartTaskInput): TaskStatusView {
@@ -807,6 +825,7 @@ export class TaskManager {
     // Revalidate after the await (Defects 1 & 4)
     if (this.closing) {
       task.state = "cancelled";
+      this.releaseCheckout(task);
       if (!task.error) {
         task.error = new ClineRunError("cancelled", "The bridge is shutting down; no new tasks start.", { attempts: 0 });
       }
@@ -821,6 +840,7 @@ export class TaskManager {
     }
     if ((task.state as TaskState) === "cancelled" || task.controller.signal.aborted) {
       task.state = "cancelled";
+      this.releaseCheckout(task);
       if (!task.error) {
         task.error = new ClineRunError("cancelled", "The task was cancelled.", { attempts: 0 });
       }
@@ -939,6 +959,7 @@ export class TaskManager {
     } else if (task.state === "input_required") {
       task.state = "cancelled";
       task.error = new ClineRunError("cancelled", "The task was cancelled while waiting for input.", { attempts: 0 });
+      this.releaseCheckout(task);
     }
     return this.view(task);
   }
@@ -993,6 +1014,7 @@ export class TaskManager {
       } else if (t.state === "input_required") {
         t.state = "cancelled";
         t.error = new ClineRunError("cancelled", "The bridge is shutting down.", { attempts: 0 });
+        this.releaseCheckout(t);
       } else if (t.resolveSettled !== undefined) {
         t.controller.abort();
         toSettle.push(t);

@@ -2,6 +2,7 @@ import { spawn } from "node:child_process";
 import path from "node:path";
 import { buildEnvironmentLine, WORKING_RULES } from "./rules.js";
 import { withCodeMap } from "./codemap.js";
+import { acquire, ownsCheckoutLock } from "./checkoutlock.js";
 import {
   defaultKillTree,
   ClineRunError,
@@ -139,6 +140,25 @@ export async function applyClineEdits(
     if (signal?.aborted) throw new ClineRunError("cancelled", "The Cline request was cancelled.", { attempts: 0 });
     throw new ClineRunError("workspace_not_git", "The requested cwd must be inside a Git repository with at least one commit.");
   }
+
+  const release = ownsCheckoutLock(options.checkoutLock, repositoryRoot) ? undefined
+    : acquire(repositoryRoot, { lockDirectory: options.checkoutLockDirectory });
+  try {
+    return await applyWithinLock(input, repositoryRoot, headBefore, signal, options);
+  } finally { release?.(); }
+}
+
+/** Resolve the same root as the sync edits path before an async task takes ownership. */
+export async function editsCheckoutRoot(cwd: string, signal?: AbortSignal): Promise<string> {
+  try { return path.resolve(await runGit(path.resolve(cwd), ["rev-parse", "--show-toplevel"], signal)); }
+  catch {
+    if (signal?.aborted) throw new ClineRunError("cancelled", "The Cline request was cancelled.", { attempts: 0 });
+    throw new ClineRunError("workspace_not_git", "The requested cwd must be inside a Git repository with at least one commit.");
+  }
+}
+
+async function applyWithinLock(input: ApplyClineEditsInput, repositoryRoot: string, headBefore: string,
+  signal: AbortSignal | undefined, options: Partial<ClineInvocationOptions>): Promise<ClineEditsResponse> {
 
   const canRetry = async ({ stdout }: { stdout: string; stderr: string; attempt: number }) => {
     // Read-only checks before a retry: they follow the caller's cancel and share one short budget.
