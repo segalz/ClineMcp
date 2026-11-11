@@ -192,6 +192,21 @@ Built against real Cline runs: each step ends with a live run before review. Rol
 | 9.R | Codex review per step. | No open findings. |
 | 9.L | Live: a real Cline run that repeats a failing edit is stopped by the guard and reported; a normal run is untouched. | Both behave as specified. |
 
+## Stage 10 — Working rules for Cline (agreed with the owner on 2026-11-11)
+
+Live runs on 2026-11-11 showed Cline reading whole files, getting truncated output and reading them again,
+which burned the token budget and time. The bridge adds standing working rules to every task so Cline works
+economically and finishes. These rules are also the base for micro-steps later (option C, each step is one task).
+Roles: Codex codes, AGY reviews. All prompts and replies with other models in English.
+
+| Step | Work | Done when |
+|---|---|---|
+| 10.0 | Research: what Cline 3.0.74 already offers (rules files, line-range reads, search tools, how the bridge builds the prompt today). Short proposal to the owner. | Owner agrees. |
+| 10.1 | Working rules: search before reading, read line ranges, continue a truncated read instead of re-reading, stop and ask after 2 failures on the same thing, a closing summary (files read/changed, not verified, open). Delivered through the mechanism 10.0 picks. | Tests; the rules reach Cline in every mode. |
+| 10.2 | Definition of done in the task prompt: required output shape per mode. | Tests. |
+| 10.R | AGY review. | No open findings. |
+| 10.L | Live: the same task before and after; compare tokens, time and success. | Fewer tokens or re-reads, same or better result. |
+
 ## Later — the same micro-steps for OpenCode (owner's idea, 2026-11-10)
 
 Once Stage 9 works with Cline, apply it to the OpenCode helper (`C:\Develop\openCodeHelperMcp`), where
