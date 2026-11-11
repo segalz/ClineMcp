@@ -658,10 +658,15 @@ export class TaskManager {
           task.guardReport = err.guard;
           task.guardReportSummary = formatReportSummary(err.guard, err.message);
           const detail = err.message.replace(/^Stopped by the bridge:\s*/i, "").replace(/\.\s*$/, "");
-          task.question = {
-            question: `QUESTION: Stopped by the bridge: ${detail}. How should it continue (a different approach, skip this file, or stop)?`,
-            options: ["a different approach", "skip this file", "stop"]
-          };
+          task.question = err.kind === "loop_detected"
+            ? {
+                question: `QUESTION: Stopped by the bridge: ${detail}. How should it continue (a different approach, skip this target, or stop)?`,
+                options: ["a different approach", "skip this target", "stop"]
+              }
+            : {
+                question: `QUESTION: Stopped by the bridge: ${detail}. How should it continue (a narrower scope, or stop)?`,
+                options: ["a narrower scope", "stop"]
+              };
           task.runHistory.push({
             run: task.run,
             trace,

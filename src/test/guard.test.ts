@@ -382,6 +382,58 @@ test("token budget: trips when cumulative input tokens > maxInputTokens", () => 
   assert.equal(guard.snapshot().kind, "budget_exceeded");
 });
 
+test("lastAssistantText uses full accumulated text instead of the last streamed delta", () => {
+  const guard = createGuard({ maxInputTokens: 10_000 });
+  const deltas = ["  Let me re-read the files", " using one call per file", ".\n"];
+  let accumulated = "";
+
+  for (const text of deltas) {
+    accumulated += text;
+    assert.equal(guard.observe(agent({
+      type: "content_start",
+      contentType: "text",
+      text,
+      accumulated
+    })), null);
+  }
+
+  const verdict = guard.observe(agent({ type: "usage", inputTokens: 10_001 }));
+  assert.ok(verdict);
+  assert.equal(verdict.kind, "budget_exceeded");
+  assert.equal(verdict.lastAssistantText, "Let me re-read the files using one call per file.");
+  assert.notEqual(verdict.lastAssistantText, deltas[deltas.length - 1].trim());
+});
+
+test("lastAssistantText retains accumulated text when a reasoning event follows", () => {
+  const guard = createGuard({ maxInputTokens: 10_000 });
+  const deltas = ["Let me re-read the files", " using one call per file", ".\n"];
+  let accumulated = "";
+
+  for (const text of deltas) {
+    accumulated += text;
+    assert.equal(guard.observe(agent({
+      type: "content_start",
+      contentType: "text",
+      text,
+      accumulated
+    })), null);
+  }
+
+  const reasoning = "Private reasoning that must not appear in the report.";
+  assert.equal(guard.observe(agent({
+    type: "content_start",
+    contentType: "reasoning",
+    accumulated: reasoning,
+    reasoning
+  })), null);
+
+  const verdict = guard.observe(agent({ type: "usage", inputTokens: 10_001 }));
+  assert.ok(verdict);
+  assert.equal(verdict.kind, "budget_exceeded");
+  assert.equal(verdict.lastAssistantText, accumulated.trim());
+  assert.notEqual(verdict.lastAssistantText, reasoning);
+});
+
 test("redaction of secrets in error texts and length cap <= 300 chars", () => {
   const guard = createGuard({ maxRepeatedFailures: 1, window: 10 });
 

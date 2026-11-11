@@ -457,9 +457,9 @@ test("tasks: run ending in loop_detected transitions to input_required with brid
   assert.ok(status.question, "task has bridge question");
   assert.equal(
     status.question.question,
-    "QUESTION: Stopped by the bridge: 3 failed edits on src/handler.ts within 10 tool calls. How should it continue (a different approach, skip this file, or stop)?"
+    "QUESTION: Stopped by the bridge: 3 failed edits on src/handler.ts within 10 tool calls. How should it continue (a different approach, skip this target, or stop)?"
   );
-  assert.deepEqual(status.question.options, ["a different approach", "skip this file", "stop"]);
+  assert.deepEqual(status.question.options, ["a different approach", "skip this target", "stop"]);
 
   // Guard report and run history in status view
   assert.deepEqual(status.guard, guardReport);
@@ -540,8 +540,9 @@ test("tasks: second trip in resumed run stops in input_required again without au
   assert.equal(s1.state, "input_required");
   assert.equal(
     s1.question?.question,
-    "QUESTION: Stopped by the bridge: 3 failed search calls on needle within 10 tool calls. How should it continue (a different approach, skip this file, or stop)?"
+    "QUESTION: Stopped by the bridge: 3 failed search calls on needle within 10 tool calls. How should it continue (a different approach, skip this target, or stop)?"
   );
+  assert.deepEqual(s1.question?.options, ["a different approach", "skip this target", "stop"]);
 
   // Resume with cline_send
   await m.send(started.taskId, "try searching for alternative needle");
@@ -567,8 +568,9 @@ test("tasks: second trip in resumed run stops in input_required again without au
   assert.equal(s2.state, "input_required", "second trip also goes to input_required");
   assert.equal(
     s2.question?.question,
-    "QUESTION: Stopped by the bridge: tool-call budget exceeded (151 > 150 tool calls). How should it continue (a different approach, skip this file, or stop)?"
+    "QUESTION: Stopped by the bridge: tool-call budget exceeded (151 > 150 tool calls). How should it continue (a narrower scope, or stop)?"
   );
+  assert.deepEqual(s2.question?.options, ["a narrower scope", "stop"]);
   assert.deepEqual(s2.guard, trip2Report);
   assert.equal(s2.runHistory?.length, 2);
   assert.equal(s2.runHistory[0].run, 1);

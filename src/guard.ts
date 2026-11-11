@@ -482,7 +482,10 @@ export function createGuard(options?: GuardOptions): Guard {
     // 0. Capture assistant text excerpt
     const inner = (event.type === "agent_event" && isObject(event.event)) ? event.event : event;
     if (isObject(inner)) {
-      if (inner.contentType === "text" && typeof inner.text === "string" && inner.text.trim()) {
+      if ((inner.contentType === "text" || inner.contentType === undefined) &&
+          typeof inner.accumulated === "string" && inner.accumulated.trim()) {
+        lastAssistantText = inner.accumulated.trim();
+      } else if (inner.contentType === "text" && typeof inner.text === "string" && inner.text.trim()) {
         lastAssistantText = inner.text.trim();
       } else if (inner.type === "text" && typeof inner.text === "string" && inner.text.trim()) {
         lastAssistantText = inner.text.trim();
