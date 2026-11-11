@@ -208,22 +208,48 @@ Roles: Codex codes, AGY reviews. All prompts and replies with other models in En
 | 10.R | AGY review. | No open findings. |
 | 10.L | Live: the same task in three variants (today, rules, rules + map); compare tokens, time and success. | Fewer tokens or re-reads, same or better result. |
 
-## Stage 11 — Micro-steps (option C; proposed 2026-11-12, waiting for the owner)
+## Stage 11 — Micro-steps (research option b; agreed with the owner on 2026-11-12)
 
-Research: [stage11-research.md](stage11-research.md). The caller plans (any model), Cline executes one small step per
-run, the bridge verifies and can roll back. Built on Stage 9 (guard) and Stage 10 (rules, code map). Roles: Codex codes,
-AGY reviews.
+Research: [stage11-research.md](stage11-research.md). Plan reviewed by Codex (27 points, 2026-11-12); the agreed
+minimal v1 is below (D-32). The caller plans (any model), Cline executes one small step per run, the bridge verifies,
+and restores a failed step. Sequential only. Roles: Codex codes, AGY reviews.
+
+**Contracts (v1)**
+- Steps: `cline_start` mode `edits` with `steps` (1-16): `{id: [A-Za-z0-9_-]{1,64} unique, instruction: 1-4,000 chars,
+  paths?: <=32 relative paths (context hints, validated: no traversal, no .git, no device/ADS names), verify: {command,
+  args?, timeoutSeconds? (default 60, max 300)}}`. `verify` is mandatory. Unknown fields rejected; input <= 64 KiB.
+- Per step: a fresh Cline run with the objective (the task prompt), the current step, a ledger of verified steps
+  (id, one-line summary, changed files; rendered <= 4,000 chars) and the code map, within the existing prompt and
+  Windows command-line limits (optional context shrinks first).
+- Verification: no shell; cwd = checkout root; stdin closed; timeout; output tails 8 KiB per stream, killed above
+  1 MiB; pass = exit 0 without timeout/kill. Windows: `npm`/`npx` run as `node.exe` + resolved `npm-cli.js`/`npx-cli.js`;
+  other `.cmd`/`.bat` rejected.
+- Snapshot before each step: raw bytes of tracked + untracked (not ignored) files into a folder outside the checkout,
+  with a manifest (path, size, hash). Limits: 20,000 files, 64 MiB/file, 512 MiB total; above → refuse before
+  launching. Restore after a failed step: rewrite modified/deleted files, remove files added by the step. Never stages,
+  never touches HEAD, the index or ignored files. Submodules, nested repos and reparse points → refused in v1.
+- HEAD or index changed during a step → fail closed (no reset), task waits with evidence.
+- One writer per checkout: a lock (in-process and a lock file under `~/.cline-mcp/locks`) shared by all edits paths,
+  held until the plan ends, also while waiting.
+- Waiting and answers: verification failure, guard trip or Cline error → restore the step, then `input_required`
+  with a typed reason. `cline_send` gains `action: retry | skip | stop` (default: retry with the message as guidance).
+  retry = rerun the step from its baseline; skip = record unverified and move on; stop = end, keeping verified steps.
+  Max 3 Cline launches per step. A Cline QUESTION inside a step keeps the partial edits and resumes the same step.
+- Status/result: current step id/index/total, phase (snapshot/run/verify/restore/waiting), attempt, per-step records
+  (state, summary, changed files, verification tail, restore outcome); final result `completed`,
+  `completed_with_skips` or stopped, with usage summed over all runs.
+- Cancel at any phase: stop the process, restore the unverified step, release the lock.
+- Budgets: per-step and per-plan tool calls and input tokens (summed guard counters), plus the per-step launch cap.
 
 | Step | Work | Done when |
 |---|---|---|
-| 11.0 | Research and proposal. | Owner agrees. |
-| 11.1 | `steps` on `cline_start` (mode edits): `{id, instruction, paths?, verify?: {command, args, timeoutSeconds}}`. One fresh Cline run per step with the objective, the current step, a short ledger of verified steps and the code map. `cline_status` shows the current step. | Tests with fake runs. |
-| 11.2 | Bridge-run verification after each step (no shell, timeout, exit code, output tail). Pass → next step; fail → `input_required` with evidence; `cline_send` answers retry / skip / stop / free guidance. | Tests. |
-| 11.3 | Snapshot before each step outside the checkout (no commit, no HEAD or index change); restore a failed step only, keeping earlier verified steps and the owner's own dirty, staged and untracked files. | Tests incl. untracked and pre-existing dirty files. |
-| 11.4 | Budgets per step and per plan; README. | Docs match code. |
+| 11.0 | Research, proposal, Codex plan review. | Done 2026-11-12. |
+| 11.1 | Building blocks: snapshot/restore module, checkout lock, verification runner (pure modules). | Unit tests incl. dirty/staged/untracked/binary files, deletions, renames, limits, Windows npm. |
+| 11.2 | Step orchestration in tasks: schema, per-step runs with ledger, verify, restore, advance, `cline_send` actions, status/result, cancel. | Tests with fake runs. |
+| 11.3 | Budgets per step and plan; README and tool descriptions. | Docs match code. |
 | 11.R | AGY review. | No open findings. |
-| 11.L | Live on a throwaway repo: a 3-4 step change as micro-steps vs one run; compare success, time and tokens. | Micro-steps succeed at least as often, with smaller contexts. |
-| Later | (a) `cline_plan`: Cline or another model drafts the steps. | — |
+| 11.L | Live on a throwaway repo: a 3-4 step change as micro-steps vs one run; compare success, time and tokens. | Micro-steps succeed at least as often. |
+| Later | `cline_plan` (automatic planning), parallel steps. | — |
 
 ## Later — the same micro-steps for OpenCode (owner's idea, 2026-11-10)
 

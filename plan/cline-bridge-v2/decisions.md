@@ -202,6 +202,15 @@ paths and commands; the first rule text ("read ranges") made Cline page in small
 task the old setup failed 0/2, rules + map succeeded 5/5. Approved by the owner on 2026-11-11 ("change what is
 needed for optimisation").
 
+### D-32 — 2026-11-12 — Micro-steps v1: caller-supplied steps, mandatory verify, byte snapshots
+**Decision:** Steps come from the caller; each runs as a fresh Cline run; `verify` is mandatory; a failed step is
+restored from a raw-byte snapshot of tracked and untracked (not ignored) files outside the checkout; one writer per
+checkout; sequential only. Not taken from the Codex review: snapshotting ignored files (node_modules makes it huge),
+a ledger file on disk, a generic shell for verification.
+**Why:** Codex plan review (2026-11-12): a temporary Git index loses exact bytes and writes objects; without
+`verify` there is no acceptance criterion; Windows `.cmd` shims need a shell. Owner approved Codex writes, AGY reviews,
+work through without stopping.
+
 ### D-13 — 2026-11-09 — Codex replaces Grok; Grok is out
 **Decision:** Pre-code analysis and `n.R` code review go to Codex (`codex_ask`, read-only sandbox).
 Fallback: AGY, then OpenCode. Grok is not used in this project. Supersedes the Grok parts of D-12.
