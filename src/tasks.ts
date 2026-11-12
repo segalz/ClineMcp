@@ -14,7 +14,7 @@ import { applyClineEdits, buildEditSystemPrompt, editsCheckoutRoot, runClineEdit
 import { acquire, type CheckoutRelease } from "./checkoutlock.js";
 import { resolveTraceBase, type TraceInfo, type TraceRecorder, type TraceStatus } from "./trace.js";
 import { takeSnapshot, restoreSnapshot, discardSnapshot, headAndIndexIdentity, type SnapshotOptions } from "./snapshot.js";
-import { runVerification } from "./verify.js";
+import { runVerification, VerificationError, type VerificationResult } from "./verify.js";
 import { buildStepPrompt, startTaskSchema, sumUsage, type StepDefinition, type PlanView, type PlanOutcome,
   DEFAULT_STEP_BUDGET, type StepBudget, type StepAction, type StepExecution, type WaitReason } from "./steps.js";
 
@@ -1017,9 +1017,18 @@ export class TaskManager {
         return;
       }
       plan.phase = "verify";
-      const verified = await (this.deps.runVerification ?? runVerification)(execution.definitions[plan.currentIndex].verify, task.cwd!, task.controller.signal);
+      const verificationStarted = performance.now();
+      let verified: VerificationResult & { error?: string };
+      try {
+        verified = await (this.deps.runVerification ?? runVerification)(execution.definitions[plan.currentIndex].verify, task.cwd!, task.controller.signal);
+      } catch (error) {
+        if (!(error instanceof VerificationError)) throw error;
+        const message = redactSecrets(error.message);
+        verified = { passed: false, exitCode: null, signal: null, timedOut: false, killedForOutput: false,
+          durationMs: performance.now() - verificationStarted, stdoutTail: "", stderrTail: message, error: message };
+      }
       record.verify = { passed: verified.passed, exitCode: verified.exitCode, timedOut: verified.timedOut,
-        stdoutTail: verified.stdoutTail, stderrTail: verified.stderrTail };
+        stdoutTail: verified.stdoutTail, stderrTail: verified.stderrTail, ...(verified.error ? { error: verified.error } : {}) };
       this.checkCancelled(task);
       if (!await this.planIdentityUnchanged(task)) return;
       if (!verified.passed) {

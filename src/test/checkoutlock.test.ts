@@ -1,6 +1,8 @@
 import assert from "node:assert/strict";
 import "./git-test-serial.js";
 import test from "node:test";
+import fs from "node:fs";
+import { syncBuiltinESMExports } from "node:module";
 import { spawnSync } from "node:child_process";
 import { mkdir, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
 import os from "node:os";
@@ -24,6 +26,48 @@ async function fixture(t: test.TestContext) {
   return { base, root, locks };
 }
 const busy = (err: unknown) => err instanceof CheckoutBusyError && err.kind === "checkout_busy";
+
+test("orphaned reaper metadata and incomplete dead claims are reclaimed; live reapers remain busy", async t => {
+  const { root, locks } = await fixture(t);
+  const file = checkoutLockPath(root, locks);
+  const orphan = spawnSync(process.execPath, ["--input-type=module", "-e", `
+    import { mkdirSync, writeFileSync } from 'node:fs';
+    const file = process.argv[1];
+    const metadata = JSON.stringify({ pid: process.pid, time: new Date().toISOString(), token: 'orphan' });
+    writeFileSync(file, metadata); writeFileSync(file + '.reap', metadata);
+    mkdirSync(file + '.reap-claims');
+    writeFileSync(file + '.reap-claims/' + process.pid + '-00000000-0000-0000-0000-000000000000.json', '');
+  `, file], { encoding: "utf8", windowsHide: true, timeout: 10_000 });
+  assert.equal(orphan.status, 0, orphan.stderr);
+  const staleMetadata = await readFile(file, "utf8");
+  const release = acquire(root, { lockDirectory: locks }); release();
+  await assert.rejects(readFile(file + ".reap"), { code: "ENOENT" });
+  assert.deepEqual(fs.readdirSync(file + ".reap-claims"), []);
+  await writeFile(file, staleMetadata);
+  await writeFile(file + ".reap", JSON.stringify({ pid: process.pid, time: new Date().toISOString() }));
+  assert.throws(() => acquire(root, { lockDirectory: locks }), busy);
+  assert.equal(await readFile(file, "utf8"), staleMetadata);
+});
+
+test("failed lock writes close the descriptor before Windows-style unlink cleanup", async t => {
+  const { root, locks } = await fixture(t);
+  const file = checkoutLockPath(root, locks);
+  const originalClose = fs.closeSync, originalUnlink = fs.unlinkSync;
+  const injected = Object.assign(new Error("injected write failure"), { code: "ENOSPC" });
+  let closed = false, unlinked = false;
+  t.mock.method(fs, "writeFileSync", () => { throw injected; });
+  t.mock.method(fs, "closeSync", (fd: number) => { originalClose(fd); closed = true; });
+  t.mock.method(fs, "unlinkSync", (target: fs.PathLike) => {
+    if (!closed) throw Object.assign(new Error("Windows handle is open"), { code: "EBUSY" });
+    originalUnlink(target); unlinked = true;
+  });
+  syncBuiltinESMExports();
+  try { assert.throws(() => acquire(root, { lockDirectory: locks }), error => error === injected); }
+  finally { t.mock.restoreAll(); syncBuiltinESMExports(); }
+  assert.equal(closed, true); assert.equal(unlinked, true);
+  await assert.rejects(readFile(file), { code: "ENOENT" });
+  const release = acquire(root, { lockDirectory: locks }); release();
+});
 async function until(check: () => Promise<boolean>) {
   // Whole-suite parallel Git/process work can delay a fake runner before it is scheduled.
   const deadline = Date.now() + 20_000;

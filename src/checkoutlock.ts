@@ -1,5 +1,5 @@
 import { createHash, randomUUID } from "node:crypto";
-import { closeSync, mkdirSync, openSync, readFileSync, realpathSync, unlinkSync, writeFileSync } from "node:fs";
+import { closeSync, existsSync, linkSync, mkdirSync, openSync, readFileSync, readdirSync, realpathSync, unlinkSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { ClineRunError } from "./runner.js";
@@ -23,14 +23,51 @@ export function checkoutLockPath(checkoutRoot: string, lockDirectory = path.join
   return path.join(lockDirectory, createHash("sha256").update(canonicalCheckoutPath(checkoutRoot)).digest("hex") + ".lock");
 }
 
+function pidIsGone(pid: number): boolean {
+  if (!Number.isSafeInteger(pid) || pid <= 0) return false;
+  try { process.kill(pid, 0); }
+  catch (error) { return (error as NodeJS.ErrnoException).code === "ESRCH"; }
+  return false;
+}
+
 function deadHolder(file: string): boolean {
   try {
     const holder = JSON.parse(readFileSync(file, "utf8"));
-    if (!Number.isSafeInteger(holder.pid) || holder.pid <= 0) return false;
-    try { process.kill(holder.pid, 0); }
-    catch (error) { return (error as NodeJS.ErrnoException).code === "ESRCH"; }
+    return pidIsGone(holder.pid);
   } catch { /* An incomplete or unreadable lock is busy, never stale by age alone. */ }
   return false;
+}
+
+function createHolder(file: string, token: string): void {
+  const fd = openSync(file, "wx", 0o600);
+  try { writeFileSync(fd, JSON.stringify({ pid: process.pid, time: new Date().toISOString(), token })); }
+  catch (error) {
+    closeSync(fd); // Windows cannot unlink the failed write while this handle is still open.
+    unlinkSync(file);
+    throw error;
+  }
+  closeSync(fd);
+}
+
+/** Unique claims cannot be replaced while being inspected. Refuse if another live claimant exists.
+ * Keeping our claim through the critical section prevents two stale-reaper recoverers from both entering. */
+function claimReclamation(file: string, token: string, root: string): { file: string; release: () => void } {
+  const directory = file + ".reap-claims";
+  mkdirSync(directory, { recursive: true });
+  const own = `${process.pid}-${token}.json`;
+  const claim = path.join(directory, own);
+  createHolder(claim, token);
+  try {
+    for (const name of readdirSync(directory)) {
+      if (name === own) continue;
+      const pid = /^(\d+)-[a-f0-9-]+\.json$/i.exec(name)?.[1];
+      if (!pid || !pidIsGone(Number(pid))) throw new CheckoutBusyError(root);
+      // The pid is encoded before creation, so even a crash before writing metadata is recoverable.
+      try { unlinkSync(path.join(directory, name)); }
+      catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
+    }
+    return { file: claim, release: () => unlinkSync(claim) };
+  } catch (error) { unlinkSync(claim); throw error; }
 }
 
 /** Exclusive across this process and bridge processes. Callers pass the Git checkout root. */
@@ -40,22 +77,26 @@ export function acquire(checkoutRoot: string, options: { lockDirectory?: string 
   const file = checkoutLockPath(root, options.lockDirectory);
   mkdirSync(path.dirname(file), { recursive: true });
   const token = randomUUID();
-  const create = () => {
-    const fd = openSync(file, "wx", 0o600);
-    try { writeFileSync(fd, JSON.stringify({ pid: process.pid, time: new Date().toISOString(), token })); }
-    catch (error) { unlinkSync(file); throw error; }
-    finally { closeSync(fd); }
-  };
+  const create = () => createHolder(file, token);
   try { create(); }
   catch (error) {
     if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
     if (!deadHolder(file)) throw new CheckoutBusyError(root);
     // Serialize reclaimers: none may unlink a newly created live lock after another reclaimed it.
     const reaper = file + ".reap";
-    let fd: number;
-    try { fd = openSync(reaper, "wx", 0o600); }
-    catch { throw new CheckoutBusyError(root); }
+    const claim = claimReclamation(file, token, root);
+    let reaperOwned = false;
     try {
+      if (existsSync(reaper)) {
+        if (!deadHolder(reaper)) throw new CheckoutBusyError(root);
+        unlinkSync(reaper);
+      }
+      // Publish complete, closed metadata atomically; a crash cannot leave an empty .reap file.
+      try { linkSync(claim.file, reaper); reaperOwned = true; }
+      catch (err) {
+        if ((err as NodeJS.ErrnoException).code === "EEXIST") throw new CheckoutBusyError(root);
+        throw err;
+      }
       if (!deadHolder(file)) throw new CheckoutBusyError(root);
       unlinkSync(file);
       try { create(); }
@@ -63,7 +104,10 @@ export function acquire(checkoutRoot: string, options: { lockDirectory?: string 
         if ((err as NodeJS.ErrnoException).code === "EEXIST") throw new CheckoutBusyError(root);
         throw err;
       }
-    } finally { closeSync(fd); unlinkSync(reaper); }
+    } finally {
+      try { if (reaperOwned) unlinkSync(reaper); }
+      finally { claim.release(); }
+    }
   }
   const release: CheckoutRelease = Object.assign(() => {
     if (held.get(root) !== release) return;

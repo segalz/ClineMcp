@@ -44,7 +44,7 @@ export interface StepRecord {
   attempts: number;
   summary?: string;
   changedFiles?: string[];
-  verify?: Pick<VerificationResult, "passed" | "exitCode" | "timedOut" | "stdoutTail" | "stderrTail">;
+  verify?: Pick<VerificationResult, "passed" | "exitCode" | "timedOut" | "stdoutTail" | "stderrTail"> & { error?: string };
   restore?: RestoreReport;
   counters?: BudgetCounters;
 }

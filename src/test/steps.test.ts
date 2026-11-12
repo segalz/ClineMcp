@@ -368,6 +368,26 @@ test("stepBudget is strict, bounded like guard, requires steps, and defaults are
   await f.manager.cancel(started.taskId);
 });
 
+test("verification resolution errors populate failed verification evidence and restore before waiting", async t => {
+  for (const command of ["cline-mcp-review-no-such-executable", ...(process.platform === "win32" ? ["review-refused.cmd", "review-refused.bat"] : [])]) {
+    const f = await fixture(t);
+    const started = f.start([step("one", { command, args: [] })]);
+    const run = await f.launched(1);
+    await writeFile(path.join(f.cwd, "a"), "unverified edit");
+    run.finish("ready to verify");
+    const waiting = await f.wait(started.taskId, status => status.state === "input_required");
+    assert.equal(waiting.waitReason, "verify_failed", command);
+    const result = waiting.plan!.steps[0].verify!;
+    assert.equal(result.passed, false); assert.equal(result.exitCode, null); assert.equal(result.timedOut, false);
+    assert.ok(result.error); assert.equal(result.stderrTail, result.error);
+    assert.equal(await readFile(path.join(f.cwd, "a"), "utf8"), "dirty baseline\r\n");
+    assert.deepEqual(waiting.plan!.steps[0].restore?.failed, []);
+    await f.manager.send(started.taskId, undefined, "stop");
+    await f.wait(started.taskId, status => status.state === "done");
+    await f.snapshotsEmpty();
+  }
+});
+
 test("per-step budgets span question resumes, cap explicit guard limits, restore and permit only skip/stop", async t => {
   for (const dimension of ["calls", "tokens"] as const) {
     const f = await fixture(t);

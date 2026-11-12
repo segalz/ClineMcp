@@ -1,6 +1,8 @@
 import assert from "node:assert/strict";
 import "./git-test-serial.js";
 import test from "node:test";
+import promises from "node:fs/promises";
+import { syncBuiltinESMExports } from "node:module";
 import { spawnSync } from "node:child_process";
 import { link, mkdtemp, mkdir, readFile, readdir, rename, rm, symlink, truncate, unlink, writeFile } from "node:fs/promises";
 import os from "node:os";
@@ -26,6 +28,33 @@ async function fixture(t: test.TestContext) {
   return { root, storage, base };
 }
 const refused = (kind: string) => (err: unknown) => err instanceof SnapshotError && err.kind === kind;
+
+test("Windows checkout identity accepts normalized upper/lower-case drive letters", { skip: process.platform !== "win32" }, async t => {
+  const { root, storage } = await fixture(t);
+  assert.match(root, /^[A-Za-z]:/);
+  const variants = [root[0].toLowerCase() + root.slice(1), root[0].toUpperCase() + root.slice(1)];
+  const expected = await headAndIndexIdentity(root);
+  const actualRealpath = promises.realpath;
+  let calls = 0, changedCase = false;
+  t.mock.method(promises, "realpath", (async (target: Parameters<typeof actualRealpath>[0]) => {
+    const value = await actualRealpath(target);
+    if (++calls !== 2) return value;
+    // Force the Git-reported root's realpath to differ only in drive case, even on Node versions that canonicalize it.
+    changedCase = true;
+    return (value[0] === value[0].toUpperCase() ? value[0].toLowerCase() : value[0].toUpperCase()) + value.slice(1);
+  }) as typeof actualRealpath);
+  syncBuiltinESMExports();
+  try {
+    for (const variant of variants) {
+      calls = 0; changedCase = false;
+      const snapshot = await takeSnapshot(variant, { snapshotBase: storage });
+      assert.equal(changedCase, true);
+      assert.ok(snapshot.manifest.some(entry => entry.path === "a"));
+      assert.deepEqual(await headAndIndexIdentity(variant), expected);
+      await discardSnapshot(snapshot);
+    }
+  } finally { t.mock.restoreAll(); syncBuiltinESMExports(); }
+});
 
 test("byte restore preserves dirty/staged/binary/untracked state and HEAD/index; ignored content stays untouched", async t => {
   const { root, storage } = await fixture(t);

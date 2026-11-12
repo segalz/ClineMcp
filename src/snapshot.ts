@@ -117,7 +117,8 @@ async function checkout(root: string): Promise<string> {
   if (stat.isSymbolicLink()) throw new SnapshotError("snapshot_unsupported", "Checkout root is a symlink/reparse point.");
   const resolved = await realpath(root);
   const top = (await git(resolved, ["rev-parse", "--show-toplevel"])).toString("utf8").trim();
-  if (await realpath(top) !== resolved) throw new SnapshotError("snapshot_invalid", "Expected the checkout root.");
+  const normalize = (value: string) => process.platform === "win32" ? path.normalize(value).toLowerCase() : path.normalize(value);
+  if (normalize(await realpath(top)) !== normalize(resolved)) throw new SnapshotError("snapshot_invalid", "Expected the checkout root.");
   return resolved;
 }
 
