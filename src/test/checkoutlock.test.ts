@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import "./git-test-serial.js";
 import test from "node:test";
 import { spawnSync } from "node:child_process";
 import { mkdir, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
@@ -24,7 +25,8 @@ async function fixture(t: test.TestContext) {
 }
 const busy = (err: unknown) => err instanceof CheckoutBusyError && err.kind === "checkout_busy";
 async function until(check: () => Promise<boolean>) {
-  const deadline = Date.now() + 5000;
+  // Whole-suite parallel Git/process work can delay a fake runner before it is scheduled.
+  const deadline = Date.now() + 20_000;
   while (!await check()) {
     assert.ok(Date.now() < deadline, "condition did not become true");
     await new Promise(resolve => setTimeout(resolve, 10));

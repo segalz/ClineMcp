@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import "./git-test-serial.js";
 import test from "node:test";
 import { spawnSync } from "node:child_process";
 import { link, mkdtemp, mkdir, readFile, readdir, rename, rm, symlink, truncate, unlink, writeFile } from "node:fs/promises";

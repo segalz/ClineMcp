@@ -8,6 +8,7 @@ import { clinePing } from "./ping.js";
 import { listFreeModels, writeCatalogSnapshot } from "./models.js";
 import { cleanupTraces } from "./trace.js";
 import { TaskManager, MAX_TASK_TIMEOUT_SECONDS, MAX_WAIT_SECONDS } from "./tasks.js";
+import { startTaskObjectSchema, startTaskSchema } from "./steps.js";
 import { PROHIBITED_NAMES, resolveProviderSettingsPath, recoverProviderSettingsJournal } from "./settings.js";
 import {
   attachCliToObject,
@@ -293,26 +294,23 @@ server.registerTool(
   {
     description: "Start a Cline task in the background and return its taskId at once. mode \"ask\": answer from the prompt, " +
       "no tools; \"workspace\": read a Git repository in a disposable worktree; \"edits\": change files in the checkout " +
-      "(no commits; diff in the result). Then follow it with cline_status, stop it with cline_cancel, and collect it with " +
+      "(no commits; non-step runs include a diff). Then follow it with cline_status, stop it with cline_cancel, and collect it with " +
       `cline_result. One attempt, no automatic retry; timeoutSeconds up to ${MAX_TASK_TIMEOUT_SECONDS}; at most 2 tasks at once. ` +
       "The bridge stops a run on repeated failures or budget and waits for guidance via cline_send. " +
-      "codeMap defaults to true for workspace/edits, including resumed runs; ignored in ask mode.",
-    inputSchema: {
-      mode: z.enum(["ask", "workspace", "edits"]),
-      prompt: z.string().min(1).max(20_000),
+      "codeMap defaults to true for workspace/edits, including resumed runs; ignored in ask mode. " +
+      "Optional steps (edits only): 1-16 unique ids with instruction, optional relative path hints, and mandatory verify. " +
+      "Steps run sequentially with byte snapshots, a checkout lock, and mandatory shell-free verification. " +
+      "Failure restores the step and waits with waitReason/evidence; HEAD/index changes wait without reset. " +
+      "A step allows at most 3 Cline launches including question resumes. Input is strict and at most 64 KiB.",
+    inputSchema: startTaskObjectSchema.extend({
       provider: providerModelSchema,
-      model: providerModelSchema,
-      cwd: z.string().min(1).optional().describe("Required for workspace and edits: a path inside a Git repository."),
-      thinking: z.enum(["none", "low", "medium", "high", "xhigh"]).optional(),
-      timeoutSeconds: z.number().int().min(1).max(MAX_TASK_TIMEOUT_SECONDS).optional(),
-      waitSeconds: z.number().int().min(0).max(30).optional().describe("Wait this long for first progress before returning (default 3)."),
-      codeMap: z.boolean().optional().describe("Include a bounded code map in workspace/edits runs (default true); ignored in ask mode."),
-      guard: guardOptionsSchema.optional()
-    }
+      model: providerModelSchema
+    })
   },
-  async ({ waitSeconds, ...input }) => {
+  async (rawInput) => {
     await beforeToolCall();
     try {
+      const { waitSeconds, ...input } = startTaskSchema.parse(rawInput);
       const started = tasks.start(input);
       return await asText(await tasks.status(started.taskId, waitSeconds ?? 3));
     } catch (error) {
@@ -325,7 +323,8 @@ server.registerTool(
   "cline_status",
   {
     description: "Where a Cline task is now: state, step, current tool, last complete reasoning, files, any question Cline " +
-      `asked. Long poll: returns as soon as the task finishes, asks a question (input_required), or after waitSeconds (max ${MAX_WAIT_SECONDS}).`,
+      `asked. Long poll: returns as soon as the task finishes, asks a question (input_required), or after waitSeconds (max ${MAX_WAIT_SECONDS}). ` +
+      "Step plans include current step/index, phase, attempts, verification/restore records, waitReason and evidence.",
     inputSchema: {
       taskId: z.string().uuid(),
       waitSeconds: z.number().int().min(0).max(MAX_WAIT_SECONDS).optional().describe("Default 20.")
@@ -341,17 +340,21 @@ server.registerTool(
 server.registerTool(
   "cline_send",
   {
-    description: "Send an answer to a Cline task waiting in input_required state. Starts a fresh run under the same taskId.",
-    inputSchema: {
+    description: "Answer a waiting Cline task. For step plans, action retry (default) reruns the failed step from its baseline " +
+      "with message as guidance; a cline_question resumes the same step with partial edits retained. skip records an unverified " +
+      "step and continues; stop ends as stopped, keeping verified changes. At the launch cap only skip/stop are allowed. " +
+      "Omit message for skip/stop or a retry without guidance. Tasks without steps still require a message and support retry only.",
+    inputSchema: z.object({
       taskId: z.string().uuid(),
-      message: z.string().min(1).max(20_000),
+      message: z.string().max(20_000).optional(),
+      action: z.enum(["retry", "skip", "stop"]).optional(),
       waitSeconds: z.number().int().min(0).max(30).optional().describe("Wait this long for first progress before returning (default 3).")
-    }
+    }).strict()
   },
-  async ({ taskId, message, waitSeconds }) => {
+  async ({ taskId, message, action, waitSeconds }) => {
     await beforeToolCall();
     try {
-      await tasks.send(taskId, message);
+      await tasks.send(taskId, message, action);
       return await asText(await tasks.status(taskId, waitSeconds ?? 3));
     } catch (error) {
       return await asError(error, "Sending message to the Cline task failed unexpectedly.");
@@ -376,7 +379,9 @@ server.registerTool(
   "cline_result",
   {
     description: "Final result of a finished Cline task, or partial result of an input_required task (does not remove the task), " +
-      "plus log_run_hint for model-picker log_run (null when cancelled: do not log). Removes the task and its trace unless keepTrace.",
+      "plus log_run_hint for model-picker log_run (null when cancelled: do not log). Step plans include per-step records, " +
+      "summed usage, and outcome completed/completed_with_skips/stopped; only completed is ok. " +
+      "Removes the task and its trace unless keepTrace.",
     inputSchema: { taskId: z.string().uuid(), keepTrace: z.boolean().optional() }
   },
   async ({ taskId, keepTrace }) => {

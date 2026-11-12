@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import "./git-test-serial.js";
 import test, { after } from "node:test";
 import { spawnSync } from "node:child_process";
 import { EventEmitter } from "node:events";
@@ -71,8 +72,18 @@ const repo = await repository({
   ...Object.fromEntries(Array.from({ length: 24 }, (_, i) => [`extra/file${String(i).padStart(2, "0")}.ts`, `export const symbol${i} = 1;\n`]))
 });
 
+/** Content assertions need a completed best-effort scan under parallel process load.
+ * Deadline/cancellation/omission assertions below continue to exercise a single call directly. */
+async function requiredCodeMap(cwd: string, options?: Parameters<typeof buildCodeMap>[1]): Promise<string> {
+  for (let attempt = 0; attempt < 3; attempt++) {
+    const map = await buildCodeMap(cwd, options);
+    if (map !== undefined) return map;
+  }
+  assert.fail("Code map was omitted in all three bounded content scans");
+}
+
 test("maps TS and Python declarations with exact line numbers, counts, and prompt priority", async () => {
-  const map = await buildCodeMap(repo, { prompt: "Review z.py then a.ts" });
+  const map = await requiredCodeMap(repo, { prompt: "Review z.py then a.ts" });
   assert.ok(map);
   assert.equal(map.split("\n")[0], CODE_MAP_HEADER);
   // Mentioned paths tie-break by path, followed by other paths sorted by path.
@@ -83,29 +94,29 @@ test("maps TS and Python declarations with exact line numbers, counts, and promp
   assert.match(map, /readme\.txt \(2 lines\):/);
   assert.match(map, /empty\.txt \(0 lines\):/);
   assert.doesNotMatch(map, /nested:/);
-  const pythonFirst = await buildCodeMap(repo, { prompt: "Inspect z.py" });
+  const pythonFirst = await requiredCodeMap(repo, { prompt: "Inspect z.py" });
   assert.match(pythonFirst!.split("\n")[1], /^z\.py /);
 });
 
 test("recognizes the other supported language declarations", async () => {
-  const map = (await buildCodeMap(repo))!;
+  const map = await requiredCodeMap(repo);
   for (const expected of ["Serve:2, Server:3", "run:1, Item:2, Item:3, inner:4", "Source:1, Contract:2",
     "Value:1", "Thing:1, Choice:2", "Item:2, load:3", "App:1, Item:2, self.call:3"]) assert.ok(map.includes(expected), expected);
 });
 
 test("skips generated directories, minified files, lockfiles, binaries, and oversized files", async () => {
-  const map = (await buildCodeMap(repo))!;
+  const map = await requiredCodeMap(repo);
   assert.doesNotMatch(map, /ignored|bundle\.min|package-lock|Cargo\.lock|binary\.dat|invalid\.dat|huge\.ts/);
   assert.ok(map.length <= 6_000);
 });
 
 test("drops low-priority symbols before paths and reports omitted files within budget", async () => {
-  const full = (await buildCodeMap(repo, { prompt: "z.py" }))!;
-  const smaller = (await buildCodeMap(repo, { prompt: "z.py", maxChars: full.length - 15 }))!;
+  const full = await requiredCodeMap(repo, { prompt: "z.py" });
+  const smaller = await requiredCodeMap(repo, { prompt: "z.py", maxChars: full.length - 15 });
   assert.equal(smaller.split("\n").length, full.split("\n").length);
   assert.match(smaller.split("\n")[1], /fetch:2, Client:5, main:7/);
   assert.doesNotMatch(smaller, /more files/);
-  const tiny = (await buildCodeMap(repo, { maxChars: 180 }))!;
+  const tiny = await requiredCodeMap(repo, { maxChars: 180 });
   assert.ok(tiny.length <= 180);
   assert.match(tiny, /\.\.\. and \d+ more files$/);
   const shown = tiny.split("\n").length - 2;
@@ -129,7 +140,7 @@ test("clamps to the escaped Windows command line and skips under 800 characters 
   const target = WINDOWS_COMMAND_LINE_LIMIT - 1_000 - 900;
   input.prompt += "x".repeat(target - base);
   const length = (map: string) => codeMapCommandLineLength(input, options, map);
-  const map = await buildCodeMap(repo, { commandLineLength: length });
+  const map = await requiredCodeMap(repo, { commandLineLength: length });
   assert.ok(map);
   assert.ok(length(map + "\n\n") <= WINDOWS_COMMAND_LINE_LIMIT - 1_000);
   assert.ok(map.length < 900);

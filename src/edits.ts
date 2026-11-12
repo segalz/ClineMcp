@@ -21,6 +21,7 @@ export interface ApplyClineEditsInput {
   provider?: string;
   model?: string;
   codeMap?: boolean;
+  guard?: AskClineInput["guard"];
 }
 
 export interface ClineEditsResponse extends ClineResponse {
@@ -157,6 +158,23 @@ export async function editsCheckoutRoot(cwd: string, signal?: AbortSignal): Prom
   }
 }
 
+/** A task-owned step must inspect identity itself: no Git status refresh or commit recovery is allowed here. */
+export async function runClineEditStep(input: ApplyClineEditsInput, signal: AbortSignal,
+  options: Partial<ClineInvocationOptions>): Promise<ClineResponse> {
+  if (!ownsCheckoutLock(options.checkoutLock, input.cwd)) {
+    throw new ClineRunError("checkout_busy", "A step requires its task's checkout lock.", { attempts: 0 });
+  }
+  return runEdits(input, input.cwd, signal, options);
+}
+
+async function runEdits(input: ApplyClineEditsInput, repositoryRoot: string, signal: AbortSignal | undefined,
+  options: Partial<ClineInvocationOptions>): Promise<ClineResponse> {
+  return runCline({ ...input, cwd: repositoryRoot }, signal, await withCodeMap(repositoryRoot, input, {
+    ...options, autoApprove: true, cwd: repositoryRoot, systemPrompt: buildEditSystemPrompt(repositoryRoot),
+    provider: input.provider, model: input.model
+  }, signal));
+}
+
 async function applyWithinLock(input: ApplyClineEditsInput, repositoryRoot: string, headBefore: string,
   signal: AbortSignal | undefined, options: Partial<ClineInvocationOptions>): Promise<ClineEditsResponse> {
 
@@ -182,19 +200,7 @@ async function applyWithinLock(input: ApplyClineEditsInput, repositoryRoot: stri
     return true;
   };
 
-  const result = await runCline(
-    { ...input, cwd: repositoryRoot },
-    signal,
-    await withCodeMap(repositoryRoot, input, {
-      ...options,
-      autoApprove: true,
-      cwd: repositoryRoot,
-      systemPrompt: buildEditSystemPrompt(repositoryRoot),
-      provider: input.provider,
-      model: input.model,
-      canRetry
-    }, signal)
-  );
+  const result = await runEdits(input, repositoryRoot, signal, { ...options, canRetry });
 
   try {
     return await inspectAfterRun(result);

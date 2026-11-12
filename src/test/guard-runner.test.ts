@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import "./git-test-serial.js";
 import test, { after } from "node:test";
 import { EventEmitter } from "node:events";
 import { spawnSync } from "node:child_process";
