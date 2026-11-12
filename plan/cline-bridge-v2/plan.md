@@ -248,7 +248,7 @@ and restores a failed step. Sequential only. Roles: Codex codes, AGY reviews.
 | 11.2 | Step orchestration in tasks: schema, per-step runs with ledger, verify, restore, advance, `cline_send` actions, status/result, cancel. | Tests with fake runs. |
 | 11.3 | Budgets per step and plan; README and tool descriptions. | Docs match code. |
 | 11.R | AGY review. | No open findings. |
-| 11.L | Live on a throwaway repo: a 3-4 step change as micro-steps vs one run; compare success, time and tokens. | Micro-steps succeed at least as often. |
+| 11.L | Live on a throwaway repo: a 3-4 step change as micro-steps vs one run; compare success, time and tokens. | Micro-steps succeed at least as often. Done: [stage11-results.md](stage11-results.md). |
 | Later | `cline_plan` (automatic planning), parallel steps. | — |
 
 ## Later — the same micro-steps for OpenCode (owner's idea, 2026-11-10)

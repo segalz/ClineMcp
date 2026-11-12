@@ -68,11 +68,11 @@ Status values: `todo`, `in progress`, `done`, `blocked`, `skipped`.
 | 10.R | Verify: code review | done | 2026-11-12 | AGY approved both rounds; two low notes left as is (snake_case token keys unused by Cline; extreme cwd already rejected by limits) |
 | 10.L | Verify: live before/after | done | 2026-11-12 | 22 live runs, free model; see stage10-results.md. Hard task: today 0/2, rules+map 5/5 |
 | 11.0 | Research and proposal | done | 2026-11-12 | stage11-research.md; Codex plan review (27 points) folded into a minimal v1 (D-32); owner approved |
-| 11.1 | Building blocks | todo |  |  |
-| 11.2 | Step orchestration | todo |  |  |
-| 11.3 | Budgets and docs | todo |  |  |
-| 11.R | Verify: code review | todo |  |  |
-| 11.L | Verify: live comparison | todo |  |  |
+| 11.1 | Building blocks | done | 2026-11-12 | Codex: src/snapshot.ts (raw-byte snapshot of tracked + untracked files, restore, HEAD/index identity), src/checkoutlock.ts (one writer per checkout, also wired into existing edits paths), src/verify.ts (no shell, npm/npx via node + cli.js) |
+| 11.2 | Step orchestration | done | 2026-11-12 | Codex: src/steps.ts + tasks: steps on cline_start edits, ledger, verify, restore, cline_send action retry/skip/stop, 3 launches per step, status/result plan view. First Codex turn timed out at 30 min; continued |
+| 11.3 | Budgets and docs | done | 2026-11-12 | stepBudget per step and per plan from summed guard counters; README Micro-steps section; 297 tests |
+| 11.R | Verify: code review | done | 2026-11-12 | AGY approved both halves; 4 low findings (stale .reap, close before unlink, drive-letter case, verify resolution errors) fixed by Codex; 301 tests pass |
+| 11.L | Verify: live comparison | done | 2026-11-12 | stage11-results.md: single 2/2, micro-steps 2/2 (all 4 checks); micro-steps ~2x time and tokens; question path verified live |
 
 | X.1 | `ask_cline` no-tools notice + Windows length guard (D-21) | done | 2026-11-09 | Codex analysis + review (3 rounds: Windows command-line length, UTF-16 count) PASS; 139 tests; live 0 tool calls / 1 iteration |
 
