@@ -211,6 +211,13 @@ a ledger file on disk, a generic shell for verification.
 `verify` there is no acceptance criterion; Windows `.cmd` shims need a shell. Owner approved Codex writes, AGY reviews,
 work through without stopping.
 
+### D-33 — 2026-11-13 — Default to one run plus a final check; full micro-steps only for large changes
+**Decision:** For edit tasks use one Cline run followed by the bridge running the whole check suite (`steps` with a
+single step). Full micro-steps only for changes too big for one context or after a single run failed twice. Do not
+port micro-steps to OpenCode for now.
+**Why:** Experiment 2 (stage11-results.md): single runs passed 20/21 checks at ~100 s / 250k tokens; micro-steps
+21/21 at ~4x time and tokens. The only single-run miss was silent, which a final check catches cheaply.
+
 ### D-13 — 2026-11-09 — Codex replaces Grok; Grok is out
 **Decision:** Pre-code analysis and `n.R` code review go to Codex (`codex_ask`, read-only sandbox).
 Fallback: AGY, then OpenCode. Grok is not used in this project. Supersedes the Grok parts of D-12.
