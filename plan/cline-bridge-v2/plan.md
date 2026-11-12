@@ -251,6 +251,61 @@ and restores a failed step. Sequential only. Roles: Codex codes, AGY reviews.
 | 11.L | Live on a throwaway repo: a 3-4 step change as micro-steps vs one run; compare success, time and tokens. | Micro-steps succeed at least as often. Done: [stage11-results.md](stage11-results.md). |
 | Later | `cline_plan` (automatic planning), parallel steps. | — |
 
+## Stage 12 — Mandatory final check with automatic fixes; micro-step orchestration removed (owner, 2026-11-13)
+
+Why: experiment 2 (stage11-results.md, D-33) showed micro-steps cost ~4x for one extra passed check out of 21; the
+only single-run miss was silent, which a final check catches cheaply. The owner chose to remove the micro-step
+orchestration and make the final check strong and mandatory. Roles: Codex reviews the plan and codes, AGY reviews.
+
+**Contracts (draft, for Codex review)**
+- Removed: `steps`, `stepBudget`, `cline_send` actions `skip`, the step ledger and plan view (`src/steps.ts` and its
+  task wiring). Kept: `src/snapshot.ts`, `src/checkoutlock.ts`, `src/verify.ts`.
+- `verify` is required on every edit run (`apply_cline_edits`, `cline_start` mode `edits`): either
+  `{command, args?, timeoutSeconds?}` (same rules as Stage 11: no shell, npm/npx via node, 60 s default, 300 s max,
+  8 KiB tails) or `{none: true, reason: string(10-500)}` as an explicit, reported opt-out.
+- Flow: lock → snapshot → Cline run → verify → pass: done. Fail: up to 2 automatic fix runs (`maxFixRuns` 0-3,
+  default 2), each a fresh Cline run with the objective, the failing command and its output tail, and "fix only what
+  the check reports" → verify again. Still failing: sync tool returns failure with evidence and leaves the changes
+  (no automatic restore); async task goes to `input_required` (`waitReason: verify_failed`), `cline_send` actions:
+  `retry` (another fix run with the caller's guidance), `restore` (restore the snapshot and stop), `keep` (stop and
+  keep the changes, reported unverified).
+- Guard trip or Cline error on the first run: as today (async → input_required), plus `restore` available.
+- Result: `verification: {required: true|false (none), passed, command, attempts: [{run, passed, exitCode, timedOut,
+  stdoutTail, stderrTail}], fixRuns, restored}`; `log_run_hint.ok` only when the final check passed (or `none`).
+- Budgets: the fix runs count toward the task's guard budgets.
+
+**Agreed after the Codex plan review (2026-11-13, 16 points, D-34)**
+- One edit lifecycle shared by sync and async; only async may pause. One snapshot taken before the first run is kept
+  through all fix runs and question resumes; `restore` undoes the first run and every fix, back to the owner's
+  pre-run bytes (not to HEAD).
+- Sync failure (check still failing after fix runs, unresolved QUESTION, guard, Cline error): return the evidence and
+  restore by default; `keepOnFailure: true` keeps the changes, reported unverified.
+- HEAD/index identity checked before/after each run, after verification and before restore; a change → refuse, keep
+  the recovery snapshot, report (replaces the old soft-reset recovery in edits).
+- Fix prompt: objective, latest caller guidance, exact command/args, exit/timeout/output-limit status, redacted tails;
+  "fix the code, never weaken or bypass the check". Fits 20,000 prompt / 8,000 system / 24,000 combined / Windows
+  32,000; optional context (map, older history, long tails) trimmed first.
+- `{none: true, reason}`: strict, reason 10-500 chars, reported as `required: false, passed: null`.
+- Async QUESTION during a fix: `input_required` (`cline_question`), edits, snapshot and lock kept. Cancel at any phase:
+  stop processes, restore, then publish the terminal state, release the lock; keep recovery evidence if restore fails.
+- Budgets: guard budgets cumulative over first run, fixes, resumes and manual retries (never refunded); no hidden
+  runner retries in this lifecycle; an overall active-time budget besides the per-check timeout. A refused or missing
+  verify executable fails at once without spending fix runs.
+- `cline_send` actions for edits: `retry` (one more fix run with guidance; does not reset the automatic count),
+  `restore`, `keep`. `skip` and `stop` are removed.
+- `log_run_hint.ok` only for success with a passing check or `none`; null while waiting, cancelled, or local failure.
+- Order: shared lifecycle module + sync/async adapters with converted tests → delete step orchestration → docs →
+  review → live. D-33's micro-step fallback and the OpenCode port are superseded.
+
+| Step | Work | Done when |
+|---|---|---|
+| 12.0 | Plan, Codex review, agreement. | Done 2026-11-13 (D-34). |
+| 12.1 | Remove micro-step orchestration; keep building blocks; tests updated. | Suite green, no `steps` in schemas or README. |
+| 12.2 | Mandatory `verify` + automatic fix runs, sync and async; `cline_send` retry/restore/keep; result shape. | Tests: pass first time; fail→fix→pass; fail after fixes (sync report, async wait); restore; keep; `none` opt-out; guard trip. |
+| 12.3 | README and tool descriptions. | Docs match code. |
+| 12.R | AGY review. | No open findings. |
+| 12.L | Live: the 7-check experiment, 3 runs with the final check as the full check suite. | Every run ends 7/7 or reports the failure; cost close to a single run. |
+
 ## Later — the same micro-steps for OpenCode (owner's idea, 2026-11-10)
 
 Once Stage 9 works with Cline, apply it to the OpenCode helper (`C:\Develop\openCodeHelperMcp`), where

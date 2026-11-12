@@ -73,6 +73,12 @@ Status values: `todo`, `in progress`, `done`, `blocked`, `skipped`.
 | 11.3 | Budgets and docs | done | 2026-11-12 | stepBudget per step and per plan from summed guard counters; README Micro-steps section; 297 tests |
 | 11.R | Verify: code review | done | 2026-11-12 | AGY approved both halves; 4 low findings (stale .reap, close before unlink, drive-letter case, verify resolution errors) fixed by Codex; 301 tests pass |
 | 11.L | Verify: live comparison | done | 2026-11-12 | stage11-results.md: single 2/2, micro-steps 2/2 (all 4 checks); micro-steps ~2x time and tokens; question path verified live |
+| 12.0 | Plan and Codex review | done | 2026-11-13 | Codex review (16 points) folded in; sync restores by default (D-34) |
+| 12.1 | Remove micro-step orchestration | todo |  |  |
+| 12.2 | Mandatory verify with automatic fixes | todo |  |  |
+| 12.3 | Docs | todo |  |  |
+| 12.R | Verify: code review | todo |  |  |
+| 12.L | Verify: live rerun | todo |  |  |
 
 | X.1 | `ask_cline` no-tools notice + Windows length guard (D-21) | done | 2026-11-09 | Codex analysis + review (3 rounds: Windows command-line length, UTF-16 count) PASS; 139 tests; live 0 tool calls / 1 iteration |
 

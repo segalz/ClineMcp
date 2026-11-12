@@ -218,6 +218,14 @@ port micro-steps to OpenCode for now.
 **Why:** Experiment 2 (stage11-results.md): single runs passed 20/21 checks at ~100 s / 250k tokens; micro-steps
 21/21 at ~4x time and tokens. The only single-run miss was silent, which a final check catches cheaply.
 
+### D-34 — 2026-11-13 — Remove micro-step orchestration; mandatory final check with automatic fixes
+**Decision:** Every edit run requires `verify` (or an explicit, reasoned `none`). After a failing check the bridge
+gives Cline up to 2 automatic fix runs with the failure output; then async tasks wait (retry / restore / keep) and
+sync calls return the evidence and restore by default. `steps` and the micro-step orchestration are removed; the
+snapshot, lock and verification blocks stay. Supersedes D-33's micro-step fallback.
+**Why:** Owner, 2026-11-13, after experiment 2: micro-steps were redundant at ~4x cost; the real risk is a silent
+miss, which a mandatory check plus fixes handles. Codex plan review: sync cannot pause, so restore by default.
+
 ### D-13 — 2026-11-09 — Codex replaces Grok; Grok is out
 **Decision:** Pre-code analysis and `n.R` code review go to Codex (`codex_ask`, read-only sandbox).
 Fallback: AGY, then OpenCode. Grok is not used in this project. Supersedes the Grok parts of D-12.
