@@ -123,7 +123,7 @@ test("sync edits refuses a held checkout before launching Cline", async t => {
   const { root, locks } = await fixture(t);
   const release = acquire(root, { lockDirectory: locks }); t.after(release);
   await mkdir(path.join(root, "subdir"));
-  await assert.rejects(applyClineEdits({ cwd: path.join(root, "subdir"), prompt: "edit", provider: "p", model: "m" }, undefined,
+  await assert.rejects(applyClineEdits({ cwd: path.join(root, "subdir"), prompt: "edit", provider: "p", model: "m", verify: { none: true as const, reason: "Lock behavior fixture" } }, undefined,
     { checkoutLockDirectory: locks }), busy);
 });
 
@@ -133,7 +133,7 @@ test("async edits retains its lock across waiting and resume, blocks sync/async 
   const manager = new TaskManager({ traceBase: path.join(base, "traces"), runOptions: { checkoutLockDirectory: locks },
     gitDiffStat: async () => "", runners: { edits: (_input, _signal, options) => new Promise(resolve => runs.push({ resolve, options })) } });
   t.after(() => manager.shutdown());
-  const input = { mode: "edits" as const, cwd: root, prompt: "edit", provider: "p", model: "m" };
+  const input = { mode: "edits" as const, cwd: root, prompt: "edit", provider: "p", model: "m", verify: { none: true as const, reason: "Lock behavior fixture" } };
   const first = manager.start(input);
   await until(async () => runs.length === 1);
   const lease = runs[0].options.checkoutLock;
@@ -147,7 +147,7 @@ test("async edits retains its lock across waiting and resume, blocks sync/async 
   const failed = await manager.result(second.taskId);
   assert.match(failed.error!, /checkout_busy/); assert.equal(failed.log_run_hint, null); assert.equal(runs.length, 1);
   await manager.send(first.taskId, "Continue");
-  assert.equal(runs.length, 2); assert.equal(runs[1].options.checkoutLock, lease);
+  await until(async () => runs.length === 2); assert.equal(runs[1].options.checkoutLock, lease);
   runs[1].resolve({ text: "done", durationMs: 1 });
   await until(async () => (await manager.status(first.taskId, 0)).state === "done");
   const release = acquire(root, { lockDirectory: locks }); release();
@@ -155,7 +155,7 @@ test("async edits retains its lock across waiting and resume, blocks sync/async 
 
 test("async edits releases on runner failure, waiting cancellation, shutdown and active abort", async t => {
   const { root, locks, base } = await fixture(t);
-  const input = { mode: "edits" as const, cwd: root, prompt: "edit", provider: "p", model: "m" };
+  const input = { mode: "edits" as const, cwd: root, prompt: "edit", provider: "p", model: "m", verify: { none: true as const, reason: "Lock behavior fixture" } };
   for (const action of ["failure", "cancel-wait", "shutdown-wait", "cancel-active"] as const) {
     let launched = false;
     const manager = new TaskManager({ traceBase: path.join(base, action), runOptions: { checkoutLockDirectory: locks },
@@ -168,11 +168,11 @@ test("async edits releases on runner failure, waiting cancellation, shutdown and
     t.after(() => manager.shutdown());
     const task = manager.start(input);
     await until(async () => launched);
-    if (action === "failure") await until(async () => (await manager.status(task.taskId, 0)).state === "failed");
+    if (action === "failure") { await until(async () => (await manager.status(task.taskId, 0)).state === "input_required"); await manager.send(task.taskId, "", "restore"); await until(async () => (await manager.status(task.taskId, 0)).state === "done"); }
     else if (action === "cancel-active") await manager.cancel(task.taskId);
     else {
       await until(async () => (await manager.status(task.taskId, 0)).state === "input_required");
-      if (action === "shutdown-wait") await manager.shutdown(); else await manager.cancel(task.taskId);
+      if (action === "shutdown-wait") await manager.shutdown(30_000); else await manager.cancel(task.taskId);
     }
     const release = acquire(root, { lockDirectory: locks }); release();
     await manager.shutdown();

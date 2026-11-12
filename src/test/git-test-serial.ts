@@ -9,7 +9,7 @@ import { acquire, CheckoutBusyError, type CheckoutRelease } from "../checkoutloc
 // Serialize those files, rather than changing production scan budgets or weakening content assertions.
 const root = path.join(os.tmpdir(), "cline-mcp-git-tests", createHash("sha256").update(process.cwd()).digest("hex"));
 await mkdir(root, { recursive: true });
-const deadline = Date.now() + 180_000;
+const deadline = Date.now() + 600_000;
 let release: CheckoutRelease;
 while (true) {
   try { release = acquire(root, { lockDirectory: path.join(root, "locks") }); break; }

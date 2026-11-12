@@ -958,7 +958,7 @@ test("budget uses the exact system prompt that applyClineEdits passes", async ()
     }) as any
   };
 
-  await applyClineEdits({ prompt: "edit test", cwd: process.cwd(), codeMap: false, ...sel }, undefined, {
+  await applyClineEdits({ prompt: "edit test", cwd: process.cwd(), codeMap: false, verify: { none: true, reason: "System prompt fixture" }, ...sel }, undefined, {
     deps: mockDeps as any, checkoutLockDirectory: path.join(root, "locks")
   });
   assert.equal(capturedSystemPrompt, buildEditSystemPrompt(process.cwd()), "applyClineEdits passes the per-run environment and mode prompt");
@@ -1273,7 +1273,3 @@ test("minimum budget check rejects send when question + options + answer togethe
 
   await m.shutdown(1000);
 });
-
-
-
-

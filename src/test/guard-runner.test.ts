@@ -38,7 +38,7 @@ const editsRepo = path.join(root, "edits-repo");
 await mkdir(editsRepo);
 assert.equal(spawnSync(process.platform === "win32" ? "git.exe" : "git", ["-C", editsRepo, "init", "--quiet"], { windowsHide: true }).status, 0);
 
-async function waitForEditsRun(c: ReturnType<typeof controllable>) {
+async function waitForWorkspaceRun(c: ReturnType<typeof controllable>) {
   const deadline = Date.now() + 5000;
   while (!c.runs.length) {
     assert.ok(Date.now() < deadline, "edits runner did not launch after lock acquisition");
@@ -434,17 +434,17 @@ test("tasks: hintFor maps loop_detected and budget_exceeded to crash with error 
 
 test("tasks: run ending in loop_detected transitions to input_required with bridge question and history", async t => {
   const c = controllable();
-  const m = new TaskManager({ runners: { edits: c.runner }, traceBase: traceBase(), runOptions: { checkoutLockDirectory: path.join(root, "locks") } });
+  const m = new TaskManager({ runners: { workspace: c.runner }, traceBase: traceBase(), runOptions: { checkoutLockDirectory: path.join(root, "locks") } });
   t.after(() => m.shutdown());
 
   const started = m.start({
-    mode: "edits",
+    mode: "workspace",
     prompt: "fix the bug in src/handler.ts",
     cwd: editsRepo,
     ...sel
   });
   assert.equal(started.state, "running");
-  await waitForEditsRun(c);
+  await waitForWorkspaceRun(c);
 
   const guardReport: GuardReport = {
     kind: "loop_detected",
@@ -624,17 +624,17 @@ test("tasks: normal task run completes untouched", async () => {
 
 test("P2 resume content: resumed context includes tool + target, last errors (<=3x200), files touched, and last assistant text (<=400)", async t => {
   const c = controllable();
-  const m = new TaskManager({ runners: { edits: c.runner }, traceBase: traceBase(), runOptions: { checkoutLockDirectory: path.join(root, "locks") } });
+  const m = new TaskManager({ runners: { workspace: c.runner }, traceBase: traceBase(), runOptions: { checkoutLockDirectory: path.join(root, "locks") } });
   t.after(() => m.shutdown());
 
   const started = m.start({
-    mode: "edits",
+    mode: "workspace",
     prompt: "update server endpoint",
     cwd: editsRepo,
     ...sel
   });
 
-  await waitForEditsRun(c);
+  await waitForWorkspaceRun(c);
 
   const tripReport: GuardReport = {
     kind: "loop_detected",

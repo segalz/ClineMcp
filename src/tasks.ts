@@ -11,6 +11,7 @@ import {
 import { formatReportSummary, type GuardOptions, type GuardReport } from "./guard.js";
 import { askClineWorkspace, buildWorkspaceSystemPrompt, WORKTREE_BASE } from "./workspace.js";
 import { applyClineEdits, buildEditSystemPrompt, editsCheckoutRoot, runClineEditStep } from "./edits.js";
+import { FinalCheckLifecycle, type VerifySpec, type FinalVerification, type EditAction } from "./finalcheck.js";
 import { acquire, type CheckoutRelease } from "./checkoutlock.js";
 import { resolveTraceBase, type TraceInfo, type TraceRecorder, type TraceStatus } from "./trace.js";
 import { takeSnapshot, restoreSnapshot, discardSnapshot, headAndIndexIdentity, type SnapshotOptions } from "./snapshot.js";
@@ -33,6 +34,8 @@ export interface StartTaskInput {
   codeMap?: boolean;
   steps?: StepDefinition[];
   stepBudget?: StepBudget;
+  verify?: VerifySpec;
+  maxFixRuns?: number;
 }
 
 /** Async tasks may run longer than the sync tools' 300 s. */
@@ -194,7 +197,7 @@ export function isPromptTooLarge(
   const sysPrompt = task.mode === "workspace" ? buildWorkspaceSystemPrompt(effectiveCwd, platform)
     : task.mode === "edits" ? buildEditSystemPrompt(effectiveCwd, platform) : undefined;
   if ((sysPrompt?.length ?? 0) > MAX_SYSTEM_PROMPT_CHARACTERS ||
-      prompt.length + (sysPrompt?.length ?? 0) > MAX_TOTAL_TEXT_CHARACTERS) return true;
+      prompt.length + (sysPrompt?.length ?? 0) + preamble.length + codeMap.length > MAX_TOTAL_TEXT_CHARACTERS) return true;
   if (platform === "win32") {
     const windowsEntry = resolveClineEntry(deps?.entryPath) ??
       (process.env.APPDATA ? path.join(process.env.APPDATA, "npm", "node_modules", "cline", "bin", "cline") : "C:\\npm\\node_modules\\cline\\bin\\cline");
@@ -393,6 +396,7 @@ export interface TaskRunHistoryItem {
 }
 
 export interface Task {
+  finalCheck?: FinalCheckLifecycle;
   plan?: PlanView;
   stepExecution?: StepExecution;
   waitReason?: WaitReason;
@@ -437,6 +441,8 @@ export interface Task {
 export interface LogRunHint { ok: boolean; error_kind?: "timeout" | "quota" | "crash"; retry_after_s?: number; error_text?: string; duration_s: number; }
 
 export interface TaskStatusView {
+  verification?: FinalVerification;
+  phase?: FinalCheckLifecycle["phase"];
   plan?: PlanView;
   waitReason?: WaitReason;
   evidence?: Record<string, unknown>;
@@ -477,6 +483,8 @@ const LOCAL_FAILURE_KINDS = new Set([
 function noteFor(task: Task): string | undefined {
   if (task.state === "cancelled") return "Cancelled by the caller: do not log.";
   if (task.state === "input_required" || task.state === "resuming") return "Task requires caller input: do not log.";
+  if (task.finalCheck && task.finalCheck.launches === 0) return "Local lifecycle failure before any model run: do not log.";
+  if (task.finalCheck?.error instanceof VerificationError) return "Local verifier failure: do not log.";
   if (task.error instanceof ClineRunError && LOCAL_FAILURE_KINDS.has(task.error.kind)) {
     return `Local failure (${task.error.kind}), not a model run: do not log.`;
   }
@@ -491,6 +499,12 @@ function errorText(error: unknown): string {
 export function hintFor(task: Task): LogRunHint | null {
   const activeDuration = task.activeMs || ((task.endedAt ?? Date.now()) - task.startedAt);
   const duration_s = Math.round(activeDuration / 100) / 10;
+  if (task.finalCheck) {
+    if (noteFor(task)) return null;
+    const verification = task.finalCheck.verification;
+    if (task.state === "done") return { ok: !verification.restored && !verification.kept &&
+      (verification.passed === true || !verification.required), duration_s };
+  }
   if (task.state === "done") return task.plan && task.outcome !== "completed"
     ? { ok: false, error_kind: "crash", error_text: `Plan ${task.outcome}.`, duration_s }
     : { ok: true, duration_s };
@@ -738,8 +752,45 @@ export class TaskManager {
   }
 
   private releaseCheckout(task: Task): void {
+    task.finalCheck?.release();
     task.checkoutLock?.();
     task.checkoutLock = undefined;
+  }
+
+  /** Publish waiting/terminal only after the entire lifecycle segment has settled. */
+  private launchFinalCheck(task: Task, action?: EditAction | "cancel", message = ""): void {
+    const lifecycle = task.finalCheck!;
+    if (action === "retry") lifecycle.preview(message); // Validate before mutating waiting state.
+    task.state = action ? "resuming" : "running";
+    task.controller = new AbortController();
+    task.question = undefined; task.reportedQuestion = undefined; task.endedAt = undefined;
+    const started = this.wallNow();
+    let nextState: TaskState = "failed";
+    let nextError: unknown;
+    task.settled = (async () => {
+      if (action === "restore" || action === "cancel") await lifecycle.restore();
+      else if (action === "keep") await lifecycle.keep();
+      else await lifecycle.execute(task.controller.signal, action === "retry" ? message : undefined);
+      if (task.controller.signal.aborted && action !== "cancel" && !lifecycle.verification.restored) await lifecycle.restore();
+      if (action === "cancel" || task.controller.signal.aborted) {
+        nextState = "cancelled"; nextError = new ClineRunError("cancelled", "The task was cancelled.");
+      } else if (lifecycle.phase === "waiting") {
+        nextState = lifecycle.lock ? "input_required" : "failed"; nextError = lifecycle.error;
+      } else { nextState = "done"; }
+    })().catch(error => {
+      nextError = error; nextState = "failed";
+      lifecycle.evidence.cleanupError = redactSecrets(String(error));
+    }).finally(() => {
+      task.waitReason = lifecycle.waitReason; task.evidence = lifecycle.evidence;
+      task.question = lifecycle.question ?? (nextState === "input_required" ? {
+        question: `Edit stopped: ${lifecycle.waitReason}. Retry with guidance, restore baseline, or keep unverified changes?`,
+        options: ["retry", "restore", "keep"] } : undefined);
+      task.result = { ...lifecycle.result, text: lifecycle.result?.text ?? "", durationMs: lifecycle.durationMs,
+        usage: lifecycle.usage, cost: lifecycle.cost, verification: structuredClone(lifecycle.verification) };
+      task.endedAt = this.wallNow(); task.activeMs += task.endedAt - started;
+      if (nextState !== "input_required") this.releaseCheckout(task);
+      task.error = nextError; task.state = nextState;
+    });
   }
 
   private checkCancelled(task: Task): void {
@@ -1114,16 +1165,57 @@ export class TaskManager {
         budget: { limits: { ...DEFAULT_STEP_BUDGET, ...input.stepBudget }, totalToolCalls: 0, totalInputTokens: 0 } };
       task.stepExecution = { definitions: input.steps, launches: 0, usage: Object.create(null), cost: 0, durationMs: 0 };
     }
+    if (input.mode === "edits" && !input.steps) {
+      task.finalCheck = new FinalCheckLifecycle({ prompt: input.prompt, cwd: input.cwd!, verify: input.verify!,
+        maxFixRuns: input.maxFixRuns, guard: input.guard, timeoutSeconds: input.timeoutSeconds ?? DEFAULT_TASK_TIMEOUT_SECONDS }, {
+        resolveRoot: editsCheckoutRoot, snapshotOptions: this.deps.snapshotOptions,
+        lockDirectory: this.deps.runOptions?.checkoutLockDirectory, verify: this.deps.runVerification,
+        question: parseQuestionFromText,
+        fits: prompt => !isPromptTooLarge(prompt, task, getEffectivePreamble("edits", this.deps.runOptions?.promptPreamble ?? ""),
+          this.deps.platform ?? process.platform, this.deps.runOptions?.deps),
+        run: async (prompt, signal, lock, guard, remainingSeconds, run) => {
+          task.cwd = task.finalCheck!.root;
+          if (run > 1) {
+            task.run = run;
+            const runId = `${task.id}-run-${run}`, dir = path.join(resolveTraceBase(this.deps.traceBase), runId);
+            task.trace = { runId, dir, events: path.join(dir, "events.ndjson"), status: path.join(dir, "status.json") };
+            task.runs.push(task.trace);
+          }
+          task.recorder = undefined;
+          const options: Partial<ClineInvocationOptions> = { ...this.deps.runOptions, checkoutLock: lock,
+            trace: true, traceRunId: task.trace.runId, maxAttempts: 1, maxTimeoutSeconds: MAX_TASK_TIMEOUT_SECONDS,
+            promptPreamble: (this.deps.runOptions?.promptPreamble ?? "") + TASK_QUESTION_PREAMBLE,
+            guard, onTraceStart: recorder => { task.recorder = recorder; } };
+          if (this.deps.traceBase) options.deps = { ...options.deps, traceBase: this.deps.traceBase };
+          try {
+            const result = await (this.deps.runners?.edits ?? runClineEditStep)({ prompt, cwd: task.cwd, provider: task.provider,
+              model: task.model, thinking: task.thinking, timeoutSeconds: remainingSeconds, guard, codeMap: task.codeMap }, signal, options);
+            task.runHistory ??= []; task.runHistory.push({ run, trace: task.trace, guard: result.guard });
+            task.guardReport = result.guard; return result;
+          } catch (error) {
+            task.runHistory ??= []; task.runHistory.push({ run, trace: task.trace, error: errorText(error), guard: (error as ClineRunError)?.guard });
+            task.guardReport = (error as ClineRunError)?.guard; throw error;
+          }
+        }
+      });
+    }
     this.tasks.set(id, task);
-    if (task.plan) this.launchPlan(task); else this.executeRun(task, input.prompt, trace);
+    if (task.finalCheck) this.launchFinalCheck(task);
+    else if (task.plan) this.launchPlan(task); else this.executeRun(task, input.prompt, trace);
     return this.view(task);
   }
 
-  async send(taskId: string, message = "", action: StepAction = "retry"): Promise<TaskStatusView> {
+  async send(taskId: string, message = "", action: StepAction | EditAction = "retry"): Promise<TaskStatusView> {
     if (this.closing) throw new ClineRunError("cancelled", "The bridge is shutting down; no new tasks start.", { attempts: 0 });
     const task = this.get(taskId);
     if (task.state !== "input_required") {
       throw new ClineRunError("task_not_waiting", `Task ${taskId} is in state "${task.state}", not "input_required". cline_send can only be called on tasks waiting for input.`, { attempts: 0 });
+    }
+    if (task.finalCheck) {
+      if (!["retry", "restore", "keep"].includes(action) || typeof message !== "string" || message.length > 20_000)
+        throw new ClineRunError("launch_failed", "Expected retry, restore or keep, and guidance up to 20000 characters.");
+      if (action === "retry" && this.running().length >= MAX_RUNNING_TASKS) throw new ClineRunError("task_limit", "At most two tasks run at once.");
+      this.launchFinalCheck(task, action as EditAction, message); return this.view(task);
     }
     if (task.plan) {
       if (!["retry", "skip", "stop"].includes(action) || typeof message !== "string" || message.length > 20_000) {
@@ -1133,7 +1225,7 @@ export class TaskManager {
         throw new ClineRunError("budget_exceeded", "This step allows only skip or stop.", { attempts: 0 });
       }
       if (action !== "stop" && this.running().length >= MAX_RUNNING_TASKS) throw new ClineRunError("task_limit", "At most two tasks run at once.", { attempts: 0 });
-      this.launchPlan(task, action, message);
+      this.launchPlan(task, action as StepAction, message);
       return this.view(task);
     }
     if (action !== "retry") throw new ClineRunError("launch_failed", "skip and stop require a step plan.", { attempts: 0 });
@@ -1295,6 +1387,8 @@ export class TaskManager {
       ...(task.state === "failed" || task.state === "cancelled" ? { error: errorText(task.error).slice(0, 2000) } : {}),
       resultReady: task.state !== "running" && task.state !== "resuming",
       trace: task.trace,
+      ...(task.finalCheck ? { verification: structuredClone(task.finalCheck.verification), phase: task.finalCheck.phase,
+        waitReason: task.waitReason, evidence: structuredClone(task.evidence) } : {}),
       ...(task.plan ? { plan: structuredClone(task.plan), outcome: task.outcome,
         waitReason: task.waitReason, evidence: structuredClone(task.evidence) } : {})
     };
@@ -1326,6 +1420,12 @@ export class TaskManager {
   /** Stops the task's Cline process and waits briefly for it to settle. */
   async cancel(taskId: string, waitMs = 5000): Promise<TaskStatusView> {
     const task = this.get(taskId);
+    if (task.finalCheck) {
+      if (task.finalCheck.phase === "done") { await task.settled; return this.view(task); }
+      if (task.state === "input_required") this.launchFinalCheck(task, "cancel");
+      else if (task.state === "running" || task.state === "resuming") task.controller.abort();
+      await task.settled; return this.view(task);
+    }
     if (task.plan) {
       if (task.state === "input_required") this.launchPlan(task, "cancel");
       else if (task.state === "running" || task.state === "resuming") task.controller.abort();
@@ -1361,6 +1461,8 @@ export class TaskManager {
     const hint = hintFor(task);
     const out = {
       state: task.state,
+      ...(task.finalCheck ? { verification: structuredClone(task.finalCheck.verification), waitReason: task.waitReason,
+        evidence: structuredClone(task.evidence) } : {}),
       ...(task.plan ? { plan: structuredClone(task.plan), outcome: task.outcome, waitReason: task.waitReason,
         evidence: structuredClone(task.evidence), result: { ...task.result, usage: structuredClone(task.stepExecution!.usage),
           durationMs: task.stepExecution!.durationMs, cost: task.stepExecution!.cost, trace: undefined } } : {}),
@@ -1392,6 +1494,10 @@ export class TaskManager {
     this.closing = true;
     const toSettle: Task[] = [];
     for (const t of this.tasks.values()) {
+      if (t.finalCheck && ["running", "resuming", "input_required"].includes(t.state)) {
+        if (t.state === "input_required") this.launchFinalCheck(t, "cancel"); else t.controller.abort();
+        toSettle.push(t); continue;
+      }
       if (t.plan && (t.state === "running" || t.state === "resuming" || t.state === "input_required")) {
         if (t.state === "input_required") this.launchPlan(t, "cancel"); else t.controller.abort();
         toSettle.push(t);

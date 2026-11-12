@@ -1,12 +1,13 @@
 import { spawn } from "node:child_process";
 import path from "node:path";
 import { buildEnvironmentLine, WORKING_RULES } from "./rules.js";
-import { withCodeMap } from "./codemap.js";
-import { acquire, ownsCheckoutLock } from "./checkoutlock.js";
+import { withCodeMap, codeMapCommandLineLength } from "./codemap.js";
+import { FinalCheckLifecycle, verificationSchema, type VerifySpec, type FinalVerification } from "./finalcheck.js";
+import { ownsCheckoutLock } from "./checkoutlock.js";
 import {
   defaultKillTree,
   ClineRunError,
-  hasMadeToolCallsOrModifications,
+  MAX_SYSTEM_PROMPT_CHARACTERS, MAX_TOTAL_TEXT_CHARACTERS, WINDOWS_COMMAND_LINE_LIMIT,
   runCline,
   type AskClineInput,
   type ClineInvocationOptions,
@@ -22,6 +23,9 @@ export interface ApplyClineEditsInput {
   model?: string;
   codeMap?: boolean;
   guard?: AskClineInput["guard"];
+  verify: VerifySpec;
+  maxFixRuns?: number;
+  keepOnFailure?: boolean;
 }
 
 export interface ClineEditsResponse extends ClineResponse {
@@ -30,6 +34,7 @@ export interface ClineEditsResponse extends ClineResponse {
   headBefore: string;
   headAfter: string;
   commitWasReverted: boolean;
+  verification: FinalVerification;
 }
 
 export interface ClineEditsEvidence {
@@ -82,6 +87,7 @@ function runGit(cwd: string, args: string[], signal?: AbortSignal, timeoutMs = G
     const child = spawn(gitExecutable(), ["-C", cwd, ...args], {
       shell: false,
       windowsHide: true,
+      env: { ...process.env, GIT_OPTIONAL_LOCKS: "0" },
       stdio: ["ignore", "pipe", "pipe"]
     });
     let finished = false;
@@ -131,22 +137,56 @@ export async function applyClineEdits(
   signal?: AbortSignal,
   options: Partial<ClineInvocationOptions> = {}
 ): Promise<ClineEditsResponse> {
-  const requestedCwd = path.resolve(input.cwd);
-  let repositoryRoot: string;
-  let headBefore: string;
+  const verify = verificationSchema.parse(input.verify);
+  const lifecycle: FinalCheckLifecycle = new FinalCheckLifecycle({ ...input, guard: options.guard ?? input.guard, verify, timeoutSeconds: input.timeoutSeconds ?? 180 }, {
+    resolveRoot: editsCheckoutRoot, checkoutLock: options.checkoutLock, lockDirectory: options.checkoutLockDirectory,
+    fits: prompt => editPromptFits({ ...input, cwd: lifecycle.root, prompt }, options), question: editQuestion,
+    run: (prompt, runSignal, lock, guard, remainingSeconds) => runEdits({ ...input, prompt, cwd: lifecycle.root,
+      timeoutSeconds: remainingSeconds, guard }, lifecycle.root, runSignal,
+      { ...options, checkoutLock: lock, guard, maxAttempts: 1 })
+  });
   try {
-    repositoryRoot = path.resolve(await runGit(requestedCwd, ["rev-parse", "--show-toplevel"], signal));
-    headBefore = await runGit(repositoryRoot, ["rev-parse", "HEAD"], signal);
-  } catch {
-    if (signal?.aborted) throw new ClineRunError("cancelled", "The Cline request was cancelled.", { attempts: 0 });
-    throw new ClineRunError("workspace_not_git", "The requested cwd must be inside a Git repository with at least one commit.");
-  }
+    await lifecycle.execute(signal ?? new AbortController().signal);
+    if (lifecycle.phase !== "done") {
+      const reason = lifecycle.waitReason;
+      if (lifecycle.lock) {
+        try { lifecycle.evidence.gitDiff = truncateGitDiff(await runGit(lifecycle.root, ["diff", "--binary", "--no-ext-diff", "HEAD"])); }
+        catch { /* Recovery evidence must survive an inspection failure. */ }
+      }
+      if (input.keepOnFailure && !signal?.aborted && lifecycle.waitReason !== "head_changed") await lifecycle.keep();
+      else await lifecycle.restore();
+      const error = lifecycle.error instanceof ClineRunError ? lifecycle.error
+        : new ClineRunError("edits_inspection_failed", `Edit failed: ${reason ?? "verification failed"}.`);
+      Object.assign(error, { verification: lifecycle.verification, evidence: lifecycle.evidence,
+        usage: lifecycle.usage, cost: lifecycle.cost, durationMs: lifecycle.durationMs });
+      throw error;
+    }
+    if (lifecycle.cancelled) {
+      const error = new ClineRunError("cancelled", "The Cline request was cancelled.");
+      Object.assign(error, { verification: lifecycle.verification, evidence: lifecycle.evidence }); throw error;
+    }
+    const head = lifecycle.identity!.head;
+    return { ...lifecycle.result!, usage: lifecycle.usage, cost: lifecycle.cost, durationMs: lifecycle.durationMs,
+      gitDiff: truncateGitDiff(await runGit(lifecycle.root, ["diff", "--binary", "--no-ext-diff", "HEAD"])),
+      status: await runGit(lifecycle.root, ["--no-optional-locks", "status", "--short"]),
+      headBefore: head, headAfter: head, commitWasReverted: false, verification: lifecycle.verification };
+  } finally { lifecycle.release(); }
+}
 
-  const release = ownsCheckoutLock(options.checkoutLock, repositoryRoot) ? undefined
-    : acquire(repositoryRoot, { lockDirectory: options.checkoutLockDirectory });
-  try {
-    return await applyWithinLock(input, repositoryRoot, headBefore, signal, options);
-  } finally { release?.(); }
+export function editQuestion(text: string): { question: string; options?: string[] } | undefined {
+  const lines = text.split(/\r?\n/).filter(line => line.trim());
+  const last = lines.at(-1) ?? "";
+  const options = /^ {0,3}OPTIONS:\s*(.+)$/i.exec(last);
+  const question = /^ {0,3}QUESTION:\s*(.+)$/i.exec(options ? lines.at(-2) ?? "" : last)?.[1]?.trim();
+  return question ? { question, ...(options ? { options: options[1].split("|").map(v => v.trim()).filter(Boolean).slice(0, 5) } : {}) } : undefined;
+}
+
+export function editPromptFits(input: Omit<ApplyClineEditsInput, "verify">, options: Partial<ClineInvocationOptions> = {}): boolean {
+  const systemPrompt = buildEditSystemPrompt(path.resolve(input.cwd), options.deps?.platform ?? process.platform);
+  return input.prompt.length <= 20_000 && systemPrompt.length <= MAX_SYSTEM_PROMPT_CHARACTERS &&
+    input.prompt.length + systemPrompt.length + (options.promptPreamble?.length ?? 0) <= MAX_TOTAL_TEXT_CHARACTERS &&
+    ((options.deps?.platform ?? process.platform) !== "win32" || codeMapCommandLineLength(input,
+      { ...options, systemPrompt, autoApprove: true, cwd: input.cwd }, "") <= WINDOWS_COMMAND_LINE_LIMIT);
 }
 
 /** Resolve the same root as the sync edits path before an async task takes ownership. */
@@ -159,7 +199,7 @@ export async function editsCheckoutRoot(cwd: string, signal?: AbortSignal): Prom
 }
 
 /** A task-owned step must inspect identity itself: no Git status refresh or commit recovery is allowed here. */
-export async function runClineEditStep(input: ApplyClineEditsInput, signal: AbortSignal,
+export async function runClineEditStep(input: Omit<ApplyClineEditsInput, "verify">, signal: AbortSignal,
   options: Partial<ClineInvocationOptions>): Promise<ClineResponse> {
   if (!ownsCheckoutLock(options.checkoutLock, input.cwd)) {
     throw new ClineRunError("checkout_busy", "A step requires its task's checkout lock.", { attempts: 0 });
@@ -167,93 +207,10 @@ export async function runClineEditStep(input: ApplyClineEditsInput, signal: Abor
   return runEdits(input, input.cwd, signal, options);
 }
 
-async function runEdits(input: ApplyClineEditsInput, repositoryRoot: string, signal: AbortSignal | undefined,
+async function runEdits(input: Omit<ApplyClineEditsInput, "verify">, repositoryRoot: string, signal: AbortSignal | undefined,
   options: Partial<ClineInvocationOptions>): Promise<ClineResponse> {
   return runCline({ ...input, cwd: repositoryRoot }, signal, await withCodeMap(repositoryRoot, input, {
     ...options, autoApprove: true, cwd: repositoryRoot, systemPrompt: buildEditSystemPrompt(repositoryRoot),
     provider: input.provider, model: input.model
   }, signal));
-}
-
-async function applyWithinLock(input: ApplyClineEditsInput, repositoryRoot: string, headBefore: string,
-  signal: AbortSignal | undefined, options: Partial<ClineInvocationOptions>): Promise<ClineEditsResponse> {
-
-  const canRetry = async ({ stdout }: { stdout: string; stderr: string; attempt: number }) => {
-    // Read-only checks before a retry: they follow the caller's cancel and share one short budget.
-    const deadline = Date.now() + RETRY_CHECK_GIT_BUDGET_MS;
-    const checkGit = (args: string[]) => runGit(repositoryRoot, args, signal, Math.max(1000, deadline - Date.now()));
-    try {
-      const currentHead = await checkGit(["rev-parse", "HEAD"]);
-      if (currentHead !== headBefore) return false;
-      const gitDiff = await checkGit(["diff", "--binary", "--no-ext-diff", "HEAD"]);
-      if (gitDiff.trim().length > 0) return false;
-      const status = await checkGit(["status", "--short"]);
-      if (status.trim().length > 0) return false;
-    } catch {
-      return false;
-    }
-
-    if (hasMadeToolCallsOrModifications(stdout)) {
-      return false;
-    }
-
-    return true;
-  };
-
-  const result = await runEdits(input, repositoryRoot, signal, { ...options, canRetry });
-
-  try {
-    return await inspectAfterRun(result);
-  } catch (err) {
-    // The run itself was traced; a failure while inspecting Git must not lose that trace.
-    if (err instanceof ClineRunError && result.trace && !err.trace) err.trace = result.trace;
-    throw err;
-  }
-
-  async function inspectAfterRun(result: Awaited<ReturnType<typeof runCline>>): Promise<ClineEditsResponse> {
-  // One shared budget for every post-run Git step, so inspection plus commit recovery stays inside the
-  // bridge's shutdown wait instead of 60 s per command.
-  const postRunDeadline = Date.now() + POST_RUN_GIT_BUDGET_MS;
-  const postGit = (args: string[]) => runGit(repositoryRoot, args, undefined, Math.max(1000, postRunDeadline - Date.now()));
-  let headAfter: string | undefined;
-  let gitDiff: string | undefined;
-  let status: string | undefined;
-  try {
-    headAfter = await postGit(["rev-parse", "HEAD"]);
-    gitDiff = truncateGitDiff(await postGit(["diff", "--binary", "--no-ext-diff", "HEAD"]));
-    status = await postGit(["status", "--short"]);
-  } catch {
-    throw new ClineEditsError(
-      "edits_inspection_failed",
-      "Cline finished, but the resulting Git state could not be inspected.",
-      { headBefore, ...(headAfter ? { headAfter } : {}), ...(gitDiff !== undefined ? { gitDiff } : {}), ...(status !== undefined ? { status } : {}) }
-    );
-  }
-
-  let commitWasReverted = false;
-  if (headAfter !== headBefore) {
-    const committedHead = headAfter;
-    try {
-      const headImmediatelyBeforeReset = await postGit(["rev-parse", "HEAD"]);
-      if (headImmediatelyBeforeReset !== committedHead) {
-        throw new Error("HEAD changed while preparing to cancel Cline's commit");
-      }
-      await postGit(["merge-base", "--is-ancestor", headBefore, committedHead]);
-      await postGit(["reset", "--soft", headBefore]);
-      headAfter = await postGit(["rev-parse", "HEAD"]);
-      if (headAfter !== headBefore) throw new Error("HEAD did not return to its original commit");
-      gitDiff = truncateGitDiff(await postGit(["diff", "--binary", "--no-ext-diff", "HEAD"]));
-      status = await postGit(["status", "--short"]);
-      commitWasReverted = true;
-    } catch {
-      throw new ClineEditsError(
-        "commit_created",
-        "Cline changed HEAD and the commit could not be safely cancelled. Inspect the repository before continuing.",
-        { headBefore, headAfter: committedHead, gitDiff, status }
-      );
-    }
-  }
-
-  return { ...result, gitDiff, status, headBefore, headAfter, commitWasReverted };
-  }
 }

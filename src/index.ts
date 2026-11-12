@@ -9,6 +9,7 @@ import { listFreeModels, writeCatalogSnapshot } from "./models.js";
 import { cleanupTraces } from "./trace.js";
 import { TaskManager, MAX_TASK_TIMEOUT_SECONDS, MAX_WAIT_SECONDS } from "./tasks.js";
 import { startTaskObjectSchema, startTaskSchema } from "./steps.js";
+import { verificationSchema, maxFixRunsSchema } from "./finalcheck.js";
 import { PROHIBITED_NAMES, resolveProviderSettingsPath, recoverProviderSettingsJournal } from "./settings.js";
 import {
   attachCliToObject,
@@ -119,7 +120,9 @@ server.registerTool(
   "apply_cline_edits",
   {
     description: "Have Cline implement a development task directly in the current Git checkout. Files may change, but commits are forbidden and the resulting diff is returned. " +
-      "The bridge automatically stops a run on repeated failures or budget. codeMap defaults to true; set false to omit the generated code map.",
+      "verify is required: a shell-free command or explicit {none:true, reason}. Up to maxFixRuns automatic repairs (0-3, default 2) share cumulative guard and active-time budgets. " +
+      "Failure restores the original dirty baseline unless keepOnFailure; HEAD/index changes refuse restoration and retain a recovery snapshot. " +
+      "The bridge stops on repeated failures or budget. codeMap defaults to true.",
     inputSchema: {
       prompt: z.string().min(1).max(20_000),
       cwd: z.string().min(1),
@@ -128,7 +131,10 @@ server.registerTool(
       provider: providerModelSchema,
       model: providerModelSchema,
       codeMap: z.boolean().optional().describe("Include a bounded code map before the prompt (default true)."),
-      guard: guardOptionsSchema.optional()
+      guard: guardOptionsSchema.optional(),
+      verify: verificationSchema,
+      maxFixRuns: maxFixRunsSchema.optional(),
+      keepOnFailure: z.boolean().optional()
     }
   },
   async (input, extra) => {
@@ -148,10 +154,18 @@ server.registerTool(
         headBefore: result.headBefore,
         headAfter: result.headAfter,
         commitWasReverted: result.commitWasReverted,
+        verification: result.verification,
         ...(result.warnings && result.warnings.length > 0 ? { warnings: result.warnings } : {}),
         ...(result.trace ? { trace: result.trace } : {})
       });
     } catch (error) {
+      if (error && typeof error === "object" && "verification" in error) {
+        const failure = error as Error & { kind?: string; verification: unknown; evidence?: unknown; trace?: unknown; guard?: unknown;
+          usage?: unknown; cost?: unknown; durationMs?: number };
+        return await replyJson({ kind: failure.kind ?? "edit_failed", message: failure.message,
+          verification: failure.verification, evidence: failure.evidence, trace: failure.trace, guard: failure.guard,
+          usage: failure.usage, cost: failure.cost, durationMs: failure.durationMs }, { isError: true });
+      }
       if (error instanceof ClineEditsError) {
         return await replyJson({
           kind: error.kind,
@@ -298,7 +312,11 @@ server.registerTool(
     description: "Start a Cline task in the background and return its taskId at once. mode \"ask\": answer from the prompt, " +
       "no tools; \"workspace\": read a Git repository in a disposable worktree; \"edits\": change files in the checkout " +
       "(no commits; non-step runs include a diff). Then follow it with cline_status, stop it with cline_cancel, and collect it with " +
-      `cline_result. One attempt, no automatic retry; timeoutSeconds up to ${MAX_TASK_TIMEOUT_SECONDS}; at most 2 tasks at once. ` +
+      `cline_result. timeoutSeconds up to ${MAX_TASK_TIMEOUT_SECONDS}; at most 2 tasks at once. ` +
+      "Non-step edits require verify (command or explicit none/reason), share one snapshot, and run up to maxFixRuns automatic repairs (default 2). " +
+      "Failures/questions wait with their edits and lock retained; retry performs one repair, restore returns to the original baseline, keep ends unverified. " +
+      "Their timeoutSeconds is the overall active-time budget, excluding caller waits; guards accumulate across every launch. " +
+      "Ask/workspace have one attempt and no automatic retry. " +
       "The bridge stops a run on repeated failures or budget and waits for guidance via cline_send. " +
       "codeMap defaults to true for workspace/edits, including resumed runs; ignored in ask mode. " +
       "Optional steps (edits only): 1-16 unique ids with instruction, optional relative path hints, and mandatory verify. " +
@@ -352,11 +370,12 @@ server.registerTool(
       "with message as guidance; a cline_question resumes the same step with partial edits retained. skip records an unverified " +
       "step and continues; stop ends as stopped, keeping verified changes. At a launch/resource budget only skip/stop are allowed. " +
       "Skip never refunds plan capacity or permits launches after plan exhaustion. " +
-      "Omit message for skip/stop or a retry without guidance. Tasks without steps still require a message and support retry only.",
+      "Omit message for skip/stop or a retry without guidance. Non-step edits support retry/restore/keep; retry retains partial edits and performs one repair without resetting budgets. " +
+      "Restore undoes every edit run; keep ends unverified. Ask/workspace require a message and support retry only.",
     inputSchema: z.object({
       taskId: z.string().uuid(),
       message: z.string().max(20_000).optional(),
-      action: z.enum(["retry", "skip", "stop"]).optional(),
+      action: z.enum(["retry", "restore", "keep", "skip", "stop"]).optional(),
       waitSeconds: z.number().int().min(0).max(30).optional().describe("Wait this long for first progress before returning (default 3).")
     }).strict()
   },

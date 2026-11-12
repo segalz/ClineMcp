@@ -2,6 +2,7 @@ import { z } from "zod";
 import { guardOptionsSchema, ClineRunError } from "./runner.js";
 import type { RestoreReport, SnapshotHandle } from "./snapshot.js";
 import type { VerificationResult } from "./verify.js";
+import { verificationSchema, maxFixRunsSchema } from "./finalcheck.js";
 
 export const stepPathSchema = z.string().min(1).max(4096).refine(file => {
   if (/^[\\/]|[:\x00-\x1f<>"|?*]/.test(file)) return false;
@@ -81,9 +82,14 @@ export const startTaskObjectSchema = z.object({
   codeMap: z.boolean().optional(),
   guard: guardOptionsSchema.innerType().strict().pipe(guardOptionsSchema).optional(),
   steps: stepsSchema.optional(),
-  stepBudget: stepBudgetSchema.optional()
+  stepBudget: stepBudgetSchema.optional(),
+  verify: verificationSchema.optional(),
+  maxFixRuns: maxFixRunsSchema.optional()
 }).strict();
 export const startTaskSchema = startTaskObjectSchema.superRefine((input, context) => {
+  if (input.mode === "edits" && !input.steps && !input.verify) context.addIssue({ code: z.ZodIssueCode.custom, path: ["verify"], message: "verify is required for edits." });
+  if (input.mode !== "edits" && (input.verify || input.maxFixRuns !== undefined)) context.addIssue({ code: z.ZodIssueCode.custom, path: ["verify"], message: "verify/maxFixRuns require edits mode." });
+  if (input.steps && (input.verify || input.maxFixRuns !== undefined)) context.addIssue({ code: z.ZodIssueCode.custom, path: ["verify"], message: "steps use their own verification; top-level verify/maxFixRuns require non-step edits." });
   if (input.steps && input.mode !== "edits") context.addIssue({ code: z.ZodIssueCode.custom, path: ["steps"], message: "steps require mode edits." });
   if (input.stepBudget && !input.steps) context.addIssue({ code: z.ZodIssueCode.custom, path: ["stepBudget"], message: "stepBudget requires steps." });
   if (Buffer.byteLength(JSON.stringify(input), "utf8") > 64 * 1024) {

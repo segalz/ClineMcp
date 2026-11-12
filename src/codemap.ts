@@ -2,7 +2,7 @@ import { spawn } from "node:child_process";
 import { lstat, readFile, realpath } from "node:fs/promises";
 import path from "node:path";
 import {
-  defaultKillTree, resolveClineEntry, windowsCommandLineLength, WINDOWS_COMMAND_LINE_LIMIT,
+  defaultKillTree, resolveClineEntry, windowsCommandLineLength, WINDOWS_COMMAND_LINE_LIMIT, MAX_TOTAL_TEXT_CHARACTERS,
   type AskClineInput, type ClineInvocationOptions
 } from "./runner.js";
 
@@ -201,6 +201,8 @@ export async function withCodeMap(
   if (input.codeMap === false) return options;
   const map = await buildCodeMap(root, {
     prompt: input.prompt, signal,
+    maxChars: Math.min(6_000, MAX_TOTAL_TEXT_CHARACTERS - input.prompt.length -
+      (options.systemPrompt ?? input.systemPrompt ?? "").length - (options.promptPreamble?.length ?? 0) - 2),
     commandLineLength: preamble => codeMapCommandLineLength(input, options, preamble)
   });
   return map ? { ...options, promptPreamble: map + "\n\n" + (options.promptPreamble ?? "") } : options;

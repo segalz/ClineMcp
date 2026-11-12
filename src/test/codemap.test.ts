@@ -222,7 +222,7 @@ test("edits integration reads the current checkout", async () => {
   const fixture = await repository({ "main.ts": "export const atHead = 1;\n" });
   await writeFile(path.join(fixture, "main.ts"), "\nexport const dirty = 2;\n");
   const fake = fakeOptions();
-  await applyClineEdits({ cwd: fixture, prompt: "Inspect main.ts", ...selection }, undefined, fake.options);
+  await applyClineEdits({ cwd: fixture, prompt: "Inspect main.ts", verify: { none: true, reason: "Code map integration fixture" }, ...selection }, undefined, fake.options);
   assert.match(fake.calls[0].args.at(-1)!, /dirty:2/);
   assert.equal(fake.calls[0].args[fake.calls[0].args.indexOf("--system") + 1], buildEditSystemPrompt(fixture));
 });
@@ -233,7 +233,8 @@ test("async workspace and edits preserve codeMap on initial and resumed runs", a
       const fake = fakeOptions(["QUESTION: Continue?", "done"]);
       const manager = new TaskManager({ runOptions: fake.options, traceBase: path.join(root, "async-traces"), gitDiffStat: async () => undefined });
       try {
-        const started = manager.start({ mode, prompt: "Inspect a.ts", cwd: repo, codeMap, ...selection });
+        const started = manager.start({ mode, prompt: "Inspect a.ts", cwd: repo, codeMap,
+          ...(mode === "edits" ? { verify: { none: true as const, reason: "Code map integration fixture" } } : {}), ...selection });
         assert.equal((await manager.status(started.taskId, 10)).state, "input_required");
         await manager.send(started.taskId, "Continue with z.py");
         assert.equal((await manager.status(started.taskId, 10)).state, "done");
