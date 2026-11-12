@@ -6,7 +6,7 @@ import { mkdtemp, writeFile, readFile, mkdir, rm, readdir } from "node:fs/promis
 import os from "node:os";
 import path from "node:path";
 import { EventEmitter } from "node:events";
-import { FinalCheckLifecycle, buildFixPrompt, verificationSchema, maxFixRunsSchema, type VerifySpec } from "../finalcheck.js";
+import { FinalCheckLifecycle, buildFixPrompt, verificationSchema, maxFixRunsSchema, startTaskSchema, editActionSchema, type VerifySpec } from "../finalcheck.js";
 import { TaskManager, type TaskStatusView, type TaskManagerDeps } from "../tasks.js";
 import { applyClineEdits, editPromptFits, editQuestion } from "../edits.js";
 import { ClineRunError } from "../runner.js";
@@ -54,6 +54,23 @@ test("strict verification union, required edits verification, and optional conte
   const prompt = buildFixPrompt("objective".repeat(1700), verify, attempt, "Latest guidance", fits);
   assert.match(prompt, /Latest guidance/); assert.match(prompt, /never weaken or bypass/); assert.ok(fits(prompt));
   assert.throws(() => buildFixPrompt("x".repeat(20000), verify, attempt, "g".repeat(20000), fits), /limits/);
+});
+
+test("start schemas reject removed orchestration fields and actions while preserving shared validation", () => {
+  const input = { mode: "edits", cwd: "repo", prompt: "Implement", provider: "p", model: "m", verify: none };
+  assert.equal(startTaskSchema.safeParse(input).success, true);
+  for (const removed of [{ steps: [] }, { stepBudget: {} }, { extra: true }, { keepOnFailure: true }])
+    assert.equal(startTaskSchema.safeParse({ ...input, ...removed }).success, false);
+  for (const mode of ["ask", "workspace"]) {
+    assert.equal(startTaskSchema.safeParse({ ...input, mode }).success, false);
+    const { verify: _verify, ...plain } = input;
+    assert.equal(startTaskSchema.safeParse({ ...plain, mode }).success, true);
+    assert.equal(startTaskSchema.safeParse({ ...plain, mode, maxFixRuns: 0 }).success, false);
+  }
+  assert.equal(startTaskSchema.safeParse({ ...input, guard: { unexpected: true } }).success, false);
+  assert.equal(startTaskSchema.safeParse({ ...input, verify: { command: "node", args: ["x".repeat(65536)] } }).success, false);
+  for (const removed of ["skip", "stop"]) assert.equal(editActionSchema.safeParse(removed).success, false);
+  for (const action of ["retry", "restore", "keep"]) assert.equal(editActionSchema.safeParse(action).success, true);
 });
 
 test("shared lifecycle passes first time and fail/fix/pass retains the original dirty baseline", async t => {
@@ -124,6 +141,7 @@ test("async exhausted verification waits with retained edits; restore, keep and 
     const first = await f.launched(1); await f.put("failed"); first.finish();
     const automatic = await f.launched(2); assert.equal(await f.bytes(), "failed"); automatic.finish();
     const waiting = await f.wait(task.taskId, "input_required");
+    assert.equal("plan" in waiting, false); assert.equal("outcome" in waiting, false);
     assert.equal(waiting.waitReason, "verify_failed"); assert.equal(waiting.verification?.fixRuns, 1);
     assert.equal((await f.manager.result(task.taskId)).log_run_hint, null);
     assert.throws(() => acquire(f.cwd, { lockDirectory: f.locks }));
@@ -132,6 +150,7 @@ test("async exhausted verification waits with retained edits; restore, keep and 
     const done = await f.wait(task.taskId, "done");
     assert.equal(done.verification?.restored, action === "restore"); assert.equal(done.verification?.kept, action === "keep");
     const result = await f.manager.result(task.taskId); assert.equal(result.log_run_hint?.ok, action === "retry");
+    assert.equal("plan" in result, false); assert.equal("outcome" in result, false);
     if (action === "restore") await f.clean(); else assert.equal(await f.bytes(), action === "retry" ? "pass" : "failed");
     const release = acquire(f.cwd, { lockDirectory: f.locks }); release(); assert.deepEqual(await readdir(f.snapshots), []);
   }

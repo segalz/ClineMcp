@@ -87,32 +87,30 @@ ask_cline({
 
 ### 2. `apply_cline_edits`
 
-Have Cline implement a development task directly in the current Git checkout. Files may change, but commits are forbidden and the resulting diff is returned. The bridge automatically stops a run on repeated failures or budget.
+Implement a task in the current Git checkout, then run the bridge's mandatory [final check](#final-check).
 
 ```ts
 apply_cline_edits({
   prompt: string,
-  codeMap?: boolean,
   cwd: string,
   provider: string,
   model: string,
+  verify: VerificationCommand | { none: true; reason: string },
+  maxFixRuns?: number,        // integer 0-3; default 2
+  keepOnFailure?: boolean,   // sync only; default false
+  codeMap?: boolean,
   thinking?: "none" | "low" | "medium" | "high" | "xhigh",
-  timeoutSeconds?: number,
-  guard?: {
-    maxRepeatedFailures?: number,
-    window?: number,
-    maxToolCalls?: number,
-    maxInputTokens?: number
-  }
+  timeoutSeconds?: number,   // overall active-time budget; default 180, integer 1-300
+  guard?: { maxRepeatedFailures?: number; window?: number; maxToolCalls?: number; maxInputTokens?: number }
 })
 ```
 
-- `provider`, `model`, and `cwd` (path inside a Git checkout) are required; there is no saved-default fallback.
-- Runs with `--auto-approve true` and `EDIT_SYSTEM_PROMPT`; Git commits and branch/history changes are forbidden (an accidental commit is soft-reset and rejected with `commit_created`).
-- `prompt` is `1`–`20,000` characters (subject to the `32,000` UTF-16 unit Windows command-line limit); `timeoutSeconds` defaults to `180` (`1`–`300`); `thinking` defaults to `"none"`.
-- Optional `guard` configuration overrides default loop/budget detection thresholds.
-- Returns `{ text, model?, durationMs, usage?, cost?, gitDiff, status, headBefore, headAfter, commitWasReverted, warnings?, trace? }` (`gitDiff` is truncated at `48,000` characters).
-- Errors return structured JSON with `kind`, `message`, `exitCode`, `attempts`, `resetAt`, `retryAfterSeconds`, `stderrTail`, `stdoutTail`, `trace`, `notes`, Git evidence, and `guard` report.
+- `provider`, `model`, `cwd` and `verify` are required. The checkout must have at least one commit.
+- Runs with `--auto-approve true` and `EDIT_SYSTEM_PROMPT`. Commits and branch/history changes are forbidden; HEAD/index changes refuse restoration and retain recovery evidence. The bridge never soft-resets a commit.
+- `prompt` is 1-20,000 characters, subject to combined text and escaped Windows command-line limits; `thinking` defaults to `"none"`.
+- Failure returns evidence and restores the original dirty baseline unless `keepOnFailure: true` explicitly keeps it unverified. Cancellation restores where identity permits.
+- Returns `{ text, model?, durationMs, usage?, cost?, gitDiff, status, headBefore, headAfter, commitWasReverted: false, verification, warnings?, trace? }`; `gitDiff` is truncated at 48,000 characters.
+- Failures return structured JSON with `kind`, `message`, `verification`, recovery `evidence` and available trace/guard/usage/cost metrics.
 
 ### 3. `ask_cline_workspace`
 
@@ -177,214 +175,147 @@ cline_list_models({})
 
 ### 6. `cline_start`
 
-Start a Cline task asynchronously and return its initial `TaskStatusView`. Optional edits-mode `steps` run a verified plan (see [Micro-steps](#micro-steps)). The bridge stops a run on repeated failures or budget and waits for guidance via `cline_send`.
+Start a background task and return its initial `TaskStatusView`.
 
 ```ts
 cline_start({
-  codeMap?: boolean,
   mode: "ask" | "workspace" | "edits",
   prompt: string,
   provider: string,
   model: string,
   cwd?: string,
+  verify?: VerificationCommand | { none: true; reason: string }, // required for edits only
+  maxFixRuns?: number,        // edits only; integer 0-3, default 2
+  codeMap?: boolean,
   thinking?: "none" | "low" | "medium" | "high" | "xhigh",
-  timeoutSeconds?: number,
-  waitSeconds?: number,
-  steps?: Step[],             // edits only; see Micro-steps
-  stepBudget?: StepBudget,   // requires steps; see Micro-steps
-  guard?: {
-    maxRepeatedFailures?: number,
-    window?: number,
-    maxToolCalls?: number,
-    maxInputTokens?: number
-  }
+  timeoutSeconds?: number,   // default 600; integer 1-1800
+  waitSeconds?: number,      // default 3; integer 0-30
+  guard?: { maxRepeatedFailures?: number; window?: number; maxToolCalls?: number; maxInputTokens?: number }
 })
 ```
 
-- `mode`, `prompt` (`1`–`20,000` chars), `provider`, and `model` are required (no saved-default fallback; `cwd` is required for `"workspace"` and `"edits"`).
-- Each Cline launch runs a single attempt (`maxAttempts: 1`, no automatic retry) with `timeoutSeconds` defaulting to `600` (`1`–`1800`); waits up to `waitSeconds` (default `3`, `0`–`30`) for first progress before returning.
-- Optional `guard` configuration overrides default loop/budget detection thresholds.
-- Caps and retention: at most `2` concurrent active (`"running"` or `"resuming"`) tasks (`MAX_RUNNING_TASKS`; exceeding throws `task_limit`), a `1 hour` TTL (`UNCOLLECTED_TTL_MS`) for settled uncollected tasks, and at most `20` retained settled tasks (`MAX_SETTLED_TASKS`).
-- Task states: `"running"`, `"resuming"`, `"input_required"`, `"done"`, `"failed"`, and `"cancelled"`.
-- Prepends `TASK_QUESTION_PREAMBLE` instructing Cline never to call `ask_question` and instead to stop and end its response with `QUESTION: <one question>` and an optional following line `OPTIONS: a | b | c` (matched only on the final non-empty lines with at most 3 leading spaces and no tabs, up to 5 options), which places the task in `"input_required"`.
-- When the loop guard trips, the task enters `"input_required"` with a bridge question and options rather than failing, allowing guidance via `cline_send`.
+- `mode`, `prompt` (1-20,000 characters), `provider` and `model` are required; workspace/edits also require a Git `cwd`.
+- Edits use the shared final-check lifecycle below. `verify` and `maxFixRuns` are rejected for ask/workspace; `keepOnFailure` is sync only.
+- Each Cline launch has one attempt. Ask/workspace do not retry automatically; edits may launch bounded automatic repairs after a failing check. For edits, `timeoutSeconds` covers cumulative active time across runs/checks and excludes caller waits.
+- At most 2 tasks can be running/resuming. Settled uncollected tasks have a 1-hour TTL and a 20-task retention cap. Waiting tasks retain their snapshot and checkout lock.
+- Input is strict, rejects unknown fields, and is limited to 64 KiB of serialized UTF-8 JSON.
+- Cline is instructed to end a question with `QUESTION: <question>` and optional `OPTIONS: a | b | c`. Only final non-empty lines with 0-3 leading spaces and no tabs count; at most 5 options are retained. Questions and guard trips pause for caller input.
 
 ### 7. `cline_status`
 
-Long-poll a task's live status and trace progress.
-
 ```ts
-cline_status({
-  taskId: string,
-  waitSeconds?: number
-})
+cline_status({ taskId: string, waitSeconds?: number }) // default 20; integer 0-60
 ```
 
-- `taskId` (UUID) is required; `waitSeconds` defaults to `20` (`0`–`60`, where `0` returns immediately).
-- Long-polls until the task settles (`"done"`, `"input_required"`, `"failed"`, `"cancelled"`), Cline emits a new unreported question in the trace, or `waitSeconds` elapses.
-- Returns `TaskStatusView`: `{ taskId, mode, state, elapsedMs, run, runs, runHistory?, progress?, question?, autoAnswered?, error?, resultReady, trace, plan?, waitReason?, evidence?, outcome? }`.
-- `progress` exposes live trace fields (`attempt`, `iteration`, `clineTaskId`, `currentTool`, `toolCalls`, `lastReasoning`, `lastText`, `streamingChars`, `files`, `question`, `eventsWritten`, `eventsDropped`, `finish`).
+Long-polls until settlement, a new trace question, or the requested wait expires; 0 returns immediately.
+Returns `{ taskId, mode, state, elapsedMs, run, runs, runHistory?, progress?, question?, autoAnswered?, error?, resultReady, trace, phase?, verification?, waitReason?, evidence? }`.
+States are `running | resuming | input_required | done | failed | cancelled`.
+Trace progress includes the current tool, reasoning, text, files, question and event counters.
+Edit phases are `snapshot | run | verify | restore | waiting | done`.
 
 ### 8. `cline_send`
 
-Answer a task waiting in `"input_required"`. Without a step plan this starts a fresh Cline run with accumulated context under the same `taskId`. Step plans also support retry/skip/stop as described in [Micro-steps](#micro-steps).
-
 ```ts
-cline_send({
-  taskId: string,
-  message?: string,
-  action?: "retry" | "skip" | "stop", // step plans; default retry
-  waitSeconds?: number
-})
+cline_send({ taskId: string, message?: string, action?: "retry" | "restore" | "keep", waitSeconds?: number })
 ```
 
-- Requires the task to be in `"input_required"` state (otherwise throws `task_not_waiting`) and counts toward the `2`-running-task limit while `"resuming"`/`"running"`.
-- Non-plan tasks require `message` of `1`–`20,000` characters; step plans accept an omitted/empty message. `waitSeconds` defaults to `3` (`0`–`30`) before returning the updated `TaskStatusView`.
-- Starts a new run (`run` incremented, trace `<taskId>-run-<N>`) with a prompt combining `Original task`, `Previous answer`, `Working directory diff stat` (`git diff --stat` for `"workspace"`/`"edits"`), prior Q&A pairs, and the latest `Cline question` / `Options` / `Caller answer`.
-- If the assembled prompt exceeds `20,000` characters or the `32,000`-unit Windows command-line limit, it trims `diffStat`, then `previousAnswer` (keeping the tail), then oldest Q&A pairs, then `originalPrompt` (keeping the head); if the latest question + answer alone cannot fit, it throws `launch_failed` and keeps the task in `"input_required"`.
+Requires `input_required`; `action` defaults to `retry`, and `waitSeconds` defaults to 3 (0-30).
+For edits, message is optional (at most 20,000 characters):
+
+- `retry`: retain partial edits and launch one repair with caller guidance, or resume the Cline question. It does not reset automatic-fix capacity or cumulative budgets. A launch requires a free running-task slot and remaining budget.
+- `restore`: return to the original snapshot and finish; refusal or incomplete restoration remains visible with recovery evidence.
+- `keep`: finish with current changes explicitly marked unverified. Identity refusal retains the recovery snapshot.
+
+Ask/workspace support only `retry` and require a non-empty message. They rebuild context from the original task, previous answer, workspace diff stat, Q&A and latest answer, trimming older context first. Edit repair prompts preserve the objective, latest guidance, question and check command; optional diagnostics are shortened first. Oversized mandatory content is rejected before changing the waiting state.
 
 ### 9. `cline_cancel`
 
-Stop a running or waiting Cline task.
-
 ```ts
-cline_cancel({
-  taskId: string
-})
+cline_cancel({ taskId: string })
 ```
 
-- Non-plan tasks abort a `"running"` or `"resuming"` run (killing its Cline process tree and waiting up to `5 s` to settle) or transition a waiting task to `"cancelled"`. Step plans additionally wait for unverified-step rollback and lock release before cancellation returns.
-- Returns the `TaskStatusView` with `state: "cancelled"`.
-- Does not remove the task; call `cline_result` afterwards to collect it and clean up its traces.
+Edits abort the active process and wait for baseline restoration and lock release before publishing cancellation. Identity refusal or incomplete restoration retains recovery evidence. Once completion has committed, cancellation waits for the settled result.
+Ask/workspace abort running/resuming work (waiting up to 5 seconds) or cancel a waiting task.
+Collect afterwards with `cline_result`; cancellation does not remove the task.
 
 ### 10. `cline_result`
 
-Collect the final result of a finished task (or partial result of an `"input_required"` task) and its `model-picker` logging hint.
-
 ```ts
-cline_result({
-  taskId: string,
-  keepTrace?: boolean
-})
+cline_result({ taskId: string, keepTrace?: boolean })
 ```
 
-- Fails with `task_running` if the task is still `"running"` or `"resuming"`.
-- Returns `{ state, result?, error?, runHistory?, plan?, outcome?, waitReason?, evidence?, log_run_hint, log_run_note?, trace? }`.
-- `log_run_hint` is `{ ok, error_kind?: "timeout" | "quota" | "crash", retry_after_s?, error_text?, duration_s }` for `model-picker`'s `log_run`, or `null` (with `log_run_note`) when the task was `"cancelled"`, is in `"input_required"`, or failed locally before/around the model run (`workspace_not_git`, `workspace_setup_failed`, `workspace_cleanup_failed`, `settings_lock_timeout`, `settings_restore_failed`, `launch_failed`, `catalog_unavailable`, `edits_inspection_failed`, `cline_updating`, `task_*`).
-- For settled tasks (`"done"`, `"failed"`, `"cancelled"`), removes the task from memory and deletes its trace directories unless `keepTrace: true` (default `false`); for `"input_required"`, keeps the task and traces so it can be resumed with `cline_send`.
+Returns `{ state, result?, error?, runHistory?, verification?, waitReason?, evidence?, log_run_hint, log_run_note?, trace? }`.
+Running/resuming tasks throw `task_running`. Collecting a waiting task preserves it, its traces and its writer lock; collecting a terminal task removes it and deletes traces unless `keepTrace: true`.
+Usage, numeric provider breakdowns and cost are aggregated across edit launches; each run history item retains its available final guard counters.
+`log_run_hint` is null while waiting, cancelled, or on local failure. For edits, `ok: true` requires successful completion with a passing check or explicit `none`; restored/kept outcomes are not successful model results.
+The hint otherwise contains `{ ok, error_kind?: "timeout" | "quota" | "crash", retry_after_s?, error_text?, duration_s }`.
 
-## Micro-steps
+## Final check
 
-An edits task can run a caller-supplied plan sequentially. The caller supplies the objective in `prompt`;
-the bridge gives Cline one small step per fresh run, verifies it, and restores unverified changes on failure.
-No automatic planner or parallel steps are used. Calls without `steps` retain the existing single-run behavior.
+Every edit request requires a strict verification alternative:
 
 ```ts
-type Step = {
-  id: string;                    // unique; [A-Za-z0-9_-]{1,64}
-  instruction: string;           // 1-4,000 characters
-  paths?: string[];              // at most 32 relative path hints
-  verify: {                     // mandatory
-    command: string;
-    args?: string[];
-    timeoutSeconds?: number;     // default 60; integer 1-300
-  };
+type VerificationCommand = {
+  command: string;
+  args?: string[];
+  timeoutSeconds?: number; // default 60; integer 1-300
 };
-type StepBudget = {
-  maxToolCallsPerStep?: number;
-  maxInputTokensPerStep?: number;
-  maxToolCallsPerPlan?: number;
-  maxInputTokensPerPlan?: number;
-};
+type Verify = VerificationCommand | { none: true; reason: string }; // nonblank reason, 10-500 characters
 
 cline_start({
   mode: "edits", cwd: "C:\\Develop\\example", provider: "cline", model: "<available-model-id>",
-  prompt: "Add and validate the requested behavior",
-  steps: [{ id: "implement", instruction: "Implement the requested behavior and its tests", paths: ["src"],
-    verify: { command: "npm", args: ["test"], timeoutSeconds: 120 } }],
-  stepBudget: { maxToolCallsPerStep: 150, maxInputTokensPerStep: 1500000,
-    maxToolCallsPerPlan: 1000, maxInputTokensPerPlan: 10000000 }
+  prompt: "Add the requested behavior and its tests",
+  verify: { command: "npm", args: ["test"], timeoutSeconds: 120 },
+  maxFixRuns: 2
 });
 ```
 
-### Input, verification, and rollback
+The shared lifecycle acquires the checkout lock, takes one original snapshot, runs Cline, checks identity, and runs the final check.
+A passing check completes the request. A failing check launches up to `maxFixRuns` automatic repairs (0-3, default 2), checking again after each repair. A refused or missing verification executable fails immediately without spending repair runs.
+Repair prompts include the objective, latest caller guidance, exact command/arguments/cwd, exit/timeout/output-limit status and redacted tails, instructing Cline to fix the code without weakening or bypassing the check.
+They fit the 20,000-character prompt, 8,000-character system, 24,000 combined and 32,000-unit escaped Windows command-line limits; optional context is shortened first.
 
-- `steps` is accepted only with `mode: "edits"`; provide 1-16 steps. `stepBudget` requires `steps`.
-  Input is strict (unknown fields rejected) and at most 64 KiB of serialized UTF-8 JSON.
-  Path hints reject absolute paths, traversal, `.git`, Windows device names, and alternate data streams.
-- Each run receives the objective, current step, and a ledger of verified steps (id, first-line summary,
-  changed files; at most 4,000 characters). The ledger shrinks before mandatory prompt content;
-  command-line/prompt limits still apply. Existing working rules, guards, and optional code maps remain active.
-- Verification uses literal executable/argument arrays with `shell: false`, checkout-root cwd, and closed stdin.
-  No implicit shell expansion, pipelines, or batch scripts. On Windows, `npm`, `npx`, `npm.cmd`, and `npx.cmd`
-  run through `node.exe` and the installed npm's `npm-cli.js`/`npx-cli.js`. Resolution checks
-  `node_modules/npm/bin` beside `process.execPath`, then `%APPDATA%/npm/node_modules/npm/bin`.
-  Other `.cmd`/`.bat` commands are refused; plain executables resolve via PATH.
-  Pass means exit zero without timeout, cancellation, or output kill. Output above 1 MiB combined kills
-  the process tree; returned stdout/stderr tails are at most 8 KiB each and secrets are redacted.
-- Before each step, raw bytes of tracked and untracked-not-ignored files are copied outside the checkout,
-  normally under the OS temporary directory's `cline-mcp-snapshots`. Ignored files are excluded and untouched.
-  Limits are 20,000 files, 64 MiB per file, and 512 MiB total; oversized snapshots are refused before writing.
-  Submodules, nested repositories, symlinks, and reparse points are refused.
-- Failure restores modified/deleted files and removes newly added non-ignored files. Restoration never stages,
-  resets, or changes HEAD/index. If HEAD or the index changed, the task fails closed with `head_changed`
-  evidence and retains its recovery snapshot; repair identity before retry/skip, or stop for manual recovery.
-- One canonical-checkout writer lock is shared with synchronous edits, held throughout the plan and while
-  waiting. It uses an in-process lease and `~/.cline-mcp/locks`; a dead holder's lock can be reclaimed.
-  Cancel aborts the active process, waits for unverified-step rollback, and releases the lock. Failed-closed
-  identity mismatches or incomplete restoration retain recovery evidence/snapshots instead of resetting Git.
+### Verification and opt-out
 
-### Budgets and actions
+Commands use literal arguments, checkout-root cwd, closed stdin and `shell: false`; there is no implicit shell expansion or pipeline interpretation.
+On Windows, `npm`, `npx`, `npm.cmd` and `npx.cmd` resolve through Node and installed npm CLI scripts; other batch commands are refused.
+Passing requires exit zero without signal, cancellation, timeout or output kill. More than 1 MiB combined output kills the process tree; returned redacted stdout/stderr tails are at most 8 KiB each.
+`{none:true, reason}` is an explicit, reported opt-out: `required:false`, `passed:null`, no check attempts and no automatic fixes. It does not turn a Cline error or unresolved question into success.
 
-| Limit | Default | Allowed integers |
-|---|---:|---:|
-| `maxToolCallsPerStep` | 150 | 10-1,000 |
-| `maxInputTokensPerStep` | 1,500,000 | 10,000-20,000,000 |
-| `maxToolCallsPerPlan` | 1,000 | 10-1,000 |
-| `maxInputTokensPerPlan` | 10,000,000 | 10,000-20,000,000 |
+### Snapshot, lock and recovery
 
-Step counters accumulate across retries and question resumes. Each run's guard uses the remaining step
-capacity, capped by any explicit `guard.maxToolCalls` / `guard.maxInputTokens`; loop/window settings are preserved.
-Internal remaining allowances can be smaller than the public schema minima. Final guard counters are exported
-on success, questions, failures, timeouts, and cancellation (zero when nothing launched), including internal
-attempts, and summed once into step/plan counters. Usage records are not counted again as budget consumption.
+One snapshot is taken before the first Cline run and retained through all repairs and question resumes. It captures working-tree bytes of tracked and untracked non-ignored files, including dirty/binary files and tracked deletions, outside the checkout under the OS temporary directory's `cline-mcp-snapshots`. Existing staging is preserved by requiring unchanged index identity; the index itself is not backed up or restored.
+Limits are 20,000 files, 64 MiB per file and 512 MiB total; oversized or unsupported snapshots are refused. Ignored files are excluded and left untouched; submodules, nested repositories, symlinks and reparse points are refused.
+Restoration restores modified/deleted baseline files and removes newly created non-ignored files, preserving the owner's pre-run bytes rather than reverting to HEAD. It never stages files or changes HEAD/index.
+HEAD/index identity is checked before/after Cline runs, after verification and before restoration. Changes or failed identity inspection refuse restoration and preserve recovery evidence/snapshots; incomplete restoration also retains the snapshot. No Git reset is attempted.
+A canonical-checkout writer lock is shared by sync and async edits and retained across async waits. Dead-holder locks can be reclaimed. The lock excludes other bridge writers; use the checkout exclusively to avoid external edits being overwritten during restoration.
+Sync failures restore by default; `keepOnFailure:true` keeps failed edits explicitly unverified. Async failures pause with `verify_failed | cline_question | guard | cline_error | head_changed | budget` and permit retry/restore/keep. Questions retain partial edits and defer verification until answered. Cancellation aborts work, restores where identity permits, then releases the lock.
 
-Exceeding a step or plan limit restores the current unverified step and waits with `waitReason: "budget"`;
-only skip/stop are allowed. A completed run exactly at a limit can pass verification, but no new run starts
-when that step or plan has no capacity left. Plan totals are checked after each run, before verification or
-advancement. Previously verified steps are retained; retries, restore, and skip do not refund spent capacity.
-Skipping after plan exhaustion cannot launch another step: it remains budget-blocked, allowing further skip/stop.
+### Budgets and result
 
-- `cline_send({taskId, action: "retry", message: "guidance"})` (the default action) restores a failed step's
-  baseline and launches it with guidance and failure evidence. A `cline_question` instead retains partial edits
-  and resumes the same step with its Q&A context. Every step allows at most three Cline launches, including resumes.
-- `action: "skip"` restores the unverified step, records it as skipped, and advances without adding it to the
-  verified ledger. `message` may be omitted.
-- `action: "stop"` restores the unverified step where safe and ends the plan as stopped, preserving verified
-  changes. `message` may be omitted. A non-plan task still requires a non-empty message and supports retry only.
+`guard.maxToolCalls` (default 150, public range 10-1,000) and `guard.maxInputTokens` (default 1,500,000, range 10,000-20,000,000) are cumulative over the initial run, automatic fixes, question resumes and manual retries. Remaining capacity is passed to each launch and never refunded. Loop/window guard settings still apply per invocation.
+Each launch uses one runner attempt, without hidden transient/timeout retries. The overall active-time budget is `timeoutSeconds` (sync default 180/max 300; async default 600/max 1800), shared across launches and checks and retained across caller waits. Per-check timeout is an additional bound. An exhausted budget cannot be reset by retrying.
 
-### Status and result
-
-`cline_status` and `cline_result` include `plan`:
+Successful sync responses and lifecycle failures include `verification`; async status/results expose it as well (also inside the edit result):
 
 ```ts
-{
-  total, currentIndex, currentId, // index is zero-based
-  phase,                       // snapshot | run | verify | restore | waiting | done
-  attempt,
-  budget: { limits, totalToolCalls, totalInputTokens },
-  steps: [{ id, state, attempts, summary?, changedFiles?,
-    counters: { totalToolCalls, totalInputTokens },
-    verify?: { passed, exitCode, timedOut, stdoutTail, stderrTail }, restore? }]
+verification: {
+  required: boolean,
+  passed: boolean | null,        // null for none or before a check ran
+  command: VerificationCommand | null,
+  reason?: string,               // explicit none reason
+  attempts: [{ run, passed, exitCode, signal, timedOut, killedForOutput, durationMs, stdoutTail, stderrTail, error? }],
+  fixRuns: number,               // repair launches, including explicit/question continuations
+  restored: boolean,
+  kept: boolean
 }
 ```
 
-Step state is `pending | running | verified | skipped | failed`. Waiting includes `waitReason` and evidence:
-`verify_failed | guard | cline_error | head_changed | budget | cline_question`.
-Every `runHistory` item includes its final `guard` counters when a Cline invocation ran.
-Final task state is `done` with `outcome: completed | completed_with_skips | stopped`; cancellation is `cancelled`.
-Result usage is summed across runs. Only `completed` produces an `ok: true` aggregated `log_run_hint`;
-waiting/cancelled tasks return a null hint. Collecting a waiting result keeps the task and writer lock.
+`fixRuns` counts actual repair launches; automatic capacity is capped separately, and manual retries do not reset it. An opt-out returns an empty attempts array. Recovery evidence identifies any retained snapshot and restoration failures. A restored or kept request is not reported as verified success.
+
+### Breaking changes
+
+`verify` is now required for edits (command or reasoned `none`). `steps`, `stepBudget`, and the `skip`/`stop` actions are removed; legacy fields/actions are rejected. The ledger, plan view and plan outcomes are removed. Use one full check suite plus retry/restore/keep. Sync failed edits now restore by default; use `keepOnFailure` explicitly to retain them.
 
 ## Loop and Budget Guard
 
@@ -421,17 +352,11 @@ Task run history retains these reports; a tripped guard is also exposed on the t
 - `lastAssistantText`: Last assistant text excerpt (≤ 400 characters).
 
 ### Task Behavior vs Synchronous Tools
-- **Async tasks (`cline_start`)**:
-  - A tripped guard does **not** fail the task. The task enters `"input_required"` state with a bridge-generated question:
-    `QUESTION: Stopped by the bridge: <message>. How should it continue (a different approach, skip this file, or stop)?`
-    with options: `a different approach | skip this file | stop`.
-  - The task and its full run history are retained and can be inspected with `cline_status`.
-  - Calling `cline_send` resumes the task. The resumed prompt includes a bounded, redacted warning notice (`Previous run was stopped by the bridge: ...; do not repeat the same failing action.`) along with the failing tool, target, and recent error details (compacted dynamically if prompt limits require it).
-  - Subsequent trips during resumed runs pause again in `"input_required"`.
-- **Synchronous tools (`apply_cline_edits`, `ask_cline_workspace`)**:
-  - The Cline process tree is terminated immediately (`killTree`), and a `guard_trip` event is written to the trace.
-  - Fails with `ClineRunError` (kind `"loop_detected"` or `"budget_exceeded"`), attaching the `guard` report.
-  - Guard trips are never retried.
+
+- Async edits pause with `waitReason: "guard"`, retaining partial edits, the original snapshot, lock and run history. Use retry with guidance, restore, keep or `cline_cancel`; consumed budgets remain consumed.
+- Async ask/workspace tasks pause with a bridge question and guidance choices. `cline_send` with a message resumes with a bounded, redacted guard warning, tool/target and recent errors. Subsequent trips pause again.
+- Synchronous runs terminate the Cline process tree and attach the guard report to the error. Sync edits additionally restore the original baseline unless `keepOnFailure` is set; identity refusal retains recovery evidence instead.
+- Guard trips never trigger an automatic repair or hidden runner retry.
 
 ## Provider and Model Settings Coordination
 
@@ -498,12 +423,12 @@ Settlement listens for process `exit` as well as `close`. If Cline or a child da
 - `non_zero_exit`: CLI exited with a non-zero code on a non-transient error, was terminated by an external signal without a completed result, or failed with an explicit error in `run_result`.
 - `transient_provider_error`: Provider overload, rate limit (429), 5xx with HTTP context, "temporarily unavailable", ECONNRESET, ETIMEDOUT, or upstream provider errors that failed after an automatic retry with backoff (~2-3s). Stderr info messages (such as `rate limit remaining: 99`) are ignored when classifying errors.
 - `timeout`: CLI exceeded the configured timeout. The error message includes configured limit and actual elapsed seconds, plus output tails.
-- `cline_updating`: Cline CLI entry file is missing or stderr indicated `MODULE_NOT_FOUND` / `Cannot find module` during an update. The bridge retries once and reports `"Cline CLI is missing or being updated; retry in ~30 s"`.
+- `cline_updating`: Cline CLI entry file is missing or stderr indicated `MODULE_NOT_FOUND` / `Cannot find module` during an update. Where retries are enabled, the bridge retries once; otherwise it reports `"Cline CLI is missing or being updated; retry in ~30 s"`.
 - `cancelled`: Request cancelled via client abort signal before execution, during backoff, or while waiting in the lock queue.
 - `launch_failed`: Invalid input arguments, missing executable, process spawn errors (`ENOENT`, `EACCES`), or process launch failure.
 - `malformed_json` / `missing_final_result`: Process completed with code 0 but stdout did not produce a valid terminal result.
 - `workspace_not_git`, `workspace_setup_failed`, `workspace_cleanup_failed`: Worktree management failures.
-- `commit_created`, `edits_inspection_failed`: Git checkout modification failures.
+- `edits_inspection_failed`: Git inspection or identity refusal; inspect the returned verification/recovery evidence.
 - `loop_detected`: Repeated tool failure on the same target/command tripped the loop detector within the sliding window.
 - `budget_exceeded`: Cumulative tool calls or cumulative input tokens exceeded the configured budget.
 
@@ -511,12 +436,12 @@ Settlement listens for process `exit` as well as `close`. If Cline or a child da
 When Cline successfully answers but exits with code 1 or an external signal (for example, printing a completed `run_result` or an `agent_event` `done` with `reason:"completed"`, followed by `session not found` on stderr), the bridge recovers the completed text, returns success, and includes a `warnings` array (e.g. `["cline exited with code 1 after a completed result: session not found: <id>"]`).
 
 ### Clean Exit 0 Provider Errors
-If Cline exits with code 0 but stdout contains a `run_result` with `finishReason: "error"`, the error is extracted and classified prior to clean exit parsing. Transient errors trigger an automatic retry; non-transient errors report the extracted failure message clearly rather than throwing `missing_final_result`.
+If Cline exits with code 0 but stdout contains a `run_result` with `finishReason: "error"`, the error is extracted and classified prior to clean exit parsing. Transient errors are eligible for retry only on the synchronous analysis tools; edit launches report the failure without a hidden retry. Non-transient errors retain the extracted failure message rather than throwing `missing_final_result`.
 
 ### Safe Retry Behavior
-- Transient errors and timeouts on synchronous tools (`ask_cline`, `apply_cline_edits`, `ask_cline_workspace`) trigger a single automatic retry (`maxAttempts: 2`) with a short backoff when sufficient budget remains (`cline_ping` and async tasks run a single attempt with no automatic retry).
+- Transient errors and timeouts on synchronous analysis tools (`ask_cline`, `ask_cline_workspace`) may trigger one automatic retry (`maxAttempts: 2`) when budget remains. `cline_ping`, async tasks and every edit launch use one runner attempt.
 - Non-transient errors (syntax errors, invalid flags, authentication rejections, daily quota exhaustion) are never retried.
-- For `apply_cline_edits`, a retry is only attempted if the first attempt produced no tool calls and no working tree / HEAD modifications; if any change occurred or if uncertain, edits are not retried.
+- Edits perform only the final-check repairs described above. Cline errors, questions and guard trips do not launch hidden retries; sync restores by default and async waits for caller action.
 
 ## CLI State, Self-Healing Updates, and Dashboard Ping Script
 

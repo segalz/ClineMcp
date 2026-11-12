@@ -8,8 +8,7 @@ import { clinePing } from "./ping.js";
 import { listFreeModels, writeCatalogSnapshot } from "./models.js";
 import { cleanupTraces } from "./trace.js";
 import { TaskManager, MAX_TASK_TIMEOUT_SECONDS, MAX_WAIT_SECONDS } from "./tasks.js";
-import { startTaskObjectSchema, startTaskSchema } from "./steps.js";
-import { verificationSchema, maxFixRunsSchema } from "./finalcheck.js";
+import { startTaskObjectSchema, startTaskSchema, verificationSchema, maxFixRunsSchema, editActionSchema } from "./finalcheck.js";
 import { PROHIBITED_NAMES, resolveProviderSettingsPath, recoverProviderSettingsJournal } from "./settings.js";
 import {
   attachCliToObject,
@@ -311,22 +310,15 @@ server.registerTool(
   {
     description: "Start a Cline task in the background and return its taskId at once. mode \"ask\": answer from the prompt, " +
       "no tools; \"workspace\": read a Git repository in a disposable worktree; \"edits\": change files in the checkout " +
-      "(no commits; non-step runs include a diff). Then follow it with cline_status, stop it with cline_cancel, and collect it with " +
+      "(no commits). Then follow it with cline_status, cancel it with cline_cancel, and collect it with " +
       `cline_result. timeoutSeconds up to ${MAX_TASK_TIMEOUT_SECONDS}; at most 2 tasks at once. ` +
-      "Non-step edits require verify (command or explicit none/reason), share one snapshot, and run up to maxFixRuns automatic repairs (default 2). " +
+      "Edits require verify (shell-free command or explicit none/reason), share one snapshot, and run up to maxFixRuns automatic repairs (0-3, default 2). " +
       "Failures/questions wait with their edits and lock retained; retry performs one repair, restore returns to the original baseline, keep ends unverified. " +
       "Their timeoutSeconds is the overall active-time budget, excluding caller waits; guards accumulate across every launch. " +
       "Ask/workspace have one attempt and no automatic retry. " +
       "The bridge stops a run on repeated failures or budget and waits for guidance via cline_send. " +
       "codeMap defaults to true for workspace/edits, including resumed runs; ignored in ask mode. " +
-      "Optional steps (edits only): 1-16 unique ids with instruction, optional relative path hints, and mandatory verify. " +
-      "Steps run sequentially with byte snapshots, a checkout lock, and mandatory shell-free verification. " +
-      "Failure restores the step and waits with waitReason/evidence; HEAD/index changes wait without reset. " +
-      "A step allows at most 3 Cline launches including question resumes. Optional stepBudget (requires steps) sets " +
-      "cumulative tool-call/input-token caps per step and plan. Defaults: step 150/1500000, plan 1000/10000000. " +
-      "Calls range 10-1000; tokens 10000-20000000. A run uses remaining step capacity, capped by explicit guard limits. " +
-      "Final guard counters include success, questions and errors; exhausted budgets restore and wait for skip/stop only. " +
-      "Skipping retains consumed plan capacity. Input is strict and at most 64 KiB.",
+      "HEAD/index changes refuse restoration and retain recovery evidence. Input is strict and at most 64 KiB.",
     inputSchema: startTaskObjectSchema.extend({
       provider: providerModelSchema,
       model: providerModelSchema
@@ -347,10 +339,10 @@ server.registerTool(
 server.registerTool(
   "cline_status",
   {
-    description: "Where a Cline task is now: state, step, current tool, last complete reasoning, files, any question Cline " +
+    description: "Where a Cline task is now: state, current tool, last complete reasoning, files, any question Cline " +
       `asked. Long poll: returns as soon as the task finishes, asks a question (input_required), or after waitSeconds (max ${MAX_WAIT_SECONDS}). ` +
-      "Step plans include current step/index, phase, attempts, verification/restore records, per-step counters, " +
-      "plan budget limits/totals, waitReason and evidence. Run history includes final guard counters on every outcome.",
+      "Edits include lifecycle phase, verification attempts, fixRuns, restored/kept, waitReason and evidence. " +
+      "Run history includes final guard counters on every outcome.",
     inputSchema: {
       taskId: z.string().uuid(),
       waitSeconds: z.number().int().min(0).max(MAX_WAIT_SECONDS).optional().describe("Default 20.")
@@ -366,16 +358,14 @@ server.registerTool(
 server.registerTool(
   "cline_send",
   {
-    description: "Answer a waiting Cline task. For step plans, action retry (default) reruns the failed step from its baseline " +
-      "with message as guidance; a cline_question resumes the same step with partial edits retained. skip records an unverified " +
-      "step and continues; stop ends as stopped, keeping verified changes. At a launch/resource budget only skip/stop are allowed. " +
-      "Skip never refunds plan capacity or permits launches after plan exhaustion. " +
-      "Omit message for skip/stop or a retry without guidance. Non-step edits support retry/restore/keep; retry retains partial edits and performs one repair without resetting budgets. " +
-      "Restore undoes every edit run; keep ends unverified. Ask/workspace require a message and support retry only.",
+    description: "Answer a waiting Cline task. Edits support retry (default), restore and keep, with optional message as guidance. " +
+      "Retry retains partial edits and performs one repair or answers a Cline question without resetting automatic-fix capacity or budgets. " +
+      "Restore undoes every edit run back to the original dirty baseline; keep ends unverified. " +
+      "Ask/workspace require a message and support retry only.",
     inputSchema: z.object({
       taskId: z.string().uuid(),
       message: z.string().max(20_000).optional(),
-      action: z.enum(["retry", "restore", "keep", "skip", "stop"]).optional(),
+      action: editActionSchema.optional(),
       waitSeconds: z.number().int().min(0).max(30).optional().describe("Wait this long for first progress before returning (default 3).")
     }).strict()
   },
@@ -393,7 +383,8 @@ server.registerTool(
 server.registerTool(
   "cline_cancel",
   {
-    description: "Stop a running Cline task (its process tree is killed). Collect it afterwards with cline_result.",
+    description: "Cancel a running or waiting Cline task. Edits abort the active process and await baseline restoration and lock release. " +
+      "Identity refusal or incomplete restoration retains recovery evidence. Collect the result afterwards with cline_result.",
     inputSchema: { taskId: z.string().uuid() }
   },
   async ({ taskId }) => {
@@ -407,8 +398,8 @@ server.registerTool(
   "cline_result",
   {
     description: "Final result of a finished Cline task, or partial result of an input_required task (does not remove the task), " +
-      "plus log_run_hint for model-picker log_run (null when cancelled: do not log). Step plans include per-step records, " +
-      "summed usage, and outcome completed/completed_with_skips/stopped; only completed is ok. " +
+      "plus verification evidence and summed edit-run usage. log_run_hint for model-picker is null while waiting, cancelled, or on local failure; " +
+      "edits are ok only on success with a passing check or explicit none opt-out. " +
       "Removes the task and its trace unless keepTrace.",
     inputSchema: { taskId: z.string().uuid(), keepTrace: z.boolean().optional() }
   },

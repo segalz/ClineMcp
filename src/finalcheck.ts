@@ -2,7 +2,7 @@ import { z } from "zod";
 import { acquire, ownsCheckoutLock, type CheckoutRelease } from "./checkoutlock.js";
 import { takeSnapshot, restoreSnapshot, discardSnapshot, headAndIndexIdentity, type SnapshotHandle, type SnapshotOptions } from "./snapshot.js";
 import { runVerification, VerificationError, type VerificationResult } from "./verify.js";
-import { ClineRunError, redactSecrets, type ClineResponse } from "./runner.js";
+import { ClineRunError, redactSecrets, guardOptionsSchema, type ClineResponse } from "./runner.js";
 import type { GuardOptions } from "./guard.js";
 
 export const verificationSchema = z.union([
@@ -13,7 +13,27 @@ export const verificationSchema = z.union([
 ]);
 export const maxFixRunsSchema = z.number().int().min(0).max(3);
 export type VerifySpec = z.infer<typeof verificationSchema>;
-export type EditAction = "retry" | "restore" | "keep";
+export const editActionSchema = z.enum(["retry", "restore", "keep"]);
+export type EditAction = z.infer<typeof editActionSchema>;
+export const startTaskObjectSchema = z.object({
+  mode: z.enum(["ask", "workspace", "edits"]),
+  prompt: z.string().min(1).max(20_000),
+  provider: z.string().regex(/^[A-Za-z0-9._:/@-]{1,120}$/),
+  model: z.string().regex(/^[A-Za-z0-9._:/@-]{1,120}$/),
+  cwd: z.string().min(1).optional(),
+  thinking: z.enum(["none", "low", "medium", "high", "xhigh"]).optional(),
+  timeoutSeconds: z.number().int().min(1).max(1800).optional(),
+  waitSeconds: z.number().int().min(0).max(30).optional(),
+  codeMap: z.boolean().optional(),
+  guard: guardOptionsSchema.innerType().strict().pipe(guardOptionsSchema).optional(),
+  verify: verificationSchema.optional(),
+  maxFixRuns: maxFixRunsSchema.optional()
+}).strict();
+export const startTaskSchema = startTaskObjectSchema.superRefine((input, context) => {
+  if (input.mode === "edits" && !input.verify) context.addIssue({ code: z.ZodIssueCode.custom, path: ["verify"], message: "verify is required for edits." });
+  if (input.mode !== "edits" && (input.verify || input.maxFixRuns !== undefined)) context.addIssue({ code: z.ZodIssueCode.custom, path: ["verify"], message: "verify/maxFixRuns require edits mode." });
+  if (Buffer.byteLength(JSON.stringify(input), "utf8") > 64 * 1024) context.addIssue({ code: z.ZodIssueCode.custom, message: "Input exceeds 64 KiB." });
+});
 export type EditWaitReason = "verify_failed" | "cline_question" | "guard" | "cline_error" | "head_changed" | "budget";
 export interface FinalVerification {
   required: boolean; passed: boolean | null; command: Exclude<VerifySpec, { none: true }> | null;

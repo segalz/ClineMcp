@@ -10,14 +10,11 @@ import {
 } from "./runner.js";
 import { formatReportSummary, type GuardOptions, type GuardReport } from "./guard.js";
 import { askClineWorkspace, buildWorkspaceSystemPrompt, WORKTREE_BASE } from "./workspace.js";
-import { applyClineEdits, buildEditSystemPrompt, editsCheckoutRoot, runClineEditStep } from "./edits.js";
-import { FinalCheckLifecycle, type VerifySpec, type FinalVerification, type EditAction } from "./finalcheck.js";
-import { acquire, type CheckoutRelease } from "./checkoutlock.js";
+import { applyClineEdits, buildEditSystemPrompt, editsCheckoutRoot, runClineEditRun } from "./edits.js";
+import { FinalCheckLifecycle, startTaskSchema, editActionSchema, type VerifySpec, type FinalVerification, type EditAction, type EditWaitReason } from "./finalcheck.js";
 import { resolveTraceBase, type TraceInfo, type TraceRecorder, type TraceStatus } from "./trace.js";
-import { takeSnapshot, restoreSnapshot, discardSnapshot, headAndIndexIdentity, type SnapshotOptions } from "./snapshot.js";
-import { runVerification, VerificationError, type VerificationResult } from "./verify.js";
-import { buildStepPrompt, startTaskSchema, sumUsage, type StepDefinition, type PlanView, type PlanOutcome,
-  DEFAULT_STEP_BUDGET, type StepBudget, type StepAction, type StepExecution, type WaitReason } from "./steps.js";
+import type { SnapshotOptions } from "./snapshot.js";
+import { runVerification, VerificationError } from "./verify.js";
 
 export type TaskMode = "ask" | "workspace" | "edits";
 export type TaskState = "running" | "resuming" | "done" | "failed" | "cancelled" | "input_required";
@@ -32,8 +29,6 @@ export interface StartTaskInput {
   timeoutSeconds?: number;
   guard?: GuardOptions;
   codeMap?: boolean;
-  steps?: StepDefinition[];
-  stepBudget?: StepBudget;
   verify?: VerifySpec;
   maxFixRuns?: number;
 }
@@ -235,11 +230,9 @@ export function buildResumedPrompt(params: {
   guardReport?: GuardReport;
   platform?: NodeJS.Platform;
   deps?: { entryPath?: string };
-  /** Additional room required by an enclosing step prompt; mandatory Q&A still cannot be truncated. */
-  fits?: (prompt: string) => boolean;
 }): string {
   const platform = params.platform ?? process.platform;
-  const tooLarge = (prompt: string) => isPromptTooLarge(prompt, params.task, params.preamble, platform, params.deps) || params.fits?.(prompt) === false;
+  const tooLarge = (prompt: string) => isPromptTooLarge(prompt, params.task, params.preamble, platform, params.deps);
   const history = params.qaHistory;
   if (history.length === 0) {
     throw new ClineRunError("launch_failed", "No question/answer history to resume from.", { attempts: 0 });
@@ -397,12 +390,8 @@ export interface TaskRunHistoryItem {
 
 export interface Task {
   finalCheck?: FinalCheckLifecycle;
-  plan?: PlanView;
-  stepExecution?: StepExecution;
-  waitReason?: WaitReason;
+  waitReason?: EditWaitReason;
   evidence?: Record<string, unknown>;
-  outcome?: PlanOutcome;
-  checkoutLock?: CheckoutRelease;
   id: string;
   mode: TaskMode;
   state: TaskState;
@@ -443,10 +432,8 @@ export interface LogRunHint { ok: boolean; error_kind?: "timeout" | "quota" | "c
 export interface TaskStatusView {
   verification?: FinalVerification;
   phase?: FinalCheckLifecycle["phase"];
-  plan?: PlanView;
-  waitReason?: WaitReason;
+  waitReason?: EditWaitReason;
   evidence?: Record<string, unknown>;
-  outcome?: PlanOutcome;
   taskId: string;
   mode: TaskMode;
   state: TaskState;
@@ -455,7 +442,7 @@ export interface TaskStatusView {
   runs: TraceInfo[];
   runHistory?: TaskRunHistoryItem[];
   guard?: GuardReport;
-  /** Live progress from the trace: attempt, step, current tool, last complete reasoning, files, question. */
+  /** Live progress from the trace: attempt, current tool, last complete reasoning, files, question. */
   progress?: Omit<TraceStatus, "runId" | "pid" | "state" | "startedAt" | "updatedAt" | "elapsedMs">;
   question?: { question: string; options?: string[] };
   autoAnswered?: { question: string; answer: string };
@@ -505,9 +492,7 @@ export function hintFor(task: Task): LogRunHint | null {
     if (task.state === "done") return { ok: !verification.restored && !verification.kept &&
       (verification.passed === true || !verification.required), duration_s };
   }
-  if (task.state === "done") return task.plan && task.outcome !== "completed"
-    ? { ok: false, error_kind: "crash", error_text: `Plan ${task.outcome}.`, duration_s }
-    : { ok: true, duration_s };
+  if (task.state === "done") return { ok: true, duration_s };
   if (noteFor(task)) return null;
   const err = task.error;
   if (err instanceof ClineRunError) {
@@ -669,17 +654,7 @@ export class TaskManager {
 
     let run: Promise<ClineResponse & Record<string, unknown>>;
     try {
-      if (task.mode === "edits" && !task.checkoutLock) {
-        run = (async () => {
-          if (!task.checkoutLock) {
-            const root = await editsCheckoutRoot(task.cwd!, task.controller.signal);
-            if (task.controller.signal.aborted) throw new ClineRunError("cancelled", "The task was cancelled.", { attempts: 0 });
-            task.checkoutLock = acquire(root, { lockDirectory: options.checkoutLockDirectory });
-          }
-          return this.runners.edits(runInput, task.controller.signal, { ...options, checkoutLock: task.checkoutLock });
-        })();
-      } else run = this.runners[task.mode](runInput, task.controller.signal,
-        task.mode === "edits" ? { ...options, checkoutLock: task.checkoutLock } : options);
+      run = this.runners[task.mode](runInput, task.controller.signal, options);
     } catch (err) {
       run = Promise.reject(err);
     }
@@ -753,8 +728,6 @@ export class TaskManager {
 
   private releaseCheckout(task: Task): void {
     task.finalCheck?.release();
-    task.checkoutLock?.();
-    task.checkoutLock = undefined;
   }
 
   /** Publish waiting/terminal only after the entire lifecycle segment has settled. */
@@ -793,339 +766,6 @@ export class TaskManager {
     });
   }
 
-  private checkCancelled(task: Task): void {
-    if (task.controller.signal.aborted) throw new ClineRunError("cancelled", "The task was cancelled.", { attempts: 0 });
-  }
-
-  private waitPlan(task: Task, reason: WaitReason, evidence: Record<string, unknown>, question?: Task["question"]): void {
-    const plan = task.plan!;
-    plan.phase = "waiting";
-    plan.steps[plan.currentIndex].state = reason === "cline_question" ? "running" : "failed";
-    task.waitReason = reason;
-    task.evidence = evidence;
-    task.question = question ?? { question: reason === "budget" ? `Step ${plan.currentId}: budget exhausted. Skip or stop?`
-      : reason === "head_changed" ? `Step ${plan.currentId}: HEAD/index changed. Repair Git identity before retry/skip, or stop and inspect the recovery snapshot.`
-      : `Step ${plan.currentId}: ${reason}. Retry with guidance, skip, or stop?`,
-      options: reason === "budget" ? ["skip", "stop"] : ["retry", "skip", "stop"] };
-  }
-
-  private async planIdentityUnchanged(task: Task): Promise<boolean> {
-    const execution = task.stepExecution!;
-    if (!execution.identity) return true; // No Cline launch happened if initial identity capture failed.
-    try {
-      const current = await headAndIndexIdentity(task.cwd!);
-      if (current.head === execution.identity.head && current.indexHash === execution.identity.indexHash) return true;
-      this.waitPlan(task, "head_changed", { before: execution.identity, after: current,
-        snapshotDirectory: execution.snapshot?.directory, message: "HEAD/index changed. No reset or file restoration was performed." });
-    } catch (err) {
-      this.waitPlan(task, "head_changed", { before: execution.identity, error: redactSecrets(String(err)),
-        snapshotDirectory: execution.snapshot?.directory, message: "Could not establish HEAD/index identity; no restoration was performed." });
-    }
-    return false;
-  }
-
-  private async restorePlanStep(task: Task): Promise<boolean> {
-    const snapshot = task.stepExecution!.snapshot;
-    if (!snapshot) return true;
-    if (!await this.planIdentityUnchanged(task)) return false;
-    task.plan!.phase = "restore";
-    const record = task.plan!.steps[task.plan!.currentIndex];
-    try { record.restore = await restoreSnapshot(snapshot); }
-    catch (err) { record.restore = { restored: [], removed: [], failed: [{ path: ".", error: redactSecrets(String(err)) }] }; }
-    if (record.restore.failed.length) {
-      this.waitPlan(task, "cline_error", { message: "Baseline restoration is incomplete; automatic advancement is blocked.",
-        restore: record.restore, snapshotDirectory: snapshot.directory });
-      return false;
-    }
-    return true;
-  }
-
-  private async discardPlanSnapshot(task: Task): Promise<void> {
-    const execution = task.stepExecution!;
-    if (execution.snapshot) await discardSnapshot(execution.snapshot);
-    execution.snapshot = undefined;
-    execution.identity = undefined;
-  }
-
-  private async finishPlanCancellation(task: Task): Promise<void> {
-    if (await this.restorePlanStep(task)) await this.discardPlanSnapshot(task);
-    task.state = "cancelled";
-    task.plan!.phase = "done";
-    if (task.plan!.steps[task.plan!.currentIndex].state === "running") task.plan!.steps[task.plan!.currentIndex].state = "failed";
-    task.error = new ClineRunError("cancelled", "The task was cancelled.", { attempts: 0 });
-    task.waitReason = undefined;
-    task.question = undefined;
-  }
-
-  private async checkPlanBudget(task: Task, beforeLaunch = false): Promise<boolean> {
-    const plan = task.plan!, budget = plan.budget!;
-    const step = plan.steps[plan.currentIndex].counters!;
-    const over = (used: number, limit: number) => beforeLaunch ? used >= limit : used > limit;
-    const scope = over(budget.totalToolCalls, budget.limits.maxToolCallsPerPlan) || over(budget.totalInputTokens, budget.limits.maxInputTokensPerPlan)
-      ? "plan" : over(step.totalToolCalls, budget.limits.maxToolCallsPerStep) || over(step.totalInputTokens, budget.limits.maxInputTokensPerStep) ? "step" : undefined;
-    if (!scope) return true;
-    if (await this.restorePlanStep(task)) this.waitPlan(task, "budget", { scope,
-      message: `${scope} resource budget exhausted; counters are retained across retries and skips.`,
-      budget: structuredClone(budget), step: { ...step }, restore: plan.steps[plan.currentIndex].restore });
-    return false;
-  }
-
-  private planPrompt(task: Task, message: string, resumeQuestion: boolean): string {
-    const plan = task.plan!, execution = task.stepExecution!;
-    const step = execution.definitions[plan.currentIndex];
-    const preamble = getEffectivePreamble("edits", this.deps.runOptions?.promptPreamble ?? "");
-    const fits = (prompt: string) => !isPromptTooLarge(prompt, task, preamble, this.deps.platform ?? process.platform, this.deps.runOptions?.deps);
-    const guidance = message ? `Caller guidance:\n${message}` : "";
-    const failure = task.evidence ? `Previous failure evidence:\n${redactSecrets(JSON.stringify(task.evidence)).slice(0, 2000)}` : "";
-    if (!resumeQuestion) {
-      const context = [guidance, failure].filter(Boolean).join("\n\n");
-      return buildStepPrompt(task.originalPrompt, step, plan.steps, context, fits, suffixFits => {
-        let evidence = failure;
-        const render = () => [guidance, evidence].filter(Boolean).join("\n\n");
-        while (evidence.length > 200 && !suffixFits(render())) evidence = evidence.slice(0, Math.floor(evidence.length * 0.7));
-        if (!suffixFits(render()) && failure) evidence = `Previous failure: ${task.waitReason}.`;
-        return render();
-      });
-    }
-    const history = [...task.qaHistory, { question: task.question?.question ?? "", answer: message, options: task.question?.options }];
-    const full = buildResumedPrompt({ originalPrompt: "", previousAnswer: task.previousRunAnswer ?? "", qaHistory: history, task, preamble });
-    return buildStepPrompt(task.originalPrompt, step, plan.steps, full, fits, suffixFits => buildResumedPrompt({
-      originalPrompt: "", previousAnswer: task.previousRunAnswer ?? "", qaHistory: history, task, preamble,
-      platform: this.deps.platform, deps: this.deps.runOptions?.deps, fits: suffixFits
-    }));
-  }
-
-  /** One segment runs until waiting or terminal. The settled promise includes verification and rollback. */
-  private launchPlan(task: Task, action?: StepAction | "cancel", message = ""): void {
-    const resumeQuestion = action === "retry" && task.waitReason === "cline_question";
-    // Validate a resume before replacing its waiting state or controller.
-    const resumedPrompt = action === "retry" ? this.planPrompt(task, message, resumeQuestion) : undefined;
-    if (resumeQuestion) task.qaHistory.push({ question: task.question?.question ?? "", answer: message, options: task.question?.options });
-    else if (action === "retry") task.qaHistory = [];
-    task.state = action ? "resuming" : "running";
-    task.plan!.phase = resumeQuestion ? "run" : task.stepExecution!.snapshot ? "restore" : "snapshot";
-    task.endedAt = undefined;
-    task.controller = new AbortController();
-    if (action === "cancel") task.controller.abort();
-    task.question = undefined;
-    task.reportedQuestion = undefined;
-    task.recorder = undefined;
-    const startedAt = this.wallNow();
-    task.settled = this.runPlan(task, action, resumedPrompt, resumeQuestion).then(() => this.checkCancelled(task)).catch(async err => {
-      task.error = err;
-      if (task.controller.signal.aborted || (err instanceof ClineRunError && err.kind === "cancelled")) {
-        await this.finishPlanCancellation(task);
-      } else if (task.checkoutLock) {
-        if (await this.restorePlanStep(task)) this.waitPlan(task, "cline_error", { error: errorText(err) });
-      } else { task.state = "failed"; task.plan!.phase = "done"; }
-    }).then(async () => {
-      // Abort may arrive during failure cleanup, which deliberately runs without the aborted signal.
-      if (task.controller.signal.aborted && task.state !== "cancelled") await this.finishPlanCancellation(task);
-    }).catch(err => {
-      // Cleanup errors must remain observable and may never become an unhandled background rejection.
-      task.error = err;
-      task.evidence = { ...task.evidence, cleanupError: redactSecrets(String(err)), snapshotDirectory: task.stepExecution?.snapshot?.directory };
-      if (task.controller.signal.aborted) { task.state = "cancelled"; task.plan!.phase = "done"; }
-      else if (task.checkoutLock) this.waitPlan(task, "cline_error", task.evidence);
-      else { task.state = "failed"; task.plan!.phase = "done"; }
-    }).finally(() => {
-      // Publish waiting only after all segment I/O settles. A caller cannot resume into an old rollback/finalizer.
-      if (task.plan!.phase === "waiting") task.state = "input_required";
-      task.endedAt = this.wallNow();
-      task.activeMs += task.endedAt - startedAt;
-      if (task.state !== "input_required") this.releaseCheckout(task);
-    });
-  }
-
-  private async runPlan(task: Task, action?: StepAction | "cancel", resumedPrompt?: string, resumeQuestion = false): Promise<void> {
-    const plan = task.plan!, execution = task.stepExecution!;
-    this.checkCancelled(task);
-    if (!task.checkoutLock) {
-      const root = await editsCheckoutRoot(task.cwd!, task.controller.signal);
-      this.checkCancelled(task);
-      task.checkoutLock = acquire(root, { lockDirectory: this.deps.runOptions?.checkoutLockDirectory });
-      task.cwd = root;
-    }
-    if (action === "stop") {
-      if (await this.restorePlanStep(task)) await this.discardPlanSnapshot(task);
-      this.checkCancelled(task);
-      if (plan.steps[plan.currentIndex].state === "running") plan.steps[plan.currentIndex].state = "failed";
-      task.outcome = "stopped";
-      task.state = "done";
-      plan.phase = "done";
-      task.question = undefined;
-      task.waitReason = undefined;
-      task.error = undefined;
-      return;
-    }
-    if (action === "skip") {
-      if (!await this.restorePlanStep(task)) return;
-      plan.steps[plan.currentIndex].state = "skipped";
-      await this.discardPlanSnapshot(task);
-      this.checkCancelled(task);
-      if (!this.advancePlan(task)) return;
-      resumedPrompt = undefined;
-    } else if (action === "retry" && !resumeQuestion) {
-      if (!await this.restorePlanStep(task)) return;
-    }
-    task.waitReason = undefined;
-    task.error = undefined;
-    while (true) {
-      this.checkCancelled(task);
-      const record = plan.steps[plan.currentIndex];
-      if (!await this.checkPlanBudget(task, true)) return;
-      if (record.attempts >= 3) {
-        if (await this.restorePlanStep(task)) this.waitPlan(task, "budget", { message: "Three Cline launches exhausted; only skip or stop is allowed." });
-        return;
-      }
-      if (!execution.snapshot) {
-        plan.phase = "snapshot";
-        execution.snapshot = await takeSnapshot(task.cwd!, { ...this.deps.snapshotOptions, signal: task.controller.signal });
-        this.checkCancelled(task);
-        execution.identity = await headAndIndexIdentity(task.cwd!);
-      } else if (!await this.planIdentityUnchanged(task)) return;
-      if (!execution.identity) execution.identity = await headAndIndexIdentity(task.cwd!);
-      this.checkCancelled(task);
-      const prompt = resumedPrompt ?? this.planPrompt(task, "", false);
-      resumedPrompt = undefined;
-      task.evidence = undefined;
-      execution.prompt = prompt;
-      plan.phase = "run";
-      record.state = "running";
-      record.attempts++;
-      plan.attempt = record.attempts;
-      if (execution.launches++) {
-        task.run++;
-        const runId = `${task.id}-run-${task.run}`;
-        const dir = path.join(resolveTraceBase(this.deps.traceBase), runId);
-        task.trace = { runId, dir, events: path.join(dir, "events.ndjson"), status: path.join(dir, "status.json") };
-        task.runs.push(task.trace);
-      }
-      task.recorder = undefined;
-      task.autoAnswered = undefined;
-      task.guardReport = undefined;
-      task.guardReportSummary = undefined;
-      task.state = "running";
-      let result: ClineResponse | undefined, failure: unknown;
-      let finalGuard: GuardReport | undefined;
-      const limits = plan.budget!.limits;
-      const runGuard: GuardOptions = { ...task.guard,
-        maxToolCalls: Math.min(task.guard?.maxToolCalls ?? Infinity, limits.maxToolCallsPerStep - record.counters!.totalToolCalls),
-        maxInputTokens: Math.min(task.guard?.maxInputTokens ?? Infinity, limits.maxInputTokensPerStep - record.counters!.totalInputTokens) };
-      const options: Partial<ClineInvocationOptions> = { ...this.deps.runOptions,
-        checkoutLock: task.checkoutLock, trace: true, traceRunId: task.trace.runId,
-        promptPreamble: (this.deps.runOptions?.promptPreamble ?? "") + TASK_QUESTION_PREAMBLE,
-        maxAttempts: 1, maxTimeoutSeconds: MAX_TASK_TIMEOUT_SECONDS, guard: runGuard,
-        onTraceStart: recorder => { task.recorder = recorder; } };
-      if (this.deps.traceBase) options.deps = { ...options.deps, traceBase: this.deps.traceBase };
-      try {
-        const runner = this.deps.runners?.edits ?? runClineEditStep;
-        result = await runner({ prompt, cwd: task.cwd!, provider: task.provider, model: task.model,
-          thinking: task.thinking, timeoutSeconds: task.timeoutSeconds ?? DEFAULT_TASK_TIMEOUT_SECONDS,
-          guard: runGuard, codeMap: task.codeMap }, task.controller.signal, options);
-        finalGuard = result.guard;
-        sumUsage(execution.usage, result.usage);
-        execution.durationMs += result.durationMs;
-        if (typeof result.cost === "number") execution.cost += result.cost;
-        task.previousRunAnswer = result.text;
-        task.result = { ...result, usage: execution.usage, cost: execution.cost, durationMs: execution.durationMs };
-      } catch (err) {
-        failure = err;
-        task.error = err;
-        finalGuard = (err as { guard?: GuardReport } | undefined)?.guard;
-        if (err instanceof ClineRunError && err.guard) {
-          task.guardReport = err.guard;
-          task.guardReportSummary = formatReportSummary(err.guard, err.message);
-        }
-        const metrics = err as { usage?: Record<string, unknown>; durationMs?: number } | undefined;
-        if (metrics?.usage && typeof metrics.usage === "object") sumUsage(execution.usage, metrics.usage);
-        else if (err instanceof ClineRunError && err.guard) sumUsage(execution.usage, { inputTokens: err.guard.totalInputTokens });
-        if (typeof metrics?.durationMs === "number" && Number.isFinite(metrics.durationMs)) execution.durationMs += metrics.durationMs;
-      }
-      if (finalGuard) {
-        record.counters!.totalToolCalls += finalGuard.totalToolCalls;
-        record.counters!.totalInputTokens += finalGuard.totalInputTokens;
-        plan.budget!.totalToolCalls += finalGuard.totalToolCalls;
-        plan.budget!.totalInputTokens += finalGuard.totalInputTokens;
-      }
-      task.runHistory ??= [];
-      task.runHistory.push({ run: task.run, trace: task.trace, ...(finalGuard ? { guard: finalGuard } : {}), ...(failure ? { error: errorText(failure) } : {}) });
-      this.checkCancelled(task);
-      if (!await this.planIdentityUnchanged(task)) return;
-      if (!await this.checkPlanBudget(task)) return;
-      if (failure) {
-        const reason = failure instanceof ClineRunError && (failure.kind === "loop_detected" || failure.kind === "budget_exceeded")
-          ? "guard" : "cline_error";
-        if (await this.restorePlanStep(task)) this.waitPlan(task, record.attempts >= 3 ? "budget" : reason,
-          { error: errorText(failure), guard: task.guardReport, restore: record.restore });
-        return;
-      }
-      const question = parseQuestionFromText(result!.text);
-      if (question) {
-        if (record.attempts >= 3) {
-          if (await this.restorePlanStep(task)) this.waitPlan(task, "budget", { message: "Launch cap reached while Cline requested another answer.", question });
-        } else this.waitPlan(task, "cline_question", { question }, question);
-        return;
-      }
-      plan.phase = "verify";
-      const verificationStarted = performance.now();
-      let verified: VerificationResult & { error?: string };
-      try {
-        verified = await (this.deps.runVerification ?? runVerification)(execution.definitions[plan.currentIndex].verify, task.cwd!, task.controller.signal);
-      } catch (error) {
-        if (!(error instanceof VerificationError)) throw error;
-        const message = redactSecrets(error.message);
-        verified = { passed: false, exitCode: null, signal: null, timedOut: false, killedForOutput: false,
-          durationMs: performance.now() - verificationStarted, stdoutTail: "", stderrTail: message, error: message };
-      }
-      record.verify = { passed: verified.passed, exitCode: verified.exitCode, timedOut: verified.timedOut,
-        stdoutTail: verified.stdoutTail, stderrTail: verified.stderrTail, ...(verified.error ? { error: verified.error } : {}) };
-      this.checkCancelled(task);
-      if (!await this.planIdentityUnchanged(task)) return;
-      if (!verified.passed) {
-        if (await this.restorePlanStep(task)) this.waitPlan(task, record.attempts >= 3 ? "budget" : "verify_failed", { verify: verified, restore: record.restore });
-        return;
-      }
-      const after = await takeSnapshot(task.cwd!, { ...this.deps.snapshotOptions, signal: task.controller.signal });
-      try {
-        this.checkCancelled(task);
-        const beforeFiles = new Map(execution.snapshot.manifest.map(entry => [entry.path, entry.sha256]));
-        const afterFiles = new Map(after.manifest.map(entry => [entry.path, entry.sha256]));
-        record.changedFiles = [...new Set([...beforeFiles.keys(), ...afterFiles.keys()])]
-          .filter(file => beforeFiles.get(file) !== afterFiles.get(file)).sort();
-      } finally { await discardSnapshot(after); }
-      this.checkCancelled(task);
-      if (!await this.planIdentityUnchanged(task)) return;
-      record.summary = redactSecrets(result!.text.split(/\r\n|\r|\n/, 1)[0]);
-      record.state = "verified";
-      await this.discardPlanSnapshot(task);
-      this.checkCancelled(task);
-      if (!this.advancePlan(task)) return;
-    }
-  }
-
-  private advancePlan(task: Task): boolean {
-    const plan = task.plan!;
-    task.waitReason = undefined;
-    task.error = undefined;
-    task.qaHistory = [];
-    task.previousRunAnswer = undefined;
-    task.guardReport = undefined;
-    task.guardReportSummary = undefined;
-    task.evidence = undefined;
-    if (plan.currentIndex + 1 >= plan.total) {
-      task.outcome = plan.steps.some(step => step.state === "skipped") ? "completed_with_skips" : "completed";
-      task.state = "done";
-      plan.phase = "done";
-      return false;
-    }
-    plan.currentIndex++;
-    plan.currentId = plan.steps[plan.currentIndex].id;
-    plan.attempt = 0;
-    plan.phase = "snapshot";
-    return true;
-  }
-
   start(input: StartTaskInput): TaskStatusView {
     if (this.closing) throw new ClineRunError("cancelled", "The bridge is shutting down; no new tasks start.", { attempts: 0 });
     requireSelection(input);
@@ -1159,13 +799,7 @@ export class TaskManager {
       guard: input.guard,
       codeMap: input.codeMap
     };
-    if (input.steps) {
-      task.plan = { total: input.steps.length, currentIndex: 0, currentId: input.steps[0].id, phase: "snapshot", attempt: 0,
-        steps: input.steps.map(step => ({ id: step.id, state: "pending", attempts: 0, counters: { totalToolCalls: 0, totalInputTokens: 0 } })),
-        budget: { limits: { ...DEFAULT_STEP_BUDGET, ...input.stepBudget }, totalToolCalls: 0, totalInputTokens: 0 } };
-      task.stepExecution = { definitions: input.steps, launches: 0, usage: Object.create(null), cost: 0, durationMs: 0 };
-    }
-    if (input.mode === "edits" && !input.steps) {
+    if (input.mode === "edits") {
       task.finalCheck = new FinalCheckLifecycle({ prompt: input.prompt, cwd: input.cwd!, verify: input.verify!,
         maxFixRuns: input.maxFixRuns, guard: input.guard, timeoutSeconds: input.timeoutSeconds ?? DEFAULT_TASK_TIMEOUT_SECONDS }, {
         resolveRoot: editsCheckoutRoot, snapshotOptions: this.deps.snapshotOptions,
@@ -1188,7 +822,7 @@ export class TaskManager {
             guard, onTraceStart: recorder => { task.recorder = recorder; } };
           if (this.deps.traceBase) options.deps = { ...options.deps, traceBase: this.deps.traceBase };
           try {
-            const result = await (this.deps.runners?.edits ?? runClineEditStep)({ prompt, cwd: task.cwd, provider: task.provider,
+            const result = await (this.deps.runners?.edits ?? runClineEditRun)({ prompt, cwd: task.cwd, provider: task.provider,
               model: task.model, thinking: task.thinking, timeoutSeconds: remainingSeconds, guard, codeMap: task.codeMap }, signal, options);
             task.runHistory ??= []; task.runHistory.push({ run, trace: task.trace, guard: result.guard });
             task.guardReport = result.guard; return result;
@@ -1201,34 +835,24 @@ export class TaskManager {
     }
     this.tasks.set(id, task);
     if (task.finalCheck) this.launchFinalCheck(task);
-    else if (task.plan) this.launchPlan(task); else this.executeRun(task, input.prompt, trace);
+    else this.executeRun(task, input.prompt, trace);
     return this.view(task);
   }
 
-  async send(taskId: string, message = "", action: StepAction | EditAction = "retry"): Promise<TaskStatusView> {
+  async send(taskId: string, message = "", action: EditAction = "retry"): Promise<TaskStatusView> {
     if (this.closing) throw new ClineRunError("cancelled", "The bridge is shutting down; no new tasks start.", { attempts: 0 });
     const task = this.get(taskId);
     if (task.state !== "input_required") {
       throw new ClineRunError("task_not_waiting", `Task ${taskId} is in state "${task.state}", not "input_required". cline_send can only be called on tasks waiting for input.`, { attempts: 0 });
     }
+    if (!editActionSchema.safeParse(action).success) throw new ClineRunError("launch_failed", "Expected retry, restore or keep.");
     if (task.finalCheck) {
       if (!["retry", "restore", "keep"].includes(action) || typeof message !== "string" || message.length > 20_000)
         throw new ClineRunError("launch_failed", "Expected retry, restore or keep, and guidance up to 20000 characters.");
       if (action === "retry" && this.running().length >= MAX_RUNNING_TASKS) throw new ClineRunError("task_limit", "At most two tasks run at once.");
       this.launchFinalCheck(task, action as EditAction, message); return this.view(task);
     }
-    if (task.plan) {
-      if (!["retry", "skip", "stop"].includes(action) || typeof message !== "string" || message.length > 20_000) {
-        throw new ClineRunError("launch_failed", "Expected retry, skip or stop, and guidance up to 20000 characters.", { attempts: 0 });
-      }
-      if (action === "retry" && (task.waitReason === "budget" || task.plan.steps[task.plan.currentIndex].attempts >= 3)) {
-        throw new ClineRunError("budget_exceeded", "This step allows only skip or stop.", { attempts: 0 });
-      }
-      if (action !== "stop" && this.running().length >= MAX_RUNNING_TASKS) throw new ClineRunError("task_limit", "At most two tasks run at once.", { attempts: 0 });
-      this.launchPlan(task, action as StepAction, message);
-      return this.view(task);
-    }
-    if (action !== "retry") throw new ClineRunError("launch_failed", "skip and stop require a step plan.", { attempts: 0 });
+    if (action !== "retry") throw new ClineRunError("launch_failed", "Ask/workspace tasks support retry only.", { attempts: 0 });
     if (typeof message !== "string" || message.length < 1 || message.length > 20_000) {
       throw new ClineRunError("launch_failed", "message must be a string between 1 and 20000 characters.", { attempts: 0 });
     }
@@ -1389,8 +1013,7 @@ export class TaskManager {
       trace: task.trace,
       ...(task.finalCheck ? { verification: structuredClone(task.finalCheck.verification), phase: task.finalCheck.phase,
         waitReason: task.waitReason, evidence: structuredClone(task.evidence) } : {}),
-      ...(task.plan ? { plan: structuredClone(task.plan), outcome: task.outcome,
-        waitReason: task.waitReason, evidence: structuredClone(task.evidence) } : {})
+
     };
   }
 
@@ -1426,12 +1049,6 @@ export class TaskManager {
       else if (task.state === "running" || task.state === "resuming") task.controller.abort();
       await task.settled; return this.view(task);
     }
-    if (task.plan) {
-      if (task.state === "input_required") this.launchPlan(task, "cancel");
-      else if (task.state === "running" || task.state === "resuming") task.controller.abort();
-      await task.settled; // A plan's cancellation is not complete until rollback and lock release finish.
-      return this.view(task);
-    }
     if (task.state === "running" || task.state === "resuming" || (task.state === "cancelled" && task.resolveSettled !== undefined)) {
       task.controller.abort();
       if (task.state === "resuming") {
@@ -1452,7 +1069,7 @@ export class TaskManager {
   /** Final result of a settled task. Removes the task and, unless keepTrace, its trace folders. */
   async result(taskId: string, keepTrace = false): Promise<{ state: TaskState; result?: Record<string, unknown>; error?: string;
     guard?: GuardReport; runHistory?: TaskRunHistoryItem[];
-    plan?: PlanView; outcome?: PlanOutcome; waitReason?: WaitReason; evidence?: Record<string, unknown>;
+    verification?: FinalVerification; waitReason?: EditWaitReason; evidence?: Record<string, unknown>;
     log_run_hint: LogRunHint | null; log_run_note?: string; trace?: TraceInfo }> {
     const task = this.get(taskId);
     if (task.state === "running" || task.state === "resuming") {
@@ -1463,10 +1080,7 @@ export class TaskManager {
       state: task.state,
       ...(task.finalCheck ? { verification: structuredClone(task.finalCheck.verification), waitReason: task.waitReason,
         evidence: structuredClone(task.evidence) } : {}),
-      ...(task.plan ? { plan: structuredClone(task.plan), outcome: task.outcome, waitReason: task.waitReason,
-        evidence: structuredClone(task.evidence), result: { ...task.result, usage: structuredClone(task.stepExecution!.usage),
-          durationMs: task.stepExecution!.durationMs, cost: task.stepExecution!.cost, trace: undefined } } : {}),
-      ...(task.result && !task.plan ? { result: { ...task.result, trace: undefined } } : {}),
+      ...(task.result ? { result: { ...task.result, trace: undefined } } : {}),
       ...(task.error !== undefined ? { error: errorText(task.error) } : {}),
       ...(task.guardReport ? { guard: task.guardReport } : {}),
       ...(task.runHistory && task.runHistory.length > 0 ? { runHistory: task.runHistory } : {}),
@@ -1497,11 +1111,6 @@ export class TaskManager {
       if (t.finalCheck && ["running", "resuming", "input_required"].includes(t.state)) {
         if (t.state === "input_required") this.launchFinalCheck(t, "cancel"); else t.controller.abort();
         toSettle.push(t); continue;
-      }
-      if (t.plan && (t.state === "running" || t.state === "resuming" || t.state === "input_required")) {
-        if (t.state === "input_required") this.launchPlan(t, "cancel"); else t.controller.abort();
-        toSettle.push(t);
-        continue;
       }
       if (t.state === "running") {
         t.controller.abort();

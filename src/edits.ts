@@ -198,11 +198,11 @@ export async function editsCheckoutRoot(cwd: string, signal?: AbortSignal): Prom
   }
 }
 
-/** A task-owned step must inspect identity itself: no Git status refresh or commit recovery is allowed here. */
-export async function runClineEditStep(input: Omit<ApplyClineEditsInput, "verify">, signal: AbortSignal,
+/** A lifecycle-owned run must inspect identity itself: no Git status refresh or commit recovery is allowed here. */
+export async function runClineEditRun(input: Omit<ApplyClineEditsInput, "verify">, signal: AbortSignal,
   options: Partial<ClineInvocationOptions>): Promise<ClineResponse> {
   if (!ownsCheckoutLock(options.checkoutLock, input.cwd)) {
-    throw new ClineRunError("checkout_busy", "A step requires its task's checkout lock.", { attempts: 0 });
+    throw new ClineRunError("checkout_busy", "An edit run requires its lifecycle's checkout lock.", { attempts: 0 });
   }
   return runEdits(input, input.cwd, signal, options);
 }
