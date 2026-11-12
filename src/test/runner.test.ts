@@ -52,6 +52,37 @@ function createMockChild() {
   return child;
 }
 
+test("final guard counters are exported on success, error, launch failure, timeout and pre-launch cancellation", async () => {
+  for (const outcome of ["success", "error", "launch", "timeout"] as const) {
+    const options = { maxAttempts: 1, recordStatus: false, respectQuotaLock: false, deps: {
+      entryPath: "mock/cline", access: async () => {}, timeoutMs: outcome === "timeout" ? 30 : 500,
+      closeGracePeriodMs: 1, killGracePeriodMs: 1, settlementDeadlineMs: 50,
+      spawn: (() => {
+        if (outcome === "launch") throw Object.assign(new Error("spawn failed"), { code: "ENOENT" });
+        const child = createMockChild();
+        queueMicrotask(() => {
+          child.stdout.emit("data", Buffer.from(JSON.stringify({ type: "usage", inputTokens: 120 }) + "\n" +
+            JSON.stringify({ type: "agent_event", event: { type: "content_start", contentType: "tool", toolName: "read_file", input: { path: "a" } } }) + "\n"));
+          if (outcome !== "timeout") {
+            child.stdout.emit("data", Buffer.from(JSON.stringify({ type: "run_result", finishReason: outcome === "success" ? "success" : "error", text: outcome === "success" ? "done" : "invalid request" }) + "\n"));
+            child.emit("close", outcome === "success" ? 0 : 1);
+          }
+        });
+        return child;
+      }) as any } };
+    try {
+      const result = await runCline({ provider: "p", model: "m", prompt: "test" }, undefined, options);
+      assert.equal(outcome, "success"); assert.equal(result.guard?.totalToolCalls, 1); assert.equal(result.guard?.totalInputTokens, 120);
+    } catch (error) {
+      assert.notEqual(outcome, "success"); assert.ok(error instanceof ClineRunError);
+      assert.equal(error.guard?.totalToolCalls, outcome === "launch" ? 0 : 1);
+      assert.equal(error.guard?.totalInputTokens, outcome === "launch" ? 0 : 120);
+    }
+  }
+  await assert.rejects(runCline({ provider: "p", model: "m", prompt: "test" }, AbortSignal.abort()), (error: unknown) =>
+    error instanceof ClineRunError && error.guard?.totalToolCalls === 0 && error.guard?.totalInputTokens === 0);
+});
+
 test("accepts the maximum prompt size without a system prompt", () => {
   assert.doesNotThrow(() => validateInputLimits({ prompt: "x".repeat(MAX_PROMPT_CHARACTERS) }));
 });

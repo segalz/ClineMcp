@@ -16,7 +16,7 @@ import { resolveTraceBase, type TraceInfo, type TraceRecorder, type TraceStatus 
 import { takeSnapshot, restoreSnapshot, discardSnapshot, headAndIndexIdentity, type SnapshotOptions } from "./snapshot.js";
 import { runVerification } from "./verify.js";
 import { buildStepPrompt, startTaskSchema, sumUsage, type StepDefinition, type PlanView, type PlanOutcome,
-  type StepAction, type StepExecution, type WaitReason } from "./steps.js";
+  DEFAULT_STEP_BUDGET, type StepBudget, type StepAction, type StepExecution, type WaitReason } from "./steps.js";
 
 export type TaskMode = "ask" | "workspace" | "edits";
 export type TaskState = "running" | "resuming" | "done" | "failed" | "cancelled" | "input_required";
@@ -32,6 +32,7 @@ export interface StartTaskInput {
   guard?: GuardOptions;
   codeMap?: boolean;
   steps?: StepDefinition[];
+  stepBudget?: StepBudget;
 }
 
 /** Async tasks may run longer than the sync tools' 300 s. */
@@ -675,7 +676,7 @@ export class TaskManager {
         task.result = result;
         task.previousRunAnswer = result.text ?? "";
         task.runHistory = task.runHistory ?? [];
-        task.runHistory.push({ run: task.run, trace });
+        task.runHistory.push({ run: task.run, trace, ...(result.guard ? { guard: result.guard } : {}) });
         const q = parseQuestionFromText(result.text ?? "");
         if (q) {
           task.state = "input_required";
@@ -713,6 +714,7 @@ export class TaskManager {
           task.runHistory.push({
             run: task.run,
             trace,
+            ...(err?.guard ? { guard: err.guard } : {}),
             error: err instanceof Error ? err.message : String(err)
           });
         }
@@ -750,7 +752,7 @@ export class TaskManager {
     plan.steps[plan.currentIndex].state = reason === "cline_question" ? "running" : "failed";
     task.waitReason = reason;
     task.evidence = evidence;
-    task.question = question ?? { question: reason === "budget" ? `Step ${plan.currentId}: launch budget exhausted. Skip or stop?`
+    task.question = question ?? { question: reason === "budget" ? `Step ${plan.currentId}: budget exhausted. Skip or stop?`
       : reason === "head_changed" ? `Step ${plan.currentId}: HEAD/index changed. Repair Git identity before retry/skip, or stop and inspect the recovery snapshot.`
       : `Step ${plan.currentId}: ${reason}. Retry with guidance, skip, or stop?`,
       options: reason === "budget" ? ["skip", "stop"] : ["retry", "skip", "stop"] };
@@ -802,6 +804,19 @@ export class TaskManager {
     task.error = new ClineRunError("cancelled", "The task was cancelled.", { attempts: 0 });
     task.waitReason = undefined;
     task.question = undefined;
+  }
+
+  private async checkPlanBudget(task: Task, beforeLaunch = false): Promise<boolean> {
+    const plan = task.plan!, budget = plan.budget!;
+    const step = plan.steps[plan.currentIndex].counters!;
+    const over = (used: number, limit: number) => beforeLaunch ? used >= limit : used > limit;
+    const scope = over(budget.totalToolCalls, budget.limits.maxToolCallsPerPlan) || over(budget.totalInputTokens, budget.limits.maxInputTokensPerPlan)
+      ? "plan" : over(step.totalToolCalls, budget.limits.maxToolCallsPerStep) || over(step.totalInputTokens, budget.limits.maxInputTokensPerStep) ? "step" : undefined;
+    if (!scope) return true;
+    if (await this.restorePlanStep(task)) this.waitPlan(task, "budget", { scope,
+      message: `${scope} resource budget exhausted; counters are retained across retries and skips.`,
+      budget: structuredClone(budget), step: { ...step }, restore: plan.steps[plan.currentIndex].restore });
+    return false;
   }
 
   private planPrompt(task: Task, message: string, resumeQuestion: boolean): string {
@@ -907,6 +922,7 @@ export class TaskManager {
     while (true) {
       this.checkCancelled(task);
       const record = plan.steps[plan.currentIndex];
+      if (!await this.checkPlanBudget(task, true)) return;
       if (record.attempts >= 3) {
         if (await this.restorePlanStep(task)) this.waitPlan(task, "budget", { message: "Three Cline launches exhausted; only skip or stop is allowed." });
         return;
@@ -940,17 +956,23 @@ export class TaskManager {
       task.guardReportSummary = undefined;
       task.state = "running";
       let result: ClineResponse | undefined, failure: unknown;
+      let finalGuard: GuardReport | undefined;
+      const limits = plan.budget!.limits;
+      const runGuard: GuardOptions = { ...task.guard,
+        maxToolCalls: Math.min(task.guard?.maxToolCalls ?? Infinity, limits.maxToolCallsPerStep - record.counters!.totalToolCalls),
+        maxInputTokens: Math.min(task.guard?.maxInputTokens ?? Infinity, limits.maxInputTokensPerStep - record.counters!.totalInputTokens) };
       const options: Partial<ClineInvocationOptions> = { ...this.deps.runOptions,
         checkoutLock: task.checkoutLock, trace: true, traceRunId: task.trace.runId,
         promptPreamble: (this.deps.runOptions?.promptPreamble ?? "") + TASK_QUESTION_PREAMBLE,
-        maxAttempts: 1, maxTimeoutSeconds: MAX_TASK_TIMEOUT_SECONDS, guard: task.guard,
+        maxAttempts: 1, maxTimeoutSeconds: MAX_TASK_TIMEOUT_SECONDS, guard: runGuard,
         onTraceStart: recorder => { task.recorder = recorder; } };
       if (this.deps.traceBase) options.deps = { ...options.deps, traceBase: this.deps.traceBase };
       try {
         const runner = this.deps.runners?.edits ?? runClineEditStep;
         result = await runner({ prompt, cwd: task.cwd!, provider: task.provider, model: task.model,
           thinking: task.thinking, timeoutSeconds: task.timeoutSeconds ?? DEFAULT_TASK_TIMEOUT_SECONDS,
-          guard: task.guard, codeMap: task.codeMap }, task.controller.signal, options);
+          guard: runGuard, codeMap: task.codeMap }, task.controller.signal, options);
+        finalGuard = result.guard;
         sumUsage(execution.usage, result.usage);
         execution.durationMs += result.durationMs;
         if (typeof result.cost === "number") execution.cost += result.cost;
@@ -959,6 +981,7 @@ export class TaskManager {
       } catch (err) {
         failure = err;
         task.error = err;
+        finalGuard = (err as { guard?: GuardReport } | undefined)?.guard;
         if (err instanceof ClineRunError && err.guard) {
           task.guardReport = err.guard;
           task.guardReportSummary = formatReportSummary(err.guard, err.message);
@@ -968,10 +991,17 @@ export class TaskManager {
         else if (err instanceof ClineRunError && err.guard) sumUsage(execution.usage, { inputTokens: err.guard.totalInputTokens });
         if (typeof metrics?.durationMs === "number" && Number.isFinite(metrics.durationMs)) execution.durationMs += metrics.durationMs;
       }
+      if (finalGuard) {
+        record.counters!.totalToolCalls += finalGuard.totalToolCalls;
+        record.counters!.totalInputTokens += finalGuard.totalInputTokens;
+        plan.budget!.totalToolCalls += finalGuard.totalToolCalls;
+        plan.budget!.totalInputTokens += finalGuard.totalInputTokens;
+      }
       task.runHistory ??= [];
-      task.runHistory.push({ run: task.run, trace: task.trace, ...(failure ? { error: errorText(failure), guard: task.guardReport } : {}) });
+      task.runHistory.push({ run: task.run, trace: task.trace, ...(finalGuard ? { guard: finalGuard } : {}), ...(failure ? { error: errorText(failure) } : {}) });
       this.checkCancelled(task);
       if (!await this.planIdentityUnchanged(task)) return;
+      if (!await this.checkPlanBudget(task)) return;
       if (failure) {
         const reason = failure instanceof ClineRunError && (failure.kind === "loop_detected" || failure.kind === "budget_exceeded")
           ? "guard" : "cline_error";
@@ -1071,7 +1101,8 @@ export class TaskManager {
     };
     if (input.steps) {
       task.plan = { total: input.steps.length, currentIndex: 0, currentId: input.steps[0].id, phase: "snapshot", attempt: 0,
-        steps: input.steps.map(step => ({ id: step.id, state: "pending", attempts: 0 })) };
+        steps: input.steps.map(step => ({ id: step.id, state: "pending", attempts: 0, counters: { totalToolCalls: 0, totalInputTokens: 0 } })),
+        budget: { limits: { ...DEFAULT_STEP_BUDGET, ...input.stepBudget }, totalToolCalls: 0, totalInputTokens: 0 } };
       task.stepExecution = { definitions: input.steps, launches: 0, usage: Object.create(null), cost: 0, durationMs: 0 };
     }
     this.tasks.set(id, task);

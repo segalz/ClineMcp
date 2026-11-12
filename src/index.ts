@@ -102,6 +102,7 @@ server.registerTool(
         text: result.text,
         ...(result.model ? { model: result.model } : {}),
         durationMs: result.durationMs,
+        ...(result.guard ? { guard: result.guard } : {}),
         ...(result.usage ? { usage: result.usage } : {}),
         ...(result.cost !== undefined ? { cost: result.cost } : {}),
         ...(result.warnings && result.warnings.length > 0 ? { warnings: result.warnings } : {}),
@@ -139,6 +140,7 @@ server.registerTool(
         text: result.text,
         ...(result.model ? { model: result.model } : {}),
         durationMs: result.durationMs,
+        ...(result.guard ? { guard: result.guard } : {}),
         ...(result.usage ? { usage: result.usage } : {}),
         ...(result.cost !== undefined ? { cost: result.cost } : {}),
         gitDiff: result.gitDiff,
@@ -213,6 +215,7 @@ server.registerTool(
         text: result.text,
         ...(result.model ? { model: result.model } : {}),
         durationMs: result.durationMs,
+        ...(result.guard ? { guard: result.guard } : {}),
         ...(result.usage ? { usage: result.usage } : {}),
         ...(result.cost !== undefined ? { cost: result.cost } : {}),
         ...(result.warnings && result.warnings.length > 0 ? { warnings: result.warnings } : {}),
@@ -301,7 +304,11 @@ server.registerTool(
       "Optional steps (edits only): 1-16 unique ids with instruction, optional relative path hints, and mandatory verify. " +
       "Steps run sequentially with byte snapshots, a checkout lock, and mandatory shell-free verification. " +
       "Failure restores the step and waits with waitReason/evidence; HEAD/index changes wait without reset. " +
-      "A step allows at most 3 Cline launches including question resumes. Input is strict and at most 64 KiB.",
+      "A step allows at most 3 Cline launches including question resumes. Optional stepBudget (requires steps) sets " +
+      "cumulative tool-call/input-token caps per step and plan. Defaults: step 150/1500000, plan 1000/10000000. " +
+      "Calls range 10-1000; tokens 10000-20000000. A run uses remaining step capacity, capped by explicit guard limits. " +
+      "Final guard counters include success, questions and errors; exhausted budgets restore and wait for skip/stop only. " +
+      "Skipping retains consumed plan capacity. Input is strict and at most 64 KiB.",
     inputSchema: startTaskObjectSchema.extend({
       provider: providerModelSchema,
       model: providerModelSchema
@@ -324,7 +331,8 @@ server.registerTool(
   {
     description: "Where a Cline task is now: state, step, current tool, last complete reasoning, files, any question Cline " +
       `asked. Long poll: returns as soon as the task finishes, asks a question (input_required), or after waitSeconds (max ${MAX_WAIT_SECONDS}). ` +
-      "Step plans include current step/index, phase, attempts, verification/restore records, waitReason and evidence.",
+      "Step plans include current step/index, phase, attempts, verification/restore records, per-step counters, " +
+      "plan budget limits/totals, waitReason and evidence. Run history includes final guard counters on every outcome.",
     inputSchema: {
       taskId: z.string().uuid(),
       waitSeconds: z.number().int().min(0).max(MAX_WAIT_SECONDS).optional().describe("Default 20.")
@@ -342,7 +350,8 @@ server.registerTool(
   {
     description: "Answer a waiting Cline task. For step plans, action retry (default) reruns the failed step from its baseline " +
       "with message as guidance; a cline_question resumes the same step with partial edits retained. skip records an unverified " +
-      "step and continues; stop ends as stopped, keeping verified changes. At the launch cap only skip/stop are allowed. " +
+      "step and continues; stop ends as stopped, keeping verified changes. At a launch/resource budget only skip/stop are allowed. " +
+      "Skip never refunds plan capacity or permits launches after plan exhaustion. " +
       "Omit message for skip/stop or a retry without guidance. Tasks without steps still require a message and support retry only.",
     inputSchema: z.object({
       taskId: z.string().uuid(),

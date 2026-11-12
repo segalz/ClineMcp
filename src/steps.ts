@@ -26,6 +26,18 @@ export type StepDefinition = z.infer<typeof stepSchema>;
 export type StepAction = "retry" | "skip" | "stop";
 export type WaitReason = "verify_failed" | "guard" | "cline_error" | "head_changed" | "budget" | "cline_question";
 export type PlanOutcome = "completed" | "completed_with_skips" | "stopped";
+export const stepBudgetSchema = z.object({
+  maxToolCallsPerStep: z.number().int().min(10).max(1000).optional(),
+  maxInputTokensPerStep: z.number().int().min(10_000).max(20_000_000).optional(),
+  maxToolCallsPerPlan: z.number().int().min(10).max(1000).optional(),
+  maxInputTokensPerPlan: z.number().int().min(10_000).max(20_000_000).optional()
+}).strict();
+export type StepBudget = z.infer<typeof stepBudgetSchema>;
+export const DEFAULT_STEP_BUDGET: Required<StepBudget> = {
+  maxToolCallsPerStep: 150, maxInputTokensPerStep: 1_500_000,
+  maxToolCallsPerPlan: 1000, maxInputTokensPerPlan: 10_000_000
+};
+export interface BudgetCounters { totalToolCalls: number; totalInputTokens: number; }
 export interface StepRecord {
   id: string;
   state: "pending" | "running" | "verified" | "skipped" | "failed";
@@ -34,6 +46,7 @@ export interface StepRecord {
   changedFiles?: string[];
   verify?: Pick<VerificationResult, "passed" | "exitCode" | "timedOut" | "stdoutTail" | "stderrTail">;
   restore?: RestoreReport;
+  counters?: BudgetCounters;
 }
 export interface PlanView {
   total: number;
@@ -42,6 +55,7 @@ export interface PlanView {
   phase: "snapshot" | "run" | "verify" | "restore" | "waiting" | "done";
   attempt: number;
   steps: StepRecord[];
+  budget?: BudgetCounters & { limits: Required<StepBudget> };
 }
 export interface StepExecution {
   definitions: StepDefinition[];
@@ -66,10 +80,12 @@ export const startTaskObjectSchema = z.object({
   waitSeconds: z.number().int().min(0).max(30).optional(),
   codeMap: z.boolean().optional(),
   guard: guardOptionsSchema.innerType().strict().pipe(guardOptionsSchema).optional(),
-  steps: stepsSchema.optional()
+  steps: stepsSchema.optional(),
+  stepBudget: stepBudgetSchema.optional()
 }).strict();
 export const startTaskSchema = startTaskObjectSchema.superRefine((input, context) => {
   if (input.steps && input.mode !== "edits") context.addIssue({ code: z.ZodIssueCode.custom, path: ["steps"], message: "steps require mode edits." });
+  if (input.stepBudget && !input.steps) context.addIssue({ code: z.ZodIssueCode.custom, path: ["stepBudget"], message: "stepBudget requires steps." });
   if (Buffer.byteLength(JSON.stringify(input), "utf8") > 64 * 1024) {
     context.addIssue({ code: z.ZodIssueCode.custom, message: "Input exceeds 64 KiB." });
   }

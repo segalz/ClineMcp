@@ -6,8 +6,9 @@ import { spawnSync } from "node:child_process";
 import { mkdir, mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { TaskManager, isPromptTooLarge, getEffectivePreamble, type Task, type TaskManagerDeps, type TaskStatusView } from "../tasks.js";
-import { buildStepPrompt, startTaskSchema, stepsSchema, type StepDefinition } from "../steps.js";
+import { TaskManager, isPromptTooLarge, getEffectivePreamble, type Task, type TaskManagerDeps, type TaskStatusView, type StartTaskInput } from "../tasks.js";
+import { buildStepPrompt, startTaskSchema, stepsSchema, DEFAULT_STEP_BUDGET, type StepDefinition } from "../steps.js";
+import type { GuardReport } from "../guard.js";
 import { ClineRunError } from "../runner.js";
 import { acquire, CheckoutBusyError, ownsCheckoutLock } from "../checkoutlock.js";
 import { runClineEditStep } from "../edits.js";
@@ -40,20 +41,20 @@ async function fixture(t: test.TestContext, extra: TaskManagerDeps = {}) {
   await writeFile(path.join(cwd, "a"), "dirty baseline\r\n");
   await writeFile(path.join(cwd, "untracked"), Buffer.from([0, 255, 13, 10]));
   await writeFile(path.join(cwd, "ignored"), "ignored baseline");
-  const runs: Array<{ input: any; options: any; signal: AbortSignal; finish: (text?: string, usage?: Record<string, unknown>) => void; fail: (error: unknown) => void }> = [];
+  const runs: Array<{ input: any; options: any; signal: AbortSignal; finish: (text?: string, usage?: Record<string, unknown>, guard?: GuardReport) => void; fail: (error: unknown) => void }> = [];
   const manager = new TaskManager({ ...extra, traceBase: path.join(base, "traces"),
     snapshotOptions: { snapshotBase: snapshots, ...extra.snapshotOptions },
     runOptions: { checkoutLockDirectory: locks, ...extra.runOptions },
     runners: { edits: (input, signal, options) => new Promise((resolve, reject) => {
       const run = { input, signal, options, fail: reject,
-        finish: (text = "Implemented\nDetails", usage: Record<string, unknown> = { inputTokens: 10, outputTokens: 2 }) => resolve({ text, usage, cost: 0.1, durationMs: 10 } as any) };
+        finish: (text = "Implemented\nDetails", usage: Record<string, unknown> = { inputTokens: 10, outputTokens: 2 }, guard?: GuardReport) => resolve({ text, usage, guard, cost: 0.1, durationMs: 10 } as any) };
       runs.push(run);
       signal.addEventListener("abort", () => reject(new ClineRunError("cancelled", "cancelled")), { once: true });
     }) } });
   t.after(() => manager.shutdown(30_000));
   let lastTaskId = "";
-  const start = (steps: StepDefinition[], prompt = "Complete the objective") => {
-    const started = manager.start({ mode: "edits", cwd, prompt, steps, codeMap: false, ...selection });
+  const start = (steps: StepDefinition[], prompt = "Complete the objective", options: Pick<StartTaskInput, "guard" | "stepBudget"> = {}) => {
+    const started = manager.start({ mode: "edits", cwd, prompt, steps, codeMap: false, ...selection, ...options });
     lastTaskId = started.taskId;
     return started;
   };
@@ -347,5 +348,88 @@ test("cancel during snapshot or restore never launches another run and waits for
     assert.equal(await readFile(path.join(f.cwd, "a"), "utf8"), "dirty baseline\r\n");
     assert.ok(f.runs.length <= (phase === "snapshot" ? 0 : 1));
     const release = acquire(f.cwd, { lockDirectory: f.locks }); release(); await f.snapshotsEmpty();
+  }
+});
+
+const counters = (calls: number, tokens: number): GuardReport => ({ window: 10, lastErrors: [], filesTouched: [],
+  totalToolCalls: calls, totalInputTokens: tokens });
+
+test("stepBudget is strict, bounded like guard, requires steps, and defaults are exposed", async t => {
+  const input = { mode: "edits", prompt: "objective", cwd: "repo", ...selection, steps: [step("one")] };
+  for (const stepBudget of [{ maxToolCallsPerStep: 9 }, { maxToolCallsPerPlan: 1001 }, { maxInputTokensPerStep: 9999 },
+    { maxInputTokensPerPlan: 20_000_001 }, { maxToolCallsPerStep: 10.5 }, { unknown: 10 }]) {
+    assert.equal(startTaskSchema.safeParse({ ...input, stepBudget }).success, false);
+  }
+  assert.equal(startTaskSchema.safeParse({ ...input, steps: undefined, stepBudget: {} }).success, false);
+  assert.equal(startTaskSchema.safeParse({ ...input, stepBudget: {} }).success, true);
+  const f = await fixture(t);
+  const started = f.start([step("one")]);
+  assert.deepEqual(started.plan?.budget?.limits, DEFAULT_STEP_BUDGET);
+  await f.manager.cancel(started.taskId);
+});
+
+test("per-step budgets span question resumes, cap explicit guard limits, restore and permit only skip/stop", async t => {
+  for (const dimension of ["calls", "tokens"] as const) {
+    const f = await fixture(t);
+    const started = f.start([step("one"), step("two")], "objective", { stepBudget: {
+      maxToolCallsPerStep: 20, maxInputTokensPerStep: 20_000
+    }, guard: { maxToolCalls: 15, maxInputTokens: 15_000, window: 7 } });
+    const first = await f.launched(1);
+    assert.equal(first.options.guard.maxToolCalls, 15); assert.equal(first.options.guard.maxInputTokens, 15_000);
+    assert.equal(first.options.guard.window, 7); assert.deepEqual(first.input.guard, first.options.guard);
+    await writeFile(path.join(f.cwd, "a"), "partial question");
+    first.finish("QUESTION: Continue?", undefined, dimension === "calls" ? counters(12, 100) : counters(1, 12_000));
+    await f.wait(started.taskId, status => status.waitReason === "cline_question");
+    await f.manager.send(started.taskId, "Continue");
+    const second = await f.launched(2);
+    assert.equal(second.options.guard[dimension === "calls" ? "maxToolCalls" : "maxInputTokens"], dimension === "calls" ? 8 : 8000);
+    await writeFile(path.join(f.cwd, "a"), "over budget");
+    second.fail(new ClineRunError("budget_exceeded", "step budget", { guard: dimension === "calls" ? counters(9, 100) : counters(1, 9000) }));
+    const waiting = await f.wait(started.taskId, status => status.state === "input_required");
+    assert.equal(waiting.waitReason, "budget"); assert.equal(waiting.evidence?.scope, "step");
+    assert.equal(waiting.plan?.steps[0].counters?.[dimension === "calls" ? "totalToolCalls" : "totalInputTokens"], dimension === "calls" ? 21 : 21_000);
+    assert.equal(await readFile(path.join(f.cwd, "a"), "utf8"), "dirty baseline\r\n");
+    await assert.rejects(f.manager.send(started.taskId, "retry"), (err: unknown) => err instanceof ClineRunError && err.kind === "budget_exceeded");
+    await f.manager.send(started.taskId, undefined, "skip");
+    const third = await f.launched(3);
+    assert.equal(third.options.guard.maxToolCalls, 15); assert.equal(third.options.guard.maxInputTokens, 15_000);
+    third.finish("done", undefined, counters(1, 100));
+    const done = await f.wait(started.taskId, status => status.state === "done");
+    assert.equal(done.outcome, "completed_with_skips");
+    await f.snapshotsEmpty();
+  }
+});
+
+test("plan budgets sum success and error guards across steps/retries, retain verified edits, and cannot be reset by skip", async t => {
+  for (const dimension of ["calls", "tokens"] as const) {
+    const f = await fixture(t);
+    const started = f.start([step("one"), step("two"), step("three")], "objective", { stepBudget: {
+      maxToolCallsPerPlan: 20, maxInputTokensPerPlan: 20_000
+    } });
+    const report = (amount: number) => dimension === "calls" ? counters(amount, 100) : counters(1, amount * 1000);
+    const first = await f.launched(1);
+    await writeFile(path.join(f.cwd, "a"), "verified step"); first.finish("one", undefined, report(8));
+    const second = await f.launched(2);
+    await writeFile(path.join(f.cwd, "a"), "failed step"); second.fail(new ClineRunError("non_zero_exit", "retry me", { guard: report(6) }));
+    await f.wait(started.taskId, status => status.state === "input_required");
+    await f.manager.send(started.taskId, "Retry");
+    const third = await f.launched(3);
+    await writeFile(path.join(f.cwd, "a"), "unverified overspend"); third.finish("two", undefined, report(7));
+    const waiting = await f.wait(started.taskId, status => status.state === "input_required");
+    assert.equal(waiting.waitReason, "budget"); assert.equal(waiting.evidence?.scope, "plan");
+    assert.equal(waiting.plan?.budget?.[dimension === "calls" ? "totalToolCalls" : "totalInputTokens"], dimension === "calls" ? 21 : 21_000);
+    assert.equal(waiting.plan?.steps[1].verify, undefined, "verification never runs after crossing the plan limit");
+    assert.equal(await readFile(path.join(f.cwd, "a"), "utf8"), "verified step");
+    assert.equal(waiting.runHistory?.filter(run => run.guard).length, 3);
+    await assert.rejects(f.manager.send(started.taskId, "retry"), ClineRunError);
+    await f.manager.send(started.taskId, undefined, "skip");
+    const stillWaiting = await f.wait(started.taskId, status => status.state === "input_required");
+    assert.equal(stillWaiting.plan?.currentId, "three"); assert.equal(stillWaiting.waitReason, "budget");
+    assert.equal(f.runs.length, 3, "skip cannot launch past the retained plan budget");
+    await f.manager.send(started.taskId, undefined, "stop");
+    await f.wait(started.taskId, status => status.state === "done");
+    const result = await f.manager.result(started.taskId);
+    assert.equal(result.outcome, "stopped"); assert.equal(result.log_run_hint?.ok, false);
+    await f.snapshotsEmpty();
   }
 });

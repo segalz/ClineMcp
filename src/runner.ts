@@ -3,7 +3,7 @@ import { access } from "node:fs/promises";
 import path from "node:path";
 import { z } from "zod";
 import { LineSplitter, TraceRecorder, type TraceInfo } from "./trace.js";
-import { createGuard, buildGuardTripMessage, type GuardOptions, type GuardReport, type GuardVerdict } from "./guard.js";
+import { createGuard, buildGuardTripMessage, type Guard, type GuardOptions, type GuardReport, type GuardVerdict } from "./guard.js";
 import {
   JsonlParseError,
   parseClineJsonl,
@@ -235,6 +235,8 @@ export interface ClineInvocationOptions {
 }
 
 export interface ClineResponse extends ClineFinalResult {
+  /** Final counters on every run, including successful runs and all internal attempts. */
+  guard?: GuardReport;
   durationMs: number;
   /** Where this run's live trace was written (only when requested). */
   trace?: TraceInfo;
@@ -583,6 +585,31 @@ export async function runCline(
   signal?: AbortSignal,
   options: ClineInvocationOptions = {}
 ): Promise<ClineResponse> {
+  const guards: Guard[] = [];
+  const finalReport = (existing?: GuardReport): GuardReport => {
+    const reports = guards.map(guard => guard.snapshot());
+    const last = reports.at(-1) ?? existing ?? { window: options.guard?.window ?? input.guard?.window ?? 10,
+      lastErrors: [], totalToolCalls: 0, totalInputTokens: 0, filesTouched: [] };
+    return Object.assign(last, {
+      totalToolCalls: reports.length ? reports.reduce((sum, report) => sum + report.totalToolCalls, 0) : last.totalToolCalls,
+      totalInputTokens: reports.length ? reports.reduce((sum, report) => sum + report.totalInputTokens, 0) : last.totalInputTokens,
+      filesTouched: [...new Set(reports.length ? reports.flatMap(report => report.filesTouched) : last.filesTouched)] });
+  };
+  try {
+    const response = await runClineCore(input, signal, options, guards);
+    response.guard = finalReport();
+    return response;
+  } catch (error) {
+    if (error && typeof error === "object") {
+      const outcome = error as { guard?: GuardReport };
+      outcome.guard = finalReport(outcome.guard);
+    }
+    throw error;
+  }
+}
+
+async function runClineCore(input: AskClineInput, signal: AbortSignal | undefined,
+  options: ClineInvocationOptions, guards: Guard[]): Promise<ClineResponse> {
   if (signal?.aborted) {
     throw new ClineRunError("cancelled", "The Cline request was cancelled.", { attempts: 0 });
   }
@@ -794,6 +821,7 @@ export async function runCline(
         const thisAttempt = attempt;
         recorder?.attemptStarted(thisAttempt);
         const guard = createGuard(options.guard ?? effectiveInput.guard);
+        guards.push(guard);
         const guardState: { verdict: GuardVerdict | null } = { verdict: null };
         let terminateChild!: (reason: "timeout" | "cancelled" | "guard") => void;
         const splitter = new LineSplitter(

@@ -177,7 +177,7 @@ cline_list_models({})
 
 ### 6. `cline_start`
 
-Start a Cline task asynchronously in the background and return its initial `TaskStatusView`. The bridge stops a run on repeated failures or budget and waits for guidance via `cline_send`.
+Start a Cline task asynchronously and return its initial `TaskStatusView`. Optional edits-mode `steps` run a verified plan (see [Micro-steps](#micro-steps)). The bridge stops a run on repeated failures or budget and waits for guidance via `cline_send`.
 
 ```ts
 cline_start({
@@ -190,6 +190,8 @@ cline_start({
   thinking?: "none" | "low" | "medium" | "high" | "xhigh",
   timeoutSeconds?: number,
   waitSeconds?: number,
+  steps?: Step[],             // edits only; see Micro-steps
+  stepBudget?: StepBudget,   // requires steps; see Micro-steps
   guard?: {
     maxRepeatedFailures?: number,
     window?: number,
@@ -200,7 +202,7 @@ cline_start({
 ```
 
 - `mode`, `prompt` (`1`–`20,000` chars), `provider`, and `model` are required (no saved-default fallback; `cwd` is required for `"workspace"` and `"edits"`).
-- Runs a single attempt (`maxAttempts: 1`, no automatic retry) with `timeoutSeconds` defaulting to `600` (`1`–`1800`); waits up to `waitSeconds` (default `3`, `0`–`30`) for first progress before returning.
+- Each Cline launch runs a single attempt (`maxAttempts: 1`, no automatic retry) with `timeoutSeconds` defaulting to `600` (`1`–`1800`); waits up to `waitSeconds` (default `3`, `0`–`30`) for first progress before returning.
 - Optional `guard` configuration overrides default loop/budget detection thresholds.
 - Caps and retention: at most `2` concurrent active (`"running"` or `"resuming"`) tasks (`MAX_RUNNING_TASKS`; exceeding throws `task_limit`), a `1 hour` TTL (`UNCOLLECTED_TTL_MS`) for settled uncollected tasks, and at most `20` retained settled tasks (`MAX_SETTLED_TASKS`).
 - Task states: `"running"`, `"resuming"`, `"input_required"`, `"done"`, `"failed"`, and `"cancelled"`.
@@ -220,23 +222,24 @@ cline_status({
 
 - `taskId` (UUID) is required; `waitSeconds` defaults to `20` (`0`–`60`, where `0` returns immediately).
 - Long-polls until the task settles (`"done"`, `"input_required"`, `"failed"`, `"cancelled"`), Cline emits a new unreported question in the trace, or `waitSeconds` elapses.
-- Returns `TaskStatusView`: `{ taskId, mode, state, elapsedMs, run, runs, progress?, question?, autoAnswered?, error?, resultReady, trace }`.
+- Returns `TaskStatusView`: `{ taskId, mode, state, elapsedMs, run, runs, runHistory?, progress?, question?, autoAnswered?, error?, resultReady, trace, plan?, waitReason?, evidence?, outcome? }`.
 - `progress` exposes live trace fields (`attempt`, `iteration`, `clineTaskId`, `currentTool`, `toolCalls`, `lastReasoning`, `lastText`, `streamingChars`, `files`, `question`, `eventsWritten`, `eventsDropped`, `finish`).
 
 ### 8. `cline_send`
 
-Send an answer to a task waiting in `"input_required"` state, starting a fresh Cline run with accumulated context under the same `taskId`.
+Answer a task waiting in `"input_required"`. Without a step plan this starts a fresh Cline run with accumulated context under the same `taskId`. Step plans also support retry/skip/stop as described in [Micro-steps](#micro-steps).
 
 ```ts
 cline_send({
   taskId: string,
-  message: string,
+  message?: string,
+  action?: "retry" | "skip" | "stop", // step plans; default retry
   waitSeconds?: number
 })
 ```
 
 - Requires the task to be in `"input_required"` state (otherwise throws `task_not_waiting`) and counts toward the `2`-running-task limit while `"resuming"`/`"running"`.
-- `message` is `1`–`20,000` characters; `waitSeconds` defaults to `3` (`0`–`30`) before returning the updated `TaskStatusView`.
+- Non-plan tasks require `message` of `1`–`20,000` characters; step plans accept an omitted/empty message. `waitSeconds` defaults to `3` (`0`–`30`) before returning the updated `TaskStatusView`.
 - Starts a new run (`run` incremented, trace `<taskId>-run-<N>`) with a prompt combining `Original task`, `Previous answer`, `Working directory diff stat` (`git diff --stat` for `"workspace"`/`"edits"`), prior Q&A pairs, and the latest `Cline question` / `Options` / `Caller answer`.
 - If the assembled prompt exceeds `20,000` characters or the `32,000`-unit Windows command-line limit, it trims `diffStat`, then `previousAnswer` (keeping the tail), then oldest Q&A pairs, then `originalPrompt` (keeping the head); if the latest question + answer alone cannot fit, it throws `launch_failed` and keeps the task in `"input_required"`.
 
@@ -250,7 +253,7 @@ cline_cancel({
 })
 ```
 
-- Aborts a `"running"` or `"resuming"` task (killing its Cline process tree and waiting up to `5 s` to settle) or transitions an `"input_required"` task to `"cancelled"`.
+- Non-plan tasks abort a `"running"` or `"resuming"` run (killing its Cline process tree and waiting up to `5 s` to settle) or transition a waiting task to `"cancelled"`. Step plans additionally wait for unverified-step rollback and lock release before cancellation returns.
 - Returns the `TaskStatusView` with `state: "cancelled"`.
 - Does not remove the task; call `cline_result` afterwards to collect it and clean up its traces.
 
@@ -266,9 +269,122 @@ cline_result({
 ```
 
 - Fails with `task_running` if the task is still `"running"` or `"resuming"`.
-- Returns `{ state, result?, error?, log_run_hint, log_run_note?, trace? }`.
+- Returns `{ state, result?, error?, runHistory?, plan?, outcome?, waitReason?, evidence?, log_run_hint, log_run_note?, trace? }`.
 - `log_run_hint` is `{ ok, error_kind?: "timeout" | "quota" | "crash", retry_after_s?, error_text?, duration_s }` for `model-picker`'s `log_run`, or `null` (with `log_run_note`) when the task was `"cancelled"`, is in `"input_required"`, or failed locally before/around the model run (`workspace_not_git`, `workspace_setup_failed`, `workspace_cleanup_failed`, `settings_lock_timeout`, `settings_restore_failed`, `launch_failed`, `catalog_unavailable`, `edits_inspection_failed`, `cline_updating`, `task_*`).
 - For settled tasks (`"done"`, `"failed"`, `"cancelled"`), removes the task from memory and deletes its trace directories unless `keepTrace: true` (default `false`); for `"input_required"`, keeps the task and traces so it can be resumed with `cline_send`.
+
+## Micro-steps
+
+An edits task can run a caller-supplied plan sequentially. The caller supplies the objective in `prompt`;
+the bridge gives Cline one small step per fresh run, verifies it, and restores unverified changes on failure.
+No automatic planner or parallel steps are used. Calls without `steps` retain the existing single-run behavior.
+
+```ts
+type Step = {
+  id: string;                    // unique; [A-Za-z0-9_-]{1,64}
+  instruction: string;           // 1-4,000 characters
+  paths?: string[];              // at most 32 relative path hints
+  verify: {                     // mandatory
+    command: string;
+    args?: string[];
+    timeoutSeconds?: number;     // default 60; integer 1-300
+  };
+};
+type StepBudget = {
+  maxToolCallsPerStep?: number;
+  maxInputTokensPerStep?: number;
+  maxToolCallsPerPlan?: number;
+  maxInputTokensPerPlan?: number;
+};
+
+cline_start({
+  mode: "edits", cwd: "C:\\Develop\\example", provider: "cline", model: "<available-model-id>",
+  prompt: "Add and validate the requested behavior",
+  steps: [{ id: "implement", instruction: "Implement the requested behavior and its tests", paths: ["src"],
+    verify: { command: "npm", args: ["test"], timeoutSeconds: 120 } }],
+  stepBudget: { maxToolCallsPerStep: 150, maxInputTokensPerStep: 1500000,
+    maxToolCallsPerPlan: 1000, maxInputTokensPerPlan: 10000000 }
+});
+```
+
+### Input, verification, and rollback
+
+- `steps` is accepted only with `mode: "edits"`; provide 1-16 steps. `stepBudget` requires `steps`.
+  Input is strict (unknown fields rejected) and at most 64 KiB of serialized UTF-8 JSON.
+  Path hints reject absolute paths, traversal, `.git`, Windows device names, and alternate data streams.
+- Each run receives the objective, current step, and a ledger of verified steps (id, first-line summary,
+  changed files; at most 4,000 characters). The ledger shrinks before mandatory prompt content;
+  command-line/prompt limits still apply. Existing working rules, guards, and optional code maps remain active.
+- Verification uses literal executable/argument arrays with `shell: false`, checkout-root cwd, and closed stdin.
+  No implicit shell expansion, pipelines, or batch scripts. On Windows, `npm`, `npx`, `npm.cmd`, and `npx.cmd`
+  run through `node.exe` and the installed npm's `npm-cli.js`/`npx-cli.js`. Resolution checks
+  `node_modules/npm/bin` beside `process.execPath`, then `%APPDATA%/npm/node_modules/npm/bin`.
+  Other `.cmd`/`.bat` commands are refused; plain executables resolve via PATH.
+  Pass means exit zero without timeout, cancellation, or output kill. Output above 1 MiB combined kills
+  the process tree; returned stdout/stderr tails are at most 8 KiB each and secrets are redacted.
+- Before each step, raw bytes of tracked and untracked-not-ignored files are copied outside the checkout,
+  normally under the OS temporary directory's `cline-mcp-snapshots`. Ignored files are excluded and untouched.
+  Limits are 20,000 files, 64 MiB per file, and 512 MiB total; oversized snapshots are refused before writing.
+  Submodules, nested repositories, symlinks, and reparse points are refused.
+- Failure restores modified/deleted files and removes newly added non-ignored files. Restoration never stages,
+  resets, or changes HEAD/index. If HEAD or the index changed, the task fails closed with `head_changed`
+  evidence and retains its recovery snapshot; repair identity before retry/skip, or stop for manual recovery.
+- One canonical-checkout writer lock is shared with synchronous edits, held throughout the plan and while
+  waiting. It uses an in-process lease and `~/.cline-mcp/locks`; a dead holder's lock can be reclaimed.
+  Cancel aborts the active process, waits for unverified-step rollback, and releases the lock. Failed-closed
+  identity mismatches or incomplete restoration retain recovery evidence/snapshots instead of resetting Git.
+
+### Budgets and actions
+
+| Limit | Default | Allowed integers |
+|---|---:|---:|
+| `maxToolCallsPerStep` | 150 | 10-1,000 |
+| `maxInputTokensPerStep` | 1,500,000 | 10,000-20,000,000 |
+| `maxToolCallsPerPlan` | 1,000 | 10-1,000 |
+| `maxInputTokensPerPlan` | 10,000,000 | 10,000-20,000,000 |
+
+Step counters accumulate across retries and question resumes. Each run's guard uses the remaining step
+capacity, capped by any explicit `guard.maxToolCalls` / `guard.maxInputTokens`; loop/window settings are preserved.
+Internal remaining allowances can be smaller than the public schema minima. Final guard counters are exported
+on success, questions, failures, timeouts, and cancellation (zero when nothing launched), including internal
+attempts, and summed once into step/plan counters. Usage records are not counted again as budget consumption.
+
+Exceeding a step or plan limit restores the current unverified step and waits with `waitReason: "budget"`;
+only skip/stop are allowed. A completed run exactly at a limit can pass verification, but no new run starts
+when that step or plan has no capacity left. Plan totals are checked after each run, before verification or
+advancement. Previously verified steps are retained; retries, restore, and skip do not refund spent capacity.
+Skipping after plan exhaustion cannot launch another step: it remains budget-blocked, allowing further skip/stop.
+
+- `cline_send({taskId, action: "retry", message: "guidance"})` (the default action) restores a failed step's
+  baseline and launches it with guidance and failure evidence. A `cline_question` instead retains partial edits
+  and resumes the same step with its Q&A context. Every step allows at most three Cline launches, including resumes.
+- `action: "skip"` restores the unverified step, records it as skipped, and advances without adding it to the
+  verified ledger. `message` may be omitted.
+- `action: "stop"` restores the unverified step where safe and ends the plan as stopped, preserving verified
+  changes. `message` may be omitted. A non-plan task still requires a non-empty message and supports retry only.
+
+### Status and result
+
+`cline_status` and `cline_result` include `plan`:
+
+```ts
+{
+  total, currentIndex, currentId, // index is zero-based
+  phase,                       // snapshot | run | verify | restore | waiting | done
+  attempt,
+  budget: { limits, totalToolCalls, totalInputTokens },
+  steps: [{ id, state, attempts, summary?, changedFiles?,
+    counters: { totalToolCalls, totalInputTokens },
+    verify?: { passed, exitCode, timedOut, stdoutTail, stderrTail }, restore? }]
+}
+```
+
+Step state is `pending | running | verified | skipped | failed`. Waiting includes `waitReason` and evidence:
+`verify_failed | guard | cline_error | head_changed | budget | cline_question`.
+Every `runHistory` item includes its final `guard` counters when a Cline invocation ran.
+Final task state is `done` with `outcome: completed | completed_with_skips | stopped`; cancellation is `cancelled`.
+Result usage is summed across runs. Only `completed` produces an `ok: true` aggregated `log_run_hint`;
+waiting/cancelled tasks return a null hint. Collecting a waiting result keeps the task and writer lock.
 
 ## Loop and Budget Guard
 
@@ -291,8 +407,9 @@ Available as an optional `guard` object on `apply_cline_edits`, `ask_cline_works
 - `maxInputTokens`: Integer between `10,000` and `20,000,000` (default `1,500,000`).
 
 ### The Guard Report
-When tripped (or inspected via task history), a `GuardReport` object is attached (`err.guard` or `task.guard`):
-- `kind`: `"loop_detected"` or `"budget_exceeded"`.
+Every Cline invocation exports a final `GuardReport` on its response or error, including successful runs.
+Task run history retains these reports; a tripped guard is also exposed on the task's waiting status:
+- `kind`: `"loop_detected"` or `"budget_exceeded"` when tripped; omitted on an untripped final report.
 - `tool`: The tool involved in the loop (e.g. `"replace_in_file"`, `"run_commands"`).
 - `target`: The failing file path or command (secrets redacted).
 - `count`: Number of times the failure signature appeared in the window.
