@@ -36,3 +36,39 @@ Go. A1 keeps accuracy and cuts free-model tokens by about a third. Next:
 - make the codeindex map the default in both MCP configurations (`CODEINDEX_CLI`, after owner OK);
 - a harder question set and the hard analysis task, 3 runs per cell, to test accuracy;
 - arms B (tools) and C (brief) only if that shows a remaining localization gap.
+
+# Hard set (13.P2, 2026-11-13)
+
+Ten harder questions (`stage13-pilot/hardq.json`): multi-file flows, callers, lifecycle paths. Each
+question has 2-4 expected items (identifier + file); the score is the fraction found. 3 runs per
+question, arm and bridge, with the arm order alternated (`runhard.sh`, `scoreH.mjs`). Code at 96eeeb2.
+
+| Bridge | Arm | Score | Avg time | Avg input tokens | Avg tool calls |
+|---|---|---|---|---|---|
+| Cline | A0 regex | 25.8/30 (1 run errored; 0.89 per valid run) | 52 s | 103,523 | 4.0 |
+| Cline | A1 codeindex | 23.3/30 (0.78) | 52 s | 112,218 | 4.2 |
+| OpenCode | both | invalid | - | - | - |
+
+## Reading
+
+- **OpenCode:** invalid. From h04 on, every run timed out at 240 s with 0 tokens. A probe of all 12 free
+  OpenCode models at the same time also timed out, so this was a provider outage, not the map.
+  The OpenCode half must be rerun when the service is back.
+- **Cline accuracy:** no gain from A1. Per question A1 was higher on 2 (h02, h03), equal on 3 (h01, h04,
+  h10) and lower on 5 (h05-h09). That split is not significant (sign test p ≈ 0.45), but there is no sign
+  of an accuracy benefit either.
+- **Cline cost:** the pilot's token saving disappears on hard questions (+8%, within noise: single runs
+  range from 29k to 540k tokens). On hard questions the model explores anyway.
+- **Why A1 lost on h05-h07:** the map's file ranking is weak for multi-step questions. For h05 (the
+  model catalog) it does not surface `status.ts` (`resolveCatalogPath`), so the model followed the
+  map's candidates to a neighbouring answer (`clistate.ts`). Some losses (h06 `editQuestion` in
+  `edits.ts` versus the expected `parseQuestionFromText` in `tasks.ts`) are partly question ambiguity.
+
+## Decision (D-35, updated)
+
+- Keep codeindex as the default: it cuts about a third of the tokens on targeted questions (pilot) and
+  costs nothing measurable on hard ones.
+- It does not raise accuracy on hard questions. The bottleneck there is the map's ranking, not its
+  format, so arms B (tools) and C (brief) would not address it.
+- Next, if pursued: improve the query-to-file ranking in codeindex (for example, weight definitions over
+  mentions) and rerun the hard set on both bridges once OpenCode is back.
