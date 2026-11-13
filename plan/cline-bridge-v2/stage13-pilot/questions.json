@@ -1,0 +1,12 @@
+[
+ {"id":"q01","q":"Which function determines the normalized target (file path, command, or input hash) of a tool call for the loop guard?","expect":[["extractTarget","guard.ts"]]},
+ {"id":"q02","q":"Where is the rule 'the same tool and target failed N times within the window' enforced?","expect":[["createGuard|observe","guard.ts"]]},
+ {"id":"q03","q":"Which functions call withCodeMap?","expect":[["runEdits","edits.ts"],["askClineWorkspace","workspace.ts"]]},
+ {"id":"q04","q":"Which function builds the prompt used when an async task resumes after the caller answers a question?","expect":[["buildResumedPrompt","tasks.ts"]]},
+ {"id":"q05","q":"Which function writes the pre-run file bytes back when a failed edit is restored?","expect":[["restoreSnapshot","snapshot.ts"]]},
+ {"id":"q06","q":"Which function turns npm or npx in a verification command into a node invocation on Windows?","expect":[["resolveVerificationCommand","verify.ts"]]},
+ {"id":"q07","q":"How does the checkout writer lock decide that an existing lock holder is stale? Name the function.","expect":[["deadHolder|pidIsGone","checkoutlock.ts"]]},
+ {"id":"q08","q":"Which function removes secrets such as API keys from text before the bridge returns it?","expect":[["redactSecrets","runner.ts"]]},
+ {"id":"q09","q":"Which function builds the fix-run prompt after a failed final check?","expect":[["buildFixPrompt","finalcheck.ts"]]},
+ {"id":"q10","q":"Which function calls formatGuardContext?","expect":[["buildResumedPrompt","tasks.ts"]]}
+]

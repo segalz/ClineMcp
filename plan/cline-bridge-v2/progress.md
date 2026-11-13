@@ -99,3 +99,5 @@ Status values: `todo`, `in progress`, `done`, `blocked`, `skipped`.
 
 | 13.plan | Plan Stage 13 (structural code context), Codex review | done | 2026-11-13 | approved with 9 changes, folded in; next 13.0 |
 | 13.0-13.2 | codeindex contracts, parser/cache feasibility, library and CLI (`C:\Develop\codeindex`, local repo, branch stage13-feasibility) | done | 2026-11-13 | WASM grammars js/ts/tsx/python parse offline on Windows (ABI 14, web-tree-sitter 0.25.10); 43 tests; live maps on this repo anchor correctly and show callers/callees; AGY approved. Next: 13.3 bridge integration, 13.P pilot |
+| 13.3 | Bridge integration (Cline 06f3ccc, OpenCode branch codeindex-map 8109c8e), optional `CODEINDEX_CLI` | done | 2026-11-13 | AGY approved both; Cline 321 tests, OpenCode 87 |
+| 13.P | Pilot A0 regex vs A1 codeindex, 10 questions x 2 bridges | done | 2026-11-13 | stage13-results.md: accuracy 10/10 both arms; input tokens -32% Cline, -36% OpenCode; OpenCode 35% faster. Go |
