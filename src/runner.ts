@@ -124,6 +124,7 @@ export interface ClineRunErrorDetails {
 }
 
 export class ClineRunError extends Error {
+  public codeMapSource?: CodeMapSource;
   public readonly exitCode?: number | null;
   public readonly stderrTail?: string;
   public readonly stdoutTail?: string;
@@ -204,6 +205,10 @@ export interface ClineDependencies {
 }
 
 export interface ClineInvocationOptions {
+  /** Map preparation is part of the run's existing total deadline. */
+  preparationMs?: number;
+  codeMapSource?: CodeMapSource;
+  onCodeMapSource?: (source: CodeMapSource) => void;
   /** Internal task-owned lease; a sync run otherwise acquires its own lease. */
   checkoutLock?: import("./checkoutlock.js").CheckoutRelease;
   /** Override for isolated tests; production uses ~/.cline-mcp/locks. */
@@ -234,7 +239,10 @@ export interface ClineInvocationOptions {
   guard?: GuardOptions;
 }
 
+export type CodeMapSource = "codeindex" | "regex" | "none";
+
 export interface ClineResponse extends ClineFinalResult {
+  codeMapSource?: CodeMapSource;
   /** Final counters on every run, including successful runs and all internal attempts. */
   guard?: GuardReport;
   durationMs: number;
@@ -362,6 +370,7 @@ export function formatErrorAsText(error: unknown, fallbackMessage: string): stri
     if (error.guard) {
       lines.push(`Guard Report:\n${JSON.stringify(error.guard, null, 2)}`);
     }
+    if (error.codeMapSource) lines.push(`codeMapSource: ${error.codeMapSource}`);
     for (const note of error.notes ?? []) {
       lines.push(`Note: ${note}`);
     }
@@ -598,11 +607,13 @@ export async function runCline(
   try {
     const response = await runClineCore(input, signal, options, guards);
     response.guard = finalReport();
+    if (options.codeMapSource) response.codeMapSource = options.codeMapSource;
     return response;
   } catch (error) {
     if (error && typeof error === "object") {
-      const outcome = error as { guard?: GuardReport };
+      const outcome = error as { guard?: GuardReport; codeMapSource?: CodeMapSource };
       outcome.guard = finalReport(outcome.guard);
+      if (options.codeMapSource) outcome.codeMapSource = options.codeMapSource;
     }
     throw error;
   }
@@ -639,7 +650,7 @@ async function runClineCore(input: AskClineInput, signal: AbortSignal | undefine
   const nowFn = deps.now ?? (() => performance.now());
   const overallStarted = nowFn();
   const totalBudgetMs = deps.totalBudgetMs ?? (timeoutSeconds * 1000);
-  const overallDeadline = overallStarted + totalBudgetMs;
+  const overallDeadline = overallStarted + totalBudgetMs - (options.preparationMs ?? 0);
   const getRemainingBudgetMs = () => Math.max(0, overallDeadline - nowFn());
   const sleep = deps.sleep ?? (ms => new Promise<void>(resolve => setTimeout(resolve, ms)));
   const schedule = deps.setTimeout ?? setTimeout;

@@ -158,12 +158,14 @@ export async function applyClineEdits(
       const error = lifecycle.error instanceof ClineRunError ? lifecycle.error
         : new ClineRunError("edits_inspection_failed", `Edit failed: ${reason ?? "verification failed"}.`);
       Object.assign(error, { verification: lifecycle.verification, evidence: lifecycle.evidence,
+        codeMapSource: lifecycle.codeMapSource,
         usage: lifecycle.usage, cost: lifecycle.cost, durationMs: lifecycle.durationMs });
       throw error;
     }
     if (lifecycle.cancelled) {
       const error = new ClineRunError("cancelled", "The Cline request was cancelled.");
-      Object.assign(error, { verification: lifecycle.verification, evidence: lifecycle.evidence }); throw error;
+      Object.assign(error, { verification: lifecycle.verification, evidence: lifecycle.evidence,
+        codeMapSource: lifecycle.codeMapSource }); throw error;
     }
     const head = lifecycle.identity!.head;
     return { ...lifecycle.result!, usage: lifecycle.usage, cost: lifecycle.cost, durationMs: lifecycle.durationMs,

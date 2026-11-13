@@ -88,6 +88,7 @@ export class FinalCheckLifecycle {
   phase: "snapshot" | "run" | "verify" | "restore" | "waiting" | "done" = "snapshot";
   waitReason?: EditWaitReason; question?: { question: string; options?: string[] }; error?: unknown;
   evidence: Record<string, unknown> = {}; result?: ClineResponse;
+  codeMapSource: NonNullable<ClineResponse["codeMapSource"]> = "none";
   usage: Record<string, unknown> = Object.create(null); cost = 0; durationMs = 0;
   totalToolCalls = 0; totalInputTokens = 0; launches = 0; activeMs = 0; automaticFixes = 0;
   cancelled = false;
@@ -172,6 +173,7 @@ export class FinalCheckLifecycle {
           this.result = response;
         } catch (error) { failure = error; }
         const metrics = (response ?? failure) as Partial<ClineResponse> | undefined;
+        this.codeMapSource = metrics?.codeMapSource ?? "none";
         this.totalToolCalls += metrics?.guard?.totalToolCalls ?? 0;
         this.totalInputTokens += metrics?.guard?.totalInputTokens ?? 0;
         aggregateUsage(this.usage, metrics?.usage ?? (metrics?.guard ? { inputTokens: metrics.guard.totalInputTokens } : undefined));

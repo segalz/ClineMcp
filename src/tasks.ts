@@ -6,7 +6,7 @@ import {
   askCline, ClineRunError, defaultKillTree, formatErrorAsText, redactSecrets, requireSelection,
   resolveClineEntry, windowsCommandLineLength, WINDOWS_COMMAND_LINE_LIMIT, NO_TOOLS_PREAMBLE,
   MAX_SYSTEM_PROMPT_CHARACTERS, MAX_TOTAL_TEXT_CHARACTERS,
-  type AskClineInput, type ClineInvocationOptions, type ClineResponse
+  type AskClineInput, type ClineInvocationOptions, type ClineResponse, type CodeMapSource
 } from "./runner.js";
 import { formatReportSummary, type GuardOptions, type GuardReport } from "./guard.js";
 import { askClineWorkspace, buildWorkspaceSystemPrompt, WORKTREE_BASE } from "./workspace.js";
@@ -382,6 +382,7 @@ export function buildResumedPrompt(params: {
 }
 
 export interface TaskRunHistoryItem {
+  codeMapSource?: CodeMapSource;
   run: number;
   trace: TraceInfo;
   guard?: GuardReport;
@@ -389,6 +390,7 @@ export interface TaskRunHistoryItem {
 }
 
 export interface Task {
+  codeMapSource?: CodeMapSource;
   finalCheck?: FinalCheckLifecycle;
   waitReason?: EditWaitReason;
   evidence?: Record<string, unknown>;
@@ -430,6 +432,7 @@ export interface Task {
 export interface LogRunHint { ok: boolean; error_kind?: "timeout" | "quota" | "crash"; retry_after_s?: number; error_text?: string; duration_s: number; }
 
 export interface TaskStatusView {
+  codeMapSource: CodeMapSource;
   verification?: FinalVerification;
   phase?: FinalCheckLifecycle["phase"];
   waitReason?: EditWaitReason;
@@ -628,9 +631,11 @@ export class TaskManager {
     task.question = undefined;
     task.autoAnswered = undefined;
     task.reportedQuestion = undefined;
+    task.codeMapSource = "none";
 
     const options: Partial<ClineInvocationOptions> = {
       ...this.deps.runOptions,
+      onCodeMapSource: source => { task.codeMapSource = source; this.deps.runOptions?.onCodeMapSource?.(source); },
       promptPreamble: (this.deps.runOptions?.promptPreamble ?? "") + TASK_QUESTION_PREAMBLE,
       trace: true,
       traceRunId: trace.runId,
@@ -663,9 +668,11 @@ export class TaskManager {
     const onSettled = run.then(
       result => {
         task.result = result;
+        task.codeMapSource = result.codeMapSource ?? task.codeMapSource;
         task.previousRunAnswer = result.text ?? "";
         task.runHistory = task.runHistory ?? [];
-        task.runHistory.push({ run: task.run, trace, ...(result.guard ? { guard: result.guard } : {}) });
+        task.runHistory.push({ run: task.run, trace, codeMapSource: task.codeMapSource ?? "none",
+          ...(result.guard ? { guard: result.guard } : {}) });
         const q = parseQuestionFromText(result.text ?? "");
         if (q) {
           task.state = "input_required";
@@ -677,6 +684,7 @@ export class TaskManager {
       },
       err => {
         task.error = err;
+        task.codeMapSource = err?.codeMapSource ?? task.codeMapSource;
         task.runHistory = task.runHistory ?? [];
         if (err instanceof ClineRunError && (err.kind === "loop_detected" || err.kind === "budget_exceeded")) {
           task.state = "input_required";
@@ -696,6 +704,7 @@ export class TaskManager {
             run: task.run,
             trace,
             guard: err.guard,
+            codeMapSource: task.codeMapSource ?? "none",
             error: err.message
           });
         } else {
@@ -704,6 +713,7 @@ export class TaskManager {
             run: task.run,
             trace,
             ...(err?.guard ? { guard: err.guard } : {}),
+            codeMapSource: task.codeMapSource ?? "none",
             error: err instanceof Error ? err.message : String(err)
           });
         }
@@ -759,6 +769,7 @@ export class TaskManager {
         question: `Edit stopped: ${lifecycle.waitReason}. Retry with guidance, restore baseline, or keep unverified changes?`,
         options: ["retry", "restore", "keep"] } : undefined);
       task.result = { ...lifecycle.result, text: lifecycle.result?.text ?? "", durationMs: lifecycle.durationMs,
+        codeMapSource: task.codeMapSource ?? lifecycle.codeMapSource,
         usage: lifecycle.usage, cost: lifecycle.cost, verification: structuredClone(lifecycle.verification) };
       task.endedAt = this.wallNow(); task.activeMs += task.endedAt - started;
       if (nextState !== "input_required") this.releaseCheckout(task);
@@ -816,7 +827,9 @@ export class TaskManager {
             task.runs.push(task.trace);
           }
           task.recorder = undefined;
+          task.codeMapSource = "none";
           const options: Partial<ClineInvocationOptions> = { ...this.deps.runOptions, checkoutLock: lock,
+            onCodeMapSource: source => { task.codeMapSource = source; this.deps.runOptions?.onCodeMapSource?.(source); },
             trace: true, traceRunId: task.trace.runId, maxAttempts: 1, maxTimeoutSeconds: MAX_TASK_TIMEOUT_SECONDS,
             promptPreamble: (this.deps.runOptions?.promptPreamble ?? "") + TASK_QUESTION_PREAMBLE,
             guard, onTraceStart: recorder => { task.recorder = recorder; } };
@@ -824,10 +837,14 @@ export class TaskManager {
           try {
             const result = await (this.deps.runners?.edits ?? runClineEditRun)({ prompt, cwd: task.cwd, provider: task.provider,
               model: task.model, thinking: task.thinking, timeoutSeconds: remainingSeconds, guard, codeMap: task.codeMap }, signal, options);
-            task.runHistory ??= []; task.runHistory.push({ run, trace: task.trace, guard: result.guard });
+            task.codeMapSource = result.codeMapSource ?? task.codeMapSource;
+            task.runHistory ??= []; task.runHistory.push({ run, trace: task.trace, guard: result.guard,
+              codeMapSource: task.codeMapSource ?? "none" });
             task.guardReport = result.guard; return result;
           } catch (error) {
-            task.runHistory ??= []; task.runHistory.push({ run, trace: task.trace, error: errorText(error), guard: (error as ClineRunError)?.guard });
+            task.codeMapSource = (error as ClineRunError)?.codeMapSource ?? task.codeMapSource;
+            task.runHistory ??= []; task.runHistory.push({ run, trace: task.trace, error: errorText(error),
+              codeMapSource: task.codeMapSource ?? "none", guard: (error as ClineRunError)?.guard });
             task.guardReport = (error as ClineRunError)?.guard; throw error;
           }
         }
@@ -998,6 +1015,7 @@ export class TaskManager {
     }
     return {
       taskId: task.id,
+      codeMapSource: task.codeMapSource ?? "none",
       mode: task.mode,
       state: task.state,
       elapsedMs: (task.endedAt ?? this.wallNow()) - task.startedAt,
@@ -1068,6 +1086,7 @@ export class TaskManager {
 
   /** Final result of a settled task. Removes the task and, unless keepTrace, its trace folders. */
   async result(taskId: string, keepTrace = false): Promise<{ state: TaskState; result?: Record<string, unknown>; error?: string;
+    codeMapSource: CodeMapSource;
     guard?: GuardReport; runHistory?: TaskRunHistoryItem[];
     verification?: FinalVerification; waitReason?: EditWaitReason; evidence?: Record<string, unknown>;
     log_run_hint: LogRunHint | null; log_run_note?: string; trace?: TraceInfo }> {
@@ -1078,6 +1097,7 @@ export class TaskManager {
     const hint = hintFor(task);
     const out = {
       state: task.state,
+      codeMapSource: task.codeMapSource ?? "none",
       ...(task.finalCheck ? { verification: structuredClone(task.finalCheck.verification), waitReason: task.waitReason,
         evidence: structuredClone(task.evidence) } : {}),
       ...(task.result ? { result: { ...task.result, trace: undefined } } : {}),

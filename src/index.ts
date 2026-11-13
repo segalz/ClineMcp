@@ -103,6 +103,7 @@ server.registerTool(
         ...(result.model ? { model: result.model } : {}),
         durationMs: result.durationMs,
         ...(result.guard ? { guard: result.guard } : {}),
+        ...(result.codeMapSource ? { codeMapSource: result.codeMapSource } : {}),
         ...(result.usage ? { usage: result.usage } : {}),
         ...(result.cost !== undefined ? { cost: result.cost } : {}),
         ...(result.warnings && result.warnings.length > 0 ? { warnings: result.warnings } : {}),
@@ -146,6 +147,7 @@ server.registerTool(
         ...(result.model ? { model: result.model } : {}),
         durationMs: result.durationMs,
         ...(result.guard ? { guard: result.guard } : {}),
+        ...(result.codeMapSource ? { codeMapSource: result.codeMapSource } : {}),
         ...(result.usage ? { usage: result.usage } : {}),
         ...(result.cost !== undefined ? { cost: result.cost } : {}),
         gitDiff: result.gitDiff,
@@ -159,10 +161,10 @@ server.registerTool(
       });
     } catch (error) {
       if (error && typeof error === "object" && "verification" in error) {
-        const failure = error as Error & { kind?: string; verification: unknown; evidence?: unknown; trace?: unknown; guard?: unknown;
+        const failure = error as Error & { kind?: string; verification: unknown; evidence?: unknown; trace?: unknown; guard?: unknown; codeMapSource?: unknown;
           usage?: unknown; cost?: unknown; durationMs?: number };
         return await replyJson({ kind: failure.kind ?? "edit_failed", message: failure.message,
-          verification: failure.verification, evidence: failure.evidence, trace: failure.trace, guard: failure.guard,
+          verification: failure.verification, evidence: failure.evidence, trace: failure.trace, guard: failure.guard, codeMapSource: failure.codeMapSource ?? "none",
           usage: failure.usage, cost: failure.cost, durationMs: failure.durationMs }, { isError: true });
       }
       if (error instanceof ClineEditsError) {
@@ -175,6 +177,7 @@ server.registerTool(
           ...(error.stdoutTail ? { stdoutTail: error.stdoutTail } : {}),
           ...(error.trace ? { trace: error.trace } : {}),
           ...(error.guard ? { guard: error.guard } : {}),
+          codeMapSource: error.codeMapSource ?? "none",
           ...error.evidence
         }, { isError: true });
       }
@@ -190,6 +193,7 @@ server.registerTool(
           ...(error.stdoutTail ? { stdoutTail: error.stdoutTail } : {}),
           ...(error.trace ? { trace: error.trace } : {}),
           ...(error.guard ? { guard: error.guard } : {}),
+          codeMapSource: error.codeMapSource ?? "none",
           ...(error.notes?.length ? { notes: error.notes } : {})
         }, { isError: true });
       }
@@ -229,6 +233,7 @@ server.registerTool(
         ...(result.model ? { model: result.model } : {}),
         durationMs: result.durationMs,
         ...(result.guard ? { guard: result.guard } : {}),
+        ...(result.codeMapSource ? { codeMapSource: result.codeMapSource } : {}),
         ...(result.usage ? { usage: result.usage } : {}),
         ...(result.cost !== undefined ? { cost: result.cost } : {}),
         ...(result.warnings && result.warnings.length > 0 ? { warnings: result.warnings } : {}),
