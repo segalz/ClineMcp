@@ -74,11 +74,11 @@ Status values: `todo`, `in progress`, `done`, `blocked`, `skipped`.
 | 11.R | Verify: code review | done | 2026-11-12 | AGY approved both halves; 4 low findings (stale .reap, close before unlink, drive-letter case, verify resolution errors) fixed by Codex; 301 tests pass |
 | 11.L | Verify: live comparison | done | 2026-11-12 | stage11-results.md: single 2/2, micro-steps 2/2 (all 4 checks); micro-steps ~2x time and tokens; question path verified live |
 | 12.0 | Plan and Codex review | done | 2026-11-13 | Codex review (16 points) folded in; sync restores by default (D-34) |
-| 12.1 | Remove micro-step orchestration | todo |  |  |
-| 12.2 | Mandatory verify with automatic fixes | todo |  |  |
-| 12.3 | Docs | todo |  |  |
-| 12.R | Verify: code review | todo |  |  |
-| 12.L | Verify: live rerun | todo |  |  |
+| 12.1 | Remove micro-step orchestration | done | 2026-11-13 | Codex: src/steps.ts and its wiring removed; shared schemas moved to finalcheck.ts; snapshot/lock/verify kept; 294 tests |
+| 12.2 | Mandatory verify with automatic fixes | done | 2026-11-13 | Codex: src/finalcheck.ts shared lifecycle; sync restores by default (keepOnFailure), async retry/restore/keep; identity refusal replaces soft-reset recovery |
+| 12.3 | Docs | done | 2026-11-13 | README Final check + Breaking changes |
+| 12.R | Verify: code review | done | 2026-11-13 | AGY approved both halves (sync lifecycle, async + removal) with no findings |
+| 12.L | Verify: live rerun | done | 2026-11-13 | stage12-results.md: 3/3 full runs 7/7 at ~100 s / ~110k; 2/2 runs with a missing requirement fixed automatically in 1 fix run |
 
 | X.1 | `ask_cline` no-tools notice + Windows length guard (D-21) | done | 2026-11-09 | Codex analysis + review (3 rounds: Windows command-line length, UTF-16 count) PASS; 139 tests; live 0 tool calls / 1 iteration |
 

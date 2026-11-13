@@ -304,7 +304,7 @@ orchestration and make the final check strong and mandatory. Roles: Codex review
 | 12.2 | Mandatory `verify` + automatic fix runs, sync and async; `cline_send` retry/restore/keep; result shape. | Tests: pass first time; fail→fix→pass; fail after fixes (sync report, async wait); restore; keep; `none` opt-out; guard trip. |
 | 12.3 | README and tool descriptions. | Docs match code. |
 | 12.R | AGY review. | No open findings. |
-| 12.L | Live: the 7-check experiment, 3 runs with the final check as the full check suite. | Every run ends 7/7 or reports the failure; cost close to a single run. |
+| 12.L | Live: the 7-check experiment, 3 runs with the final check as the full check suite. | Every run ends 7/7 or reports the failure; cost close to a single run. Done: [stage12-results.md](stage12-results.md). |
 
 ## Later — the same micro-steps for OpenCode (owner's idea, 2026-11-10)
 
