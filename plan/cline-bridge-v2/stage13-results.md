@@ -113,3 +113,29 @@ Per question, V2 against A0: higher on h01 and h03, lower on h02, h04 and h07, e
 The OpenCode half is still open: the free quota is used up ("Free usage limit reached").
 
 **Decision (D-35, final):** keep codeindex as the default with ranking v2.
+
+# OpenCode half on Nvidia (13.P4, 2026-11-13)
+
+The `opencode/*` free quota was used up ("Free usage limit reached"). The OpenCode half therefore ran
+on `nvidia/nvidia/nemotron-3-ultra-550b-a55b` through `analyze_code`.
+
+Setup:
+- A0 = regex map, A1 = codeindex ranking v2;
+- 3 runs per question, arms interleaved (`runhard3.sh`);
+- 8 of 60 runs failed with Nvidia 429 rate limits (3 parallel lanes), including all 6 runs on h09.
+  Those runs are excluded.
+
+| Arm | Score per valid run | Valid runs | Avg time | Avg input tokens |
+|---|---|---|---|---|
+| A0 regex | 0.85 | 26 | 57 s | 107,659 |
+| A1 codeindex v2 | 0.85 | 26 | 54 s | 96,375 |
+
+Per question, A1 is higher on h01, h02 and h10, lower on h04 and h07, and equal elsewhere.
+
+**Reading:**
+- The OpenCode half confirms the Cline result: ranking v2 keeps accuracy equal to no map and costs
+  about 10% fewer tokens.
+- Bridge gaps found:
+  - `analyze_code` waits for its whole budget when the `opencode/*` quota is exhausted, because
+    OpenCode retries internally instead of failing fast;
+  - a 429 from Nvidia fails the run without trying a fallback model.
