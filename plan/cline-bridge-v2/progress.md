@@ -98,3 +98,4 @@ Status values: `todo`, `in progress`, `done`, `blocked`, `skipped`.
   experiments (`lastUsedProvider = cline`, `cline` model left at the original saved value).
 
 | 13.plan | Plan Stage 13 (structural code context), Codex review | done | 2026-11-13 | approved with 9 changes, folded in; next 13.0 |
+| 13.0-13.2 | codeindex contracts, parser/cache feasibility, library and CLI (`C:\Develop\codeindex`, local repo, branch stage13-feasibility) | done | 2026-11-13 | WASM grammars js/ts/tsx/python parse offline on Windows (ABI 14, web-tree-sitter 0.25.10); 43 tests; live maps on this repo anchor correctly and show callers/callees; AGY approved. Next: 13.3 bridge integration, 13.P pilot |
