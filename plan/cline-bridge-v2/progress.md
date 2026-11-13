@@ -96,3 +96,5 @@ Status values: `todo`, `in progress`, `done`, `blocked`, `skipped`.
 
 - 2026-11-09 — Plan created. No code changed yet. Cline settings were restored after the
   experiments (`lastUsedProvider = cline`, `cline` model left at the original saved value).
+
+| 13.plan | Plan Stage 13 (structural code context), Codex review | done | 2026-11-13 | approved with 9 changes, folded in; next 13.0 |

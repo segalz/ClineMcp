@@ -310,3 +310,114 @@ orchestration and make the final check strong and mandatory. Roles: Codex review
 
 Once Stage 9 works with Cline, apply it to the OpenCode helper (`C:\Develop\openCodeHelperMcp`), where
 each step can use a different free model by role: one to plan, one to execute, one to review.
+
+## Stage 13 — Structural code context for delegated models (owner, 2026-11-13)
+
+Why: the owner asked what context each delegated task should carry. Research
+([stage13-research.md](stage13-research.md)) shows that general overview files and natural-language
+per-file summaries barely help (no gain in success, more than 20% higher cost), while structural
+information helps small models most: definitions, references and callers gave +6-18 points of
+localization accuracy for models up to about 14B, in fewer steps. Our free models are in that group,
+and the Stage 10 map already lifted the hard task from 0/2 to 5/5. The map costs the orchestrator
+nothing, because the bridge inserts it into the free model's prompt. Roles: Codex reviews the plan and
+codes, AGY reviews.
+
+**Design (draft, for Codex review)**
+- One shared component, `codeindex` (a new local package, `C:\Develop\codeindex`, Node/TypeScript):
+  - a library and CLI that parse tracked files with tree-sitter (WASM, no native build) for TS/JS and
+    Python first, and other languages by fallback to the existing regex symbols;
+  - it records definitions (kind, name, file, line range) and identifier references with the
+    enclosing definition, so "who calls X" is a lookup;
+  - the cache lives outside the checkout (`~/.cline-mcp/codeindex/<sha256 of root>`), keyed by Git
+    blob hash, so only changed files are re-parsed and dirty files are read from disk;
+  - CLI: `codeindex map --root <dir> --query <text> --budget <chars> --json`,
+    `codeindex def <name>`, `codeindex refs <name>`, `codeindex outline <file>`.
+  - Bounds: as today (3,000 files, 512 KiB per file, time budget 1.5 s for a map on a warm cache; the
+    first index build may take longer and runs once).
+- **Query-focused map** (replaces the regex list as the default in both bridges, when `codeindex` is
+  present):
+  - anchors are the paths and identifiers named in the prompt (LARGER-style lexical anchoring);
+  - expand to definitions, callers and callees one hop out, rank with personalized PageRank over the
+    reference graph seeded by the anchors, then render signatures and `file:line` within the existing
+    6,000-character budget and the Windows command-line clamp;
+  - with no anchors, fall back to the current repository-level map.
+  - Both bridges call the CLI as a bounded subprocess (`CODEINDEX_BIN` or a known path). If it is
+    missing, slow or failing, they use the current map, with no error. The public OpenCode repo gets no
+    hard dependency.
+- **Structural tools for the model (arm B):** `codeindex` also serves a read-only stdio MCP server with
+  `find_definition`, `find_references` and `outline`. First check (13.0) whether Cline CLI 3.0.74 and
+  OpenCode 1.19.5 can attach an extra MCP server per run without changing global config. If not, arm B
+  is dropped.
+- **Project brief (arm C):** an optional `.codeindex/brief.md` or the repository's `AGENTS.md`, cut to at
+  most 1,000 characters, holding only non-standard facts (the test command, conventions, places not to
+  touch). Off by default.
+- **No natural-language per-file index.**
+- **Orchestrator side:** register the `codeindex` MCP server in Claude Code, and add to CLAUDE.md that
+  pure lookups ("where is X defined", "who calls Y", "what is in file Z") use it directly with no model
+  call.
+
+**Measurement (13.L)**
+- Arms: A0 current regex map, A1 query-focused map, A2 = A1 + structural tools, A3 = A1 + brief.
+- Tasks:
+  - 10 localization questions with hand-checked answers on this repository (file and function);
+  - the Stage 10 hard analysis task;
+  - the Stage 12 7-check edit task.
+- Runs: at least 5 per arm and task, because of the 9% run-to-run noise floor. Analysis runs on both
+  bridges; the edit task runs on OpenCode.
+- Report: success, time and free-model tokens per arm, plus Claude-side tokens for the lookup rule.
+- Adopt an arm as the default only if success is not lower and time or tokens fall, or success rises by
+  more than the noise.
+
+**Agreed after the Codex plan review (2026-11-13, 9 points, D-35 draft)**
+- Lifecycle facts: the Cline workspace map is built inside the disposable HEAD worktree; edits map the
+  live checkout; `tasks.ts` forwards `codeMap` to later runs; OpenCode builds a map per launch, repairs
+  included. There is no persistent index today.
+- Budgets: keep every existing limit: 6,000 map characters, Cline's 24,000 combined text, the escaped
+  command line at 32,000 minus 1,000 with no map below 800 characters of headroom, OpenCode preparation
+  counted in the attempt budget, and the edit lifecycle deadlines. A cold build, the fallback and
+  process-tree termination share one bound. Cancellation never launches the fallback.
+- Packaging: one package with library and CLI. The bridges use an optional CLI adapter: `node` plus an
+  absolute script path, `shell:false`, query on stdin, and a bounded, versioned JSON reply. No
+  duplicated implementations, and no hard dependency in the public OpenCode repo.
+- Cache:
+  - keyed by canonical repository identity, not by the worktree path;
+  - content-addressed parse records keyed by a hash of the actual bytes (dirty and CRLF included) plus
+    the grammar, query and schema versions;
+  - per-checkout manifests that handle deletions and renames;
+  - atomic publication, bounded locking and an eviction rule.
+  - A record is never served across roots without re-checking the content hash.
+- References are candidates, not resolved facts. Imports, aliases, shadowing, dispatch and dynamic
+  Python calls are not resolved. Results use scoped symbol IDs and separate calls from other
+  references.
+- v1 ranking: lexical and path anchors, deterministic weighted one-hop expansion, and a penalty for
+  high-degree symbols. Personalized PageRank only later, if an ablation shows value.
+- Parser: `web-tree-sitter` with pinned prebuilt WASM grammars (javascript, typescript, tsx,
+  python). A feasibility gate covers ABI compatibility, offline assets, Windows paths, Node 20+,
+  Unicode offsets, syntax errors, memory disposal and interruptible parsing.
+- Arm B, conditional and deny-by-default:
+  - Cline: only an isolated `--config` / `--data-dir` directory holding its own MCP settings, and only
+    if provider state still works there. There is no per-run MCP flag.
+  - OpenCode: `OPENCODE_CONFIG_CONTENT` with only the three named MCP tools allowed, writes, bash,
+    tasks and external directories still denied, and the permission validator extended explicitly.
+  - The server itself enforces root containment and the hidden, credential and generated-path
+    exclusions.
+- Measurement, reduced:
+  - A pilot first: A0 against A1, paired and randomized, with fixed commits, models, budgets and
+    scoring. Expand only if it is promising.
+  - Five runs are exploratory, not proof of non-regression.
+  - Report localization rank, correctness, failures, tool calls, tokens, and cold and warm latency.
+  - Do not assume the 9% noise figure or the model sizes. Stage 10 measured rules and map together.
+- A brief is untrusted data. "No model call" on the orchestrator side means no delegated analysis
+  call.
+
+| Step | Work | Done when |
+|---|---|---|
+| 13.0 | Contracts and security fixtures (output schema, root containment, excluded paths, budgets, cancellation). | Written in the plan; fixtures in the package. |
+| 13.1 | Parser and cache feasibility: WASM stack offline on Windows, cache identity and concurrency. | Short note in stage13-research.md; go/no-go. |
+| 13.2 | `codeindex` library and CLI (def/refs/outline/map, v1 ranking) with tests. | Deterministic output within budget on fixtures. |
+| 13.3 | Static-map integration in both bridges through the CLI adapter, with silent fallback. | Existing suites green; tests for fallback, the budget clamp and cancellation. |
+| 13.P | Pilot A0 against A1 (localization questions plus the hard analysis task, both bridges). | stage13-results.md; go or stop. |
+| 13.4 | Optional: MCP tools for models (arm B), only after the pilot and feasibility checks. | Read-only proven; measured. |
+| 13.5 | Optional: brief (arm C). | Measured. |
+| 13.6 | Orchestrator lookup rule and Claude Code registration (after owner OK). | One live lookup with no delegated call. |
+| 13.R | AGY review per code step. | No open findings. |
