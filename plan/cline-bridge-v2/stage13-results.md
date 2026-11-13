@@ -72,3 +72,44 @@ question, arm and bridge, with the arm order alternated (`runhard.sh`, `scoreH.m
   format, so arms B (tools) and C (brief) would not address it.
 - Next, if pursued: improve the query-to-file ranking in codeindex (for example, weight definitions over
   mentions) and rerun the hard set on both bridges once OpenCode is back.
+
+# Ranking v2 (13.P3, 2026-11-13)
+
+The map ranking was changed in codeindex 5b99917 (branch `ranking-v2`, plan `plan/ranking-v2.md`
+there, reviewed by Codex). The changes:
+- plain English words no longer take the exact-identifier tier;
+- lexical anchors are weighted by IDF;
+- stems that occur together in a name add up;
+- directories no longer match;
+- each primary symbol gets its own share of the budget.
+
+Offline map recall (`bench/recall.mjs`, ClineMcp@96eeeb2, no model calls):
+
+| Set | Before | After |
+|---|---|---|
+| easy | 10/11 | 11/11 |
+| hard | 11/33 | 16/33 |
+| heldout (10 new questions, not used for tuning) | 14/15 | 15/15 |
+
+No baseline hit was lost. The check is `npm run check`.
+
+Cline hard set, 3 runs per question (`runhard2.sh`). V2 is the new map. A0 and A1 are reused from 13.P2,
+so V2 ran later and was not interleaved with them.
+
+| Arm | Score per run | Avg time | Avg input tokens | Avg tool calls |
+|---|---|---|---|---|
+| A0 regex | 0.89 (29 valid runs) | 52 s | 103,523 | 4.0 |
+| A1 codeindex v1 | 0.78 | 52 s | 112,218 | 4.2 |
+| V2 codeindex ranking v2 | 0.91 (30/30 ok) | 39 s | 87,118 | 3.5 |
+
+Per question, V2 against A0: higher on h01 and h03, lower on h02, h04 and h07, equal on the other five.
+
+**Reading:**
+- V2 removes the v1 regression on hard questions; accuracy is back to the no-map level.
+- V2 is cheaper than the regex map: 16% fewer tokens and 25% less time.
+- On easy questions the map already gave a third fewer tokens.
+- Accuracy itself is not higher than A0.
+
+The OpenCode half is still open: the free quota is used up ("Free usage limit reached").
+
+**Decision (D-35, final):** keep codeindex as the default with ranking v2.
