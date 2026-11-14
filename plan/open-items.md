@@ -6,7 +6,7 @@ to, or not at all.
 | # | Item | Where | Effort | Needs owner? | Status |
 |---|---|---|---|---|---|
 | 1 | Re-measure Cloudflare models; then have AGY's Claude review the results and failures | It was still rate-limited about a day later. Its ~10k neurons/day free tier covers only ~15-20 OpenCode requests. Owner decision 2026-11-15: exclude it from routing (`mcp-model-picker` bd02308), like Groq. | — | — | closed |
-| 2 | Picker tie-break by speed: equal-skill OpenCode units are ordered without regard to latency, so the slowest (`muse-glimmer`, ~120 s) won | `mcp-model-picker` `picker.py` (tie-break), seed `avg_seconds` in the snapshot | small | No | open |
+| 2 | Picker tie-break by speed: equal-skill OpenCode units are ordered without regard to latency, so the slowest (`muse-glimmer`, ~120 s) won | `mcp-model-picker` `picker.py`: on an exact score tie, the faster measured median of the last 20 successful runs wins (no rounding, so other backends keep their order) | small | No | done (2026-11-15) |
 | 3 | Flaky test: `test/codeindex.test.js` "remaining attempt time bounds the adapter..." fails with `EBUSY` on Windows temp-folder cleanup. It also fails without the recent changes. | `openCodeHelperMcp` 5df617f: cleanup retries EBUSY (`fs.rm` maxRetries); 8/8 clean runs | small | No | done |
 | 4 | Back up `codeindex` to a private GitHub repository | https://github.com/segalz/codeindex (private; default branch `stage13-feasibility`, `main` holds only the skeleton) | small | Approved 2026-11-14 | done |
 | 5 | Upgrade agent-intern 0.36.0 → 0.37.1 | owner's terminal: `uvx agent-intern@latest` | one command | Yes: the owner runs it | open |
