@@ -31,7 +31,7 @@ to, or not at all.
 - **`pick`:** the Cline fallback now has skill 0.80 from history (was 0.72 prior); OpenCode/Nvidia stays first at 0.86.
 - **Not yet shown:** the small seed tasks do not prove the fix on medium, multi-file tasks in large files, where the original failures happened. Watch the next real Cline edit.
 | 7 | To discuss (owner, 2026-11-14), not to build yet: a token dashboard as dry JSON data only (no UI): usage and remaining quota per provider and model. Then use that data in model selection, so `pick` makes smart quota-aware choices. | model-picker (ledger, `backend_status`, `pick`) | to be discussed | Yes: discussion first | to discuss |
-| 6 | Optional, later: one generic direct OpenAI-compatible MCP server (Nvidia, Cloudflare, Groq) for text-only tasks, which makes Groq usable and saves Cloudflare quota. Only if many small text-only tasks appear. | new | medium | Yes: decision | parked |
+| 6 | Optional, later: one generic direct OpenAI-compatible MCP server (Nvidia, Cloudflare, Groq) for text-only tasks, which makes Groq usable and saves Cloudflare quota. Only if many small text-only tasks appear. | Not needed (owner, 2026-11-15). FreeLLMAPI is already an OpenCode provider (`freellmapi/*`) and aggregates many free providers behind one API, so text-only tasks go through `analyze_code` with a `freellmapi` model. OpenCode's ~18k-token overhead costs nothing there. | — | — | closed |
 
 ## Context
 
