@@ -12,7 +12,7 @@ export const WORKING_RULES = [
 export function buildEnvironmentLine(cwd: string, mode: "workspace" | "edits", platform: NodeJS.Platform = process.platform): string {
   const location = mode === "workspace" ? "a disposable Git worktree of the repository" : "the repository checkout";
   const os = platform === "win32"
-    ? "The OS is Windows; shell commands run on Windows, so do not use Unix-only tools such as find, grep or sed."
+    ? "The OS is Windows. Shell commands run in Windows PowerShell 5.1 with the working directory already set: do not cd, separate commands with ';' (never '&&' or '||'), and do not use Unix tools (find, grep, sed, head, tail, cat); use Select-String, Get-ChildItem, Get-Content and Select-Object -First N instead."
     : `The OS is ${platform}.`;
   return `Environment: the working directory is ${cwd} (${location}). Use paths relative to it, or absolute paths under it. ${os}`;
 }

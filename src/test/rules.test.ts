@@ -11,7 +11,10 @@ test("workspace and edits retain shared working rules within the system prompt l
     assert.ok(prompt.length <= MAX_SYSTEM_PROMPT_CHARACTERS);
   }
   assert.match(WORKSPACE_SYSTEM_PROMPT, /analysis-only/);
-  assert.match(EDIT_SYSTEM_PROMPT, /summarize the changed files and verification/);
+  assert.match(EDIT_SYSTEM_PROMPT, /summarize the changed files in your final response/);
+  // The bridge runs the caller's check; Cline must not burn steps running the suite itself.
+  assert.match(EDIT_SYSTEM_PROMPT, /Do not run the test suite or the build yourself/);
+  assert.doesNotMatch(EDIT_SYSTEM_PROMPT, /run safe, relevant verification commands/);
   assert.ok(!NO_TOOLS_PREAMBLE.includes(WORKING_RULES));
 });
 
@@ -35,7 +38,7 @@ test("both prompt builders prepend the run cwd and OS before mode instructions a
   ] as const) {
     const environment = `Environment: the working directory is ${cwd} (${location}). Use paths relative to it, or absolute paths under it. `;
     const windows = build(cwd, "win32");
-    assert.equal(windows, environment + "The OS is Windows; shell commands run on Windows, so do not use Unix-only tools such as find, grep or sed.\n" + modeText);
+    assert.equal(windows, environment + "The OS is Windows. Shell commands run in Windows PowerShell 5.1 with the working directory already set: do not cd, separate commands with ';' (never '&&' or '||'), and do not use Unix tools (find, grep, sed, head, tail, cat); use Select-String, Get-ChildItem, Get-Content and Select-Object -First N instead.\n" + modeText);
     assert.equal(build(cwd, "linux"), environment + "The OS is linux.\n" + modeText);
     assert.equal(build(cwd, "darwin"), environment + "The OS is darwin.\n" + modeText);
     assert.ok(windows.length <= MAX_SYSTEM_PROMPT_CHARACTERS);

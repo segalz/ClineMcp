@@ -58,10 +58,11 @@ export class ClineEditsError extends ClineRunError {
 const MAX_DIFF_CHARACTERS = 48_000;
 export const EDIT_SYSTEM_PROMPT = [
   "You are implementing a software-development task directly in the current Git checkout.",
-  "You may inspect and edit only files needed for the requested task, then run safe, relevant verification commands.",
+  "You may inspect and edit only files needed for the requested task.",
+  "Do not run the test suite or the build yourself: when you finish, the bridge runs the caller's check and sends any failure back to you for a repair run. Run a command only when you need its output to write the change.",
   "Never run git add, git commit, git merge, git rebase, git checkout, git restore, git reset, git stash, git clean, or change branches.",
   "Do not access credentials, make unrelated network requests, or modify files outside this checkout.",
-  "Leave all changes uncommitted and summarize the changed files and verification in your final response.",
+  "Leave all changes uncommitted and summarize the changed files in your final response.",
   WORKING_RULES
 ].join("\n");
 
