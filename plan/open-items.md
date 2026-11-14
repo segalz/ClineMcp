@@ -10,6 +10,7 @@ to, or not at all.
 | 3 | Flaky test: `test/codeindex.test.js` "remaining attempt time bounds the adapter..." fails with `EBUSY` on Windows temp-folder cleanup. It also fails without the recent changes. | `openCodeHelperMcp` 5df617f: cleanup retries EBUSY (`fs.rm` maxRetries); 8/8 clean runs | small | No | done |
 | 4 | Back up `codeindex` to a private GitHub repository | https://github.com/segalz/codeindex (private; default branch `stage13-feasibility`, `main` holds only the skeleton) | small | Approved 2026-11-14 | done |
 | 5 | Upgrade agent-intern 0.36.0 → 0.37.1 | owner's terminal: `uvx agent-intern@latest` | one command | Yes: the owner runs it | open |
+| 7 | To discuss (owner, 2026-11-14), not to build yet: a token dashboard as dry JSON data only (no UI): usage and remaining quota per provider and model. Then use that data in model selection, so `pick` makes smart quota-aware choices. | model-picker (ledger, `backend_status`, `pick`) | to be discussed | Yes: discussion first | to discuss |
 | 6 | Optional, later: one generic direct OpenAI-compatible MCP server (Nvidia, Cloudflare, Groq) for text-only tasks, which makes Groq usable and saves Cloudflare quota. Only if many small text-only tasks appear. | new | medium | Yes: decision | parked |
 
 ## Context
