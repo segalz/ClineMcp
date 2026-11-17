@@ -654,6 +654,19 @@ async function runCheckLatestVersion(deps: CliStateDeps, signal?: AbortSignal): 
   return res.stdout.trim();
 }
 
+/** Best effort `cline hub stop` (bounded to 20 s); never throws. */
+async function stopClineHub(): Promise<void> {
+  const entry = resolveClineEntry();
+  if (!entry) return;
+  await new Promise<void>((resolve) => {
+    const child = spawn(process.execPath, [entry, "hub", "stop"], { cwd: os.homedir(), windowsHide: true, stdio: "ignore" });
+    const timer = setTimeout(() => { try { child.kill(); } catch { /* gone */ } resolve(); }, 20_000);
+    timer.unref?.();
+    child.on("error", () => { clearTimeout(timer); resolve(); });
+    child.on("close", () => { clearTimeout(timer); resolve(); });
+  });
+}
+
 async function runInstallCliVersion(version: string, deps: CliStateDeps, signal?: AbortSignal): Promise<void> {
   const cleanVersion = version.trim().replace(/^v/i, "");
   if (!parseSemver(cleanVersion) || !/^[0-9]+\.[0-9]+\.[0-9]+(?:-[0-9A-Za-z.-]+)?$/.test(cleanVersion)) {
@@ -684,6 +697,10 @@ async function runInstallCliVersion(version: string, deps: CliStateDeps, signal?
     }
   }
   const exec = deps.execNpm ?? defaultExecNpm;
+  // The long-lived Cline hub daemon keeps cline.exe open, so on Windows `npm install -g` fails with
+  // EBUSY while it runs. No run is active here (checked under the settings lock), so stop it first;
+  // the next worktree run starts a fresh hub from the home folder.
+  if (!deps.execNpm) await stopClineHub();
   const res = await exec(["install", "-g", `cline@${cleanVersion}`], { timeoutMs, signal });
   if (res.exitCode !== 0) {
     throw new Error(res.stderr.trim() || `npm install exited with code ${res.exitCode}`);
