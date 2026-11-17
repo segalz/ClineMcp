@@ -1,4 +1,4 @@
-import { mkdir, rm } from "node:fs/promises";
+import { mkdir, readdir, rm } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { randomUUID } from "node:crypto";
@@ -8,6 +8,7 @@ import { withCodeMap } from "./codemap.js";
 import {
   defaultKillTree,
   ClineRunError,
+  resolveClineEntry,
   runCline,
   type AskClineInput,
   type ClineInvocationOptions,
@@ -89,6 +90,125 @@ function runGit(cwd: string, args: string[], signal?: AbortSignal, timeoutMs = G
   });
 }
 
+export interface ProcessInfo {
+  pid: number;
+  commandLine: string;
+}
+
+function normalizePathForMatch(value: string): string {
+  return value.replace(/\\/g, "/").replace(/\/+$/, "").toLowerCase();
+}
+
+/**
+ * PIDs of Cline hub daemons whose working directory is this worktree. Cline starts
+ * `cline --cline-hub-daemon --cwd <dir>` on demand and it outlives the run, so on Windows
+ * it keeps the worktree folder busy and the folder cannot be removed.
+ */
+export function hubDaemonPidsFor(worktreePath: string, processes: readonly ProcessInfo[]): number[] {
+  const target = normalizePathForMatch(worktreePath);
+  return processes
+    .filter(({ commandLine }) => {
+      const cwd = hubDaemonCwd(commandLine);
+      return cwd !== undefined && normalizePathForMatch(cwd) === target;
+    })
+    .map(({ pid }) => pid);
+}
+
+/** Lists cline.exe processes with their command lines (Windows only; empty elsewhere or on error). */
+async function listClineProcesses(): Promise<ProcessInfo[]> {
+  if (process.platform !== "win32") return [];
+  const script = "Get-CimInstance Win32_Process -Filter \"Name='cline.exe'\" | "
+    + "ForEach-Object { [string]$_.ProcessId + [char]9 + $_.CommandLine }";
+  return new Promise((resolve) => {
+    let stdout = "";
+    const child = spawn("powershell.exe", ["-NoProfile", "-NonInteractive", "-Command", script], {
+      windowsHide: true, stdio: ["ignore", "pipe", "ignore"]
+    });
+    const timer = setTimeout(() => { try { child.kill(); } catch { /* gone */ } resolve([]); }, 15_000);
+    timer.unref?.();
+    child.stdout.on("data", (chunk: Buffer) => { stdout += chunk.toString("utf8"); });
+    child.on("error", () => { clearTimeout(timer); resolve([]); });
+    child.on("close", () => {
+      clearTimeout(timer);
+      resolve(stdout.split(/\r?\n/).flatMap((line) => {
+        const tab = line.indexOf("\t");
+        const pid = Number(line.slice(0, tab));
+        return tab > 0 && Number.isInteger(pid) && pid > 0 ? [{ pid, commandLine: line.slice(tab + 1) }] : [];
+      }));
+    });
+  });
+}
+
+function hubDaemonCwd(commandLine: string): string | undefined {
+  if (!commandLine.includes("--cline-hub-daemon")) return undefined;
+  const match = /--cwd\s+(?:"([^"]+)"|(\S+))/.exec(commandLine);
+  return match?.[1] ?? match?.[2];
+}
+
+/** Worktree runs in flight in this process; leftovers are only touched when it is zero. */
+let activeWorktreeRuns = 0;
+
+/** Removes empty `review-*` folders that an earlier run could not delete (best effort). */
+async function sweepEmptyWorktreeFolders(): Promise<void> {
+  let names: string[];
+  try { names = await readdir(WORKTREE_BASE); } catch { return; }
+  for (const name of names) {
+    if (!name.startsWith("review-")) continue;
+    const folder = path.join(WORKTREE_BASE, name);
+    if (await folderIsEmptyOrGone(folder)) await rm(folder, { recursive: true, force: true }).catch(() => {});
+  }
+}
+
+async function folderIsEmptyOrGone(folder: string): Promise<boolean> {
+  try {
+    return (await readdir(folder)).length === 0;
+  } catch {
+    return true;
+  }
+}
+
+/**
+ * Cline runs share one hub daemon, started on demand in the first run's cwd. Started inside a
+ * worktree, it keeps that folder busy on Windows long after the run. Before each worktree run:
+ * stop a hub left behind in an empty or deleted worktree, and make sure a hub runs from the home
+ * folder (`cline hub start` is a ~0.7 s no-op when a compatible hub already runs).
+ */
+async function ensureNeutralHub(options: Partial<ClineInvocationOptions>): Promise<void> {
+  if (process.platform !== "win32" || options.deps?.spawn || options.deps?.entryPath) return;
+  const base = `${normalizePathForMatch(WORKTREE_BASE)}/`;
+  // The hub is shared by every Cline run on the machine, so a leftover one is stopped only while
+  // this bridge has no other worktree run in flight, and only when its folder is already empty.
+  if (activeWorktreeRuns === 0) {
+    let stopped = false;
+    for (const { pid, commandLine } of await listClineProcesses()) {
+      const cwd = hubDaemonCwd(commandLine);
+      if (cwd && normalizePathForMatch(cwd).startsWith(base) && await folderIsEmptyOrGone(cwd)) {
+        defaultKillTree(pid, "SIGKILL", process.platform);
+        stopped = true;
+      }
+    }
+    if (stopped) await new Promise((resolve) => setTimeout(resolve, 1000));
+    await sweepEmptyWorktreeFolders();
+  }
+  const entry = resolveClineEntry();
+  if (!entry) return;
+  const home = os.homedir();
+  await new Promise<void>((resolve) => {
+    const child = spawn(process.execPath, [entry, "hub", "start", "--cwd", home], {
+      cwd: home, windowsHide: true, stdio: "ignore"
+    });
+    const timer = setTimeout(() => { try { child.kill(); } catch { /* gone */ } resolve(); }, 30_000);
+    timer.unref?.();
+    child.on("error", () => { clearTimeout(timer); resolve(); });
+    child.on("close", () => { clearTimeout(timer); resolve(); });
+  });
+}
+
+async function removeWorktreeFolder(repositoryRoot: string, worktreePath: string): Promise<void> {
+  await rm(worktreePath, { recursive: true, force: true, maxRetries: 5, retryDelay: 250 });
+  await runGit(repositoryRoot, ["worktree", "prune"], undefined, CLEANUP_GIT_TIMEOUT_MS);
+}
+
 async function cleanupWorktree(repositoryRoot: string, worktreePath: string): Promise<void> {
   try {
     await runGit(repositoryRoot, ["worktree", "remove", "--force", worktreePath], undefined, CLEANUP_GIT_TIMEOUT_MS);
@@ -96,9 +216,10 @@ async function cleanupWorktree(repositoryRoot: string, worktreePath: string): Pr
     // Removal can fail transiently on Windows when Cline has just released a handle.
   }
   try {
-    await rm(worktreePath, { recursive: true, force: true, maxRetries: 5, retryDelay: 250 });
-    await runGit(repositoryRoot, ["worktree", "prune"], undefined, CLEANUP_GIT_TIMEOUT_MS);
+    await removeWorktreeFolder(repositoryRoot, worktreePath);
   } catch {
+    // Usually a Cline hub daemon started inside this worktree holds the folder. It is shared by
+    // other runs, so it is not killed here; the next run's ensureNeutralHub handles it when idle.
     throw new ClineRunError("workspace_cleanup_failed", "The temporary Cline worktree could not be removed completely.");
   }
 }
@@ -148,6 +269,9 @@ export async function askClineWorkspace(
   let result: ClineResponse | undefined;
   let runError: unknown;
   try {
+    await ensureNeutralHub(options);
+    activeWorktreeRuns++;
+    try {
     result = await runCline(
       { ...input, cwd: worktreePath },
       signal,
@@ -160,6 +284,9 @@ export async function askClineWorkspace(
         model: input.model
       }, signal)
     );
+    } finally {
+      activeWorktreeRuns--;
+    }
   } catch (err) {
     runError = err;
   }
@@ -167,10 +294,12 @@ export async function askClineWorkspace(
     await cleanupWorktree(repositoryRoot, worktreePath);
   } catch (cleanupError) {
     const trace = result?.trace ?? (runError as { trace?: ClineResponse["trace"] } | undefined)?.trace;
-    if (cleanupError instanceof ClineRunError && trace) cleanupError.trace = trace;
-    // A failed run's own error stays primary, but the leftover worktree must still be reported.
-    if (runError === undefined) throw cleanupError;
     const note = `The temporary worktree ${worktreePath} could not be removed: ${(cleanupError as Error)?.message ?? String(cleanupError)}`;
+    // A finished answer is never discarded because the worktree could not be removed.
+    if (runError === undefined && result !== undefined) {
+      return { ...result, warnings: [...(result.warnings ?? []), note] };
+    }
+    // A failed run's own error stays primary, but the leftover worktree must still be reported.
     if (runError instanceof ClineRunError) {
       runError.notes = [...(runError.notes ?? []), note];
     } else {

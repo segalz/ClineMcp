@@ -244,7 +244,13 @@ export class FinalCheckLifecycle {
   async complete(): Promise<void> {
     // Completion is the commit point; cancellation after this phase waits for disposal.
     this.phase = "done"; this.waitReason = undefined; this.question = undefined;
-    if (this.snapshot) { await discardSnapshot(this.snapshot); this.snapshot = undefined; delete this.evidence.snapshotDirectory; }
+    // Verified edits must never be restored because the recovery folder could not be deleted.
+    const snapshot = this.snapshot;
+    this.snapshot = undefined; delete this.evidence.snapshotDirectory;
+    if (snapshot) {
+      try { await discardSnapshot(snapshot); }
+      catch (error) { (this.evidence as Record<string, unknown>).snapshotCleanupError = `${snapshot.directory}: ${(error as Error)?.message ?? String(error)}`; }
+    }
   }
   release(): void { if (this.releaseOwnLock) this.lock?.(); this.lock = undefined; }
 }

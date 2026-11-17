@@ -1054,6 +1054,17 @@ async function runClineCore(input: AskClineInput, signal: AbortSignal | undefine
         if (guardState.verdict) {
           const verdict = guardState.verdict;
           const summary = buildGuardTripMessage(verdict, options.guard);
+          // The final run_result carries cumulative token counts, so the guard can trip on the very
+          // event that holds the finished answer. A completed answer is kept, with the trip as a warning.
+          const finished = verdict.kind === "budget_exceeded" ? parseUsableResult(stdout, effectiveCode) : null;
+          if (finished) {
+            return {
+              ...finished,
+              warnings: [...(finished.warnings ?? []), `guard: ${summary}`],
+              guard: verdict,
+              durationMs: finished.durationMs ?? Math.round(nowFn() - started)
+            } as ClineResponse;
+          }
           throw new ClineRunError(verdict.kind, summary, {
             exitCode: code,
             stderrTail,

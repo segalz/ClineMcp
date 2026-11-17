@@ -169,10 +169,16 @@ export async function applyClineEdits(
         codeMapSource: lifecycle.codeMapSource }); throw error;
     }
     const head = lifecycle.identity!.head;
-    return { ...lifecycle.result!, usage: lifecycle.usage, cost: lifecycle.cost, durationMs: lifecycle.durationMs,
-      gitDiff: truncateGitDiff(await runGit(lifecycle.root, ["diff", "--binary", "--no-ext-diff", "HEAD"])),
-      status: await runGit(lifecycle.root, ["--no-optional-locks", "status", "--short"]),
-      headBefore: head, headAfter: head, commitWasReverted: false, verification: lifecycle.verification };
+    // The edits passed and are kept: a failing report-only Git call must not turn that into an error.
+    const warnings = [...(lifecycle.result!.warnings ?? [])];
+    const report = async (args: string[], label: string): Promise<string> => {
+      try { return await runGit(lifecycle.root, args); }
+      catch (error) { warnings.push(`git ${label} failed after verified edits: ${(error as Error)?.message ?? String(error)}`); return ""; }
+    };
+    const gitDiff = truncateGitDiff(await report(["diff", "--binary", "--no-ext-diff", "HEAD"], "diff"));
+    const status = await report(["--no-optional-locks", "status", "--short"], "status");
+    return { ...lifecycle.result!, ...(warnings.length ? { warnings } : {}), usage: lifecycle.usage, cost: lifecycle.cost, durationMs: lifecycle.durationMs,
+      gitDiff, status, headBefore: head, headAfter: head, commitWasReverted: false, verification: lifecycle.verification };
   } finally { lifecycle.release(); }
 }
 
