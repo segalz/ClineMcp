@@ -8,7 +8,7 @@ import { withCodeMap } from "./codemap.js";
 import {
   defaultKillTree,
   ClineRunError,
-  resolveClineEntry,
+
   runCline,
   type AskClineInput,
   type ClineInvocationOptions,
@@ -168,10 +168,10 @@ async function folderIsEmptyOrGone(folder: string): Promise<boolean> {
 }
 
 /**
- * Cline runs share one hub daemon, started on demand in the first run's cwd. Started inside a
- * worktree, it keeps that folder busy on Windows long after the run. Before each worktree run:
- * stop a hub left behind in an empty or deleted worktree, and make sure a hub runs from the home
- * folder (`cline hub start` is a ~0.7 s no-op when a compatible hub already runs).
+ * Each bridge run uses its own hub (runCline's dedicatedHub), stopped when the run ends. Older bridge
+ * versions let the shared hub settle inside a worktree, where it keeps the folder busy on Windows.
+ * Before each worktree run: stop such a leftover hub when its folder is already empty, and sweep empty
+ * leftover `review-*` folders.
  */
 async function ensureNeutralHub(options: Partial<ClineInvocationOptions>): Promise<void> {
   if (process.platform !== "win32" || options.deps?.spawn || options.deps?.entryPath) return;
@@ -190,18 +190,6 @@ async function ensureNeutralHub(options: Partial<ClineInvocationOptions>): Promi
     if (stopped) await new Promise((resolve) => setTimeout(resolve, 1000));
     await sweepEmptyWorktreeFolders();
   }
-  const entry = resolveClineEntry();
-  if (!entry) return;
-  const home = os.homedir();
-  await new Promise<void>((resolve) => {
-    const child = spawn(process.execPath, [entry, "hub", "start", "--cwd", home], {
-      cwd: home, windowsHide: true, stdio: "ignore"
-    });
-    const timer = setTimeout(() => { try { child.kill(); } catch { /* gone */ } resolve(); }, 30_000);
-    timer.unref?.();
-    child.on("error", () => { clearTimeout(timer); resolve(); });
-    child.on("close", () => { clearTimeout(timer); resolve(); });
-  });
 }
 
 async function removeWorktreeFolder(repositoryRoot: string, worktreePath: string): Promise<void> {

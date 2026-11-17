@@ -1,5 +1,8 @@
 import { spawn } from "node:child_process";
-import { access } from "node:fs/promises";
+import { randomUUID } from "node:crypto";
+import { access, mkdir, rm } from "node:fs/promises";
+import net from "node:net";
+import os from "node:os";
 import path from "node:path";
 import { z } from "zod";
 import { LineSplitter, TraceRecorder, type TraceInfo } from "./trace.js";
@@ -205,6 +208,8 @@ export interface ClineDependencies {
 }
 
 export interface ClineInvocationOptions {
+  /** Internal: environment that points this run at its own Cline hub (set by runCline). */
+  hubEnv?: Record<string, string>;
   /** Map preparation is part of the run's existing total deadline. */
   preparationMs?: number;
   codeMapSource?: CodeMapSource;
@@ -589,7 +594,68 @@ export function requireSelection(input: { provider?: string; model?: string }): 
   if (!input.provider || !input.model) throw new ClineRunError("launch_failed", MISSING_SELECTION_MESSAGE, { attempts: 0 });
 }
 
+/** Free loopback TCP port (best effort; the hub binds it moments later). */
+async function freeLoopbackPort(): Promise<number | undefined> {
+  return new Promise((resolve) => {
+    const server = net.createServer();
+    server.once("error", () => resolve(undefined));
+    server.listen(0, "127.0.0.1", () => {
+      const address = server.address();
+      const port = typeof address === "object" && address ? address.port : undefined;
+      server.close(() => resolve(port));
+    });
+  });
+}
+
+export const DEDICATED_HUB_BASE = path.join(os.tmpdir(), "cline-mcp-hubs");
+
+/**
+ * Cline 3.x runs sessions through a hub daemon and resolves a model's RELATIVE tool paths against the
+ * hub's own cwd, not the session's --cwd. The shared hub sits wherever it was first started (the user's
+ * home, or an old worktree), so `src/x.py` was read from, and could be written to, the wrong folder.
+ * Each bridge run therefore gets its own hub (own discovery record and port): Cline starts it on demand in
+ * the run's --cwd, and the bridge stops it when the run ends, so it never outlives the run or locks a worktree.
+ */
+async function dedicatedHub(options: ClineInvocationOptions): Promise<{ env: Record<string, string>; stop: () => Promise<void> } | undefined> {
+  if (options.hubEnv || options.deps?.spawn || options.deps?.entryPath) return undefined;
+  const entry = resolveClineEntry();
+  const port = await freeLoopbackPort();
+  if (!entry || port === undefined) return undefined;
+  await mkdir(DEDICATED_HUB_BASE, { recursive: true }).catch(() => {});
+  const discovery = path.join(DEDICATED_HUB_BASE, `hub-${randomUUID()}.json`);
+  const env = { CLINE_HUB_DISCOVERY_PATH: discovery, CLINE_HUB_PORT: String(port) };
+  const stop = async () => {
+    await new Promise<void>((resolve) => {
+      const child = spawn(process.execPath, [entry, "hub", "stop"], {
+        cwd: os.homedir(), windowsHide: true, stdio: "ignore", env: { ...process.env, ...env }
+      });
+      const timer = setTimeout(() => { try { child.kill(); } catch { /* gone */ } resolve(); }, 20_000);
+      timer.unref?.();
+      child.on("error", () => { clearTimeout(timer); resolve(); });
+      child.on("close", () => { clearTimeout(timer); resolve(); });
+    });
+    for (const file of [discovery, `${discovery}.instance.lock`]) {
+      await rm(file, { force: true, maxRetries: 3, retryDelay: 200 }).catch(() => {});
+    }
+  };
+  return { env, stop };
+}
+
 export async function runCline(
+  input: AskClineInput,
+  signal?: AbortSignal,
+  options: ClineInvocationOptions = {}
+): Promise<ClineResponse> {
+  const hub = await dedicatedHub(options);
+  if (!hub) return runClineInner(input, signal, options);
+  try {
+    return await runClineInner(input, signal, { ...options, hubEnv: hub.env });
+  } finally {
+    await hub.stop();
+  }
+}
+
+async function runClineInner(
   input: AskClineInput,
   signal?: AbortSignal,
   options: ClineInvocationOptions = {}
@@ -864,7 +930,8 @@ async function runClineCore(input: AskClineInput, signal: AbortSignal | undefine
         const spawnFn = deps.spawn ?? spawn;
         const env = {
           ...process.env,
-          CLINE_NO_AUTO_UPDATE: "1"
+          CLINE_NO_AUTO_UPDATE: "1",
+          ...(options.hubEnv ?? {})
         };
 
         // A cancel that arrived during the awaits above (entry access, budget checks) must stop the launch.
@@ -955,7 +1022,10 @@ async function runClineCore(input: AskClineInput, signal: AbortSignal | undefine
               windowsHide: true,
               detached: platform !== "win32",
               stdio: ["ignore", "pipe", "pipe"],
-              env
+              env,
+              // Cline resolves a model's relative tool paths against its process cwd, not only `--cwd`:
+              // without this, `src/x.py` resolved under the MCP server's folder (the user's home).
+              ...(cwd ? { cwd } : {})
             });
           } catch (err) {
             if (cleanup()) {
