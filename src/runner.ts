@@ -1,4 +1,5 @@
 import { spawn } from "node:child_process";
+import { hubDaemonPidsOnPort, listClineProcesses } from "./procs.js";
 import { randomUUID } from "node:crypto";
 import { access, mkdir, rm } from "node:fs/promises";
 import net from "node:net";
@@ -176,6 +177,27 @@ export function defaultKillTree(pid: number, signal: NodeJS.Signals = "SIGKILL",
       process.kill(-pid, signal);
     }
   } catch {}
+}
+
+/** Kill a process tree and wait until the root process is gone (or the deadline passes). True when it is gone. */
+export async function killTreeAndWait(pid: number, timeoutMs = 10_000, platform: NodeJS.Platform = process.platform): Promise<boolean> {
+  const gone = () => { try { process.kill(pid, 0); return false; } catch (error) { return (error as NodeJS.ErrnoException).code === "ESRCH"; } };
+  if (gone()) return true;
+  const deadline = Date.now() + timeoutMs;
+  if (platform === "win32") {
+    await new Promise<void>((resolve) => {
+      try {
+        const killer = spawn("taskkill", ["/PID", String(pid), "/T", "/F"], { windowsHide: true, stdio: "ignore" });
+        const timer = setTimeout(() => { try { killer.kill(); } catch { /* gone */ } resolve(); }, timeoutMs);
+        killer.on("error", () => { clearTimeout(timer); resolve(); });
+        killer.on("close", () => { clearTimeout(timer); resolve(); });
+      } catch { resolve(); }
+    });
+  } else {
+    try { process.kill(-pid, "SIGKILL"); } catch { try { process.kill(pid, "SIGKILL"); } catch { /* gone */ } }
+  }
+  while (!gone() && Date.now() < deadline) await new Promise((resolve) => setTimeout(resolve, 100));
+  return gone();
 }
 
 export interface ClineDependencies {
@@ -634,6 +656,10 @@ async function dedicatedHub(options: ClineInvocationOptions): Promise<{ env: Rec
       child.on("error", () => { clearTimeout(timer); resolve(); });
       child.on("close", () => { clearTimeout(timer); resolve(); });
     });
+    // Safety net: never leave this run's hub behind, even when `hub stop` did not stop it.
+    if (process.platform === "win32") {
+      for (const pid of hubDaemonPidsOnPort(port, await listClineProcesses())) await killTreeAndWait(pid);
+    }
     for (const file of [discovery, `${discovery}.instance.lock`]) {
       await rm(file, { force: true, maxRetries: 3, retryDelay: 200 }).catch(() => {});
     }

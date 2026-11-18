@@ -1,6 +1,6 @@
 import { z } from "zod";
 import { acquire, ownsCheckoutLock, type CheckoutRelease } from "./checkoutlock.js";
-import { takeSnapshot, restoreSnapshot, discardSnapshot, headAndIndexIdentity, type SnapshotHandle, type SnapshotOptions } from "./snapshot.js";
+import { takeSnapshot, restoreSnapshot, discardSnapshot, createdFiles, headAndIndexIdentity, type SnapshotHandle, type SnapshotOptions } from "./snapshot.js";
 import { runVerification, VerificationError, type VerificationResult } from "./verify.js";
 import { ClineRunError, redactSecrets, guardOptionsSchema, type ClineResponse } from "./runner.js";
 import type { GuardOptions } from "./guard.js";
@@ -92,6 +92,8 @@ export class FinalCheckLifecycle {
   usage: Record<string, unknown> = Object.create(null); cost = 0; durationMs = 0;
   totalToolCalls = 0; totalInputTokens = 0; launches = 0; activeMs = 0; automaticFixes = 0;
   cancelled = false;
+  /** New, non-ignored files present when the edit finished (absent when there are none). */
+  createdFiles?: string[];
   private releaseOwnLock = false;
   constructor(readonly input: FinalCheckInput, readonly deps: FinalCheckDeps) {
     if (Buffer.byteLength(JSON.stringify(input), "utf8") > 64 * 1024) throw new ClineRunError("launch_failed", "Input exceeds 64 KiB.");
@@ -248,6 +250,9 @@ export class FinalCheckLifecycle {
     const snapshot = this.snapshot;
     this.snapshot = undefined; delete this.evidence.snapshotDirectory;
     if (snapshot) {
+      // Report every new file the edit left behind (a stray debug script, too); a report failure changes nothing.
+      try { const created = await createdFiles(snapshot); if (created.length) this.createdFiles = created; }
+      catch { /* report-only */ }
       try { await discardSnapshot(snapshot); }
       catch (error) { (this.evidence as Record<string, unknown>).snapshotCleanupError = `${snapshot.directory}: ${(error as Error)?.message ?? String(error)}`; }
     }

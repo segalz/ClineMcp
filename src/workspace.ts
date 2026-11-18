@@ -5,8 +5,10 @@ import { randomUUID } from "node:crypto";
 import { spawn } from "node:child_process";
 import { buildEnvironmentLine, WORKING_RULES } from "./rules.js";
 import { withCodeMap } from "./codemap.js";
+import { listClineProcesses, type ProcessInfo } from "./procs.js";
 import {
   defaultKillTree,
+  killTreeAndWait,
   ClineRunError,
 
   runCline,
@@ -90,10 +92,7 @@ function runGit(cwd: string, args: string[], signal?: AbortSignal, timeoutMs = G
   });
 }
 
-export interface ProcessInfo {
-  pid: number;
-  commandLine: string;
-}
+export type { ProcessInfo } from "./procs.js";
 
 function normalizePathForMatch(value: string): string {
   return value.replace(/\\/g, "/").replace(/\/+$/, "").toLowerCase();
@@ -112,31 +111,6 @@ export function hubDaemonPidsFor(worktreePath: string, processes: readonly Proce
       return cwd !== undefined && normalizePathForMatch(cwd) === target;
     })
     .map(({ pid }) => pid);
-}
-
-/** Lists cline.exe processes with their command lines (Windows only; empty elsewhere or on error). */
-async function listClineProcesses(): Promise<ProcessInfo[]> {
-  if (process.platform !== "win32") return [];
-  const script = "Get-CimInstance Win32_Process -Filter \"Name='cline.exe'\" | "
-    + "ForEach-Object { [string]$_.ProcessId + [char]9 + $_.CommandLine }";
-  return new Promise((resolve) => {
-    let stdout = "";
-    const child = spawn("powershell.exe", ["-NoProfile", "-NonInteractive", "-Command", script], {
-      windowsHide: true, stdio: ["ignore", "pipe", "ignore"]
-    });
-    const timer = setTimeout(() => { try { child.kill(); } catch { /* gone */ } resolve([]); }, 15_000);
-    timer.unref?.();
-    child.stdout.on("data", (chunk: Buffer) => { stdout += chunk.toString("utf8"); });
-    child.on("error", () => { clearTimeout(timer); resolve([]); });
-    child.on("close", () => {
-      clearTimeout(timer);
-      resolve(stdout.split(/\r?\n/).flatMap((line) => {
-        const tab = line.indexOf("\t");
-        const pid = Number(line.slice(0, tab));
-        return tab > 0 && Number.isInteger(pid) && pid > 0 ? [{ pid, commandLine: line.slice(tab + 1) }] : [];
-      }));
-    });
-  });
 }
 
 function hubDaemonCwd(commandLine: string): string | undefined {
@@ -179,15 +153,11 @@ async function ensureNeutralHub(options: Partial<ClineInvocationOptions>): Promi
   // The hub is shared by every Cline run on the machine, so a leftover one is stopped only while
   // this bridge has no other worktree run in flight, and only when its folder is already empty.
   if (activeWorktreeRuns === 0) {
-    let stopped = false;
     for (const { pid, commandLine } of await listClineProcesses()) {
       const cwd = hubDaemonCwd(commandLine);
-      if (cwd && normalizePathForMatch(cwd).startsWith(base) && await folderIsEmptyOrGone(cwd)) {
-        defaultKillTree(pid, "SIGKILL", process.platform);
-        stopped = true;
-      }
+      // Wait for the kill: the sweep below cannot remove a folder the hub still holds.
+      if (cwd && normalizePathForMatch(cwd).startsWith(base) && await folderIsEmptyOrGone(cwd)) await killTreeAndWait(pid);
     }
-    if (stopped) await new Promise((resolve) => setTimeout(resolve, 1000));
     await sweepEmptyWorktreeFolders();
   }
 }

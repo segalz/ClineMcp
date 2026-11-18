@@ -35,6 +35,8 @@ export interface ClineEditsResponse extends ClineResponse {
   headAfter: string;
   commitWasReverted: boolean;
   verification: FinalVerification;
+  /** New files the edit created (kept). Check each belongs to the task. */
+  createdFiles?: string[];
 }
 
 export interface ClineEditsEvidence {
@@ -177,7 +179,9 @@ export async function applyClineEdits(
     };
     const gitDiff = truncateGitDiff(await report(["diff", "--binary", "--no-ext-diff", "HEAD"], "diff"));
     const status = await report(["--no-optional-locks", "status", "--short"], "status");
-    return { ...lifecycle.result!, ...(warnings.length ? { warnings } : {}), usage: lifecycle.usage, cost: lifecycle.cost, durationMs: lifecycle.durationMs,
+    const created = lifecycle.createdFiles;
+    if (created?.length) warnings.push(`The edit created ${created.length} new file(s): ${created.slice(0, 20).join(", ")}${created.length > 20 ? ", ..." : ""}. Check each belongs to the task.`);
+    return { ...lifecycle.result!, ...(warnings.length ? { warnings } : {}), ...(created?.length ? { createdFiles: created } : {}), usage: lifecycle.usage, cost: lifecycle.cost, durationMs: lifecycle.durationMs,
       gitDiff, status, headBefore: head, headAfter: head, commitWasReverted: false, verification: lifecycle.verification };
   } finally { lifecycle.release(); }
 }

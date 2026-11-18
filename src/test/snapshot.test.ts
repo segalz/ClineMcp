@@ -146,7 +146,10 @@ test("restore reports integrity/link/ignored failures without following links or
   await rm(path.join(root, "dir"), { recursive: true });
   const outside = path.join(base, "outside"); await mkdir(outside); await writeFile(path.join(outside, "file"), "outside");
   await symlink(outside, path.join(root, "dir"), process.platform === "win32" ? "junction" : "dir");
-  await writeFile(path.join(root, ".gitignore"), "ignored/\nwill-ignore\n");
+  // An ignore source restore does not own (core.excludesFile): such a newly ignored path stays untouched.
+  // A rule the model writes into a .gitignore is undone first instead (edge-cases-2026-11-18.test.ts).
+  const excludes = path.join(base, "excludes"); await writeFile(excludes, "ignored/\nwill-ignore\n");
+  git(root, "config", "core.excludesFile", excludes);
   await writeFile(path.join(root, "will-ignore"), "ignored step bytes");
   const report = await restoreSnapshot(snapshot);
   assert.ok(report.failed.some(e => e.path === "a"));

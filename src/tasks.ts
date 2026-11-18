@@ -770,7 +770,9 @@ export class TaskManager {
         options: ["retry", "restore", "keep"] } : undefined);
       task.result = { ...lifecycle.result, text: lifecycle.result?.text ?? "", durationMs: lifecycle.durationMs,
         codeMapSource: task.codeMapSource ?? lifecycle.codeMapSource,
-        usage: lifecycle.usage, cost: lifecycle.cost, verification: structuredClone(lifecycle.verification) };
+        usage: lifecycle.usage, cost: lifecycle.cost, verification: structuredClone(lifecycle.verification),
+        ...(lifecycle.createdFiles?.length ? { createdFiles: [...lifecycle.createdFiles],
+          warnings: [...(lifecycle.result?.warnings ?? []), `The edit created ${lifecycle.createdFiles.length} new file(s): ${lifecycle.createdFiles.slice(0, 20).join(", ")}${lifecycle.createdFiles.length > 20 ? ", ..." : ""}. Check each belongs to the task.`] } : {}) };
       task.endedAt = this.wallNow(); task.activeMs += task.endedAt - started;
       if (nextState !== "input_required") this.releaseCheckout(task);
       task.error = nextError; task.state = nextState;
