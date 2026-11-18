@@ -153,3 +153,25 @@ test("S4 review: the node_modules/.bin search stops at the repository root", win
   await mkdir(path.join(repo, ".git"), { recursive: true });
   await assert.rejects(resolveVerificationCommand("s4only", [], repo), (error: any) => error?.kind === "verification_launch_failed");
 });
+
+test("S4 gate: a sync edit refused up front reports why the check cannot start and keeps nothing", async () => {
+  const { applyClineEdits } = await import("../edits.js");
+  const { ClineRunError } = await import("../runner.js");
+  const repo = await mkdtemp(path.join(base, "sync-early-"));
+  const git = (...args: string[]) => assert.equal(spawnSync("git", ["-C", repo, ...args], { windowsHide: true }).status, 0);
+  git("init", "--quiet");
+  await writeFile(path.join(repo, "a"), "committed");
+  git("add", ".");
+  git("-c", "user.name=Test", "-c", "user.email=t@example.invalid", "commit", "-qm", "baseline");
+  await assert.rejects(applyClineEdits({ cwd: repo, prompt: "Implement", provider: "p", model: "m", keepOnFailure: true,
+    verify: { command: "definitely-missing-verify-tool-s4" } } as any, undefined, { checkoutLockDirectory: path.join(base, "sync-locks") }),
+  (error: any) => {
+    assert.ok(error instanceof ClineRunError);
+    const verification = (error as any).verification;
+    assert.equal(error.kind, "launch_failed");
+    assert.match(error.message, /verification_launch_failed/);
+    assert.equal(verification?.kept, false, "nothing was changed, so nothing is reported as kept");
+    assert.equal(verification?.attempts.length, 0);
+    return true;
+  });
+});

@@ -4,6 +4,7 @@ import { buildEnvironmentLine, WORKING_RULES } from "./rules.js";
 import { withCodeMap, codeMapCommandLineLength } from "./codemap.js";
 import { FinalCheckLifecycle, verificationSchema, type VerifySpec, type FinalVerification } from "./finalcheck.js";
 import { ownsCheckoutLock } from "./checkoutlock.js";
+import { VerificationError } from "./verify.js";
 import {
   defaultKillTree,
   ClineRunError,
@@ -156,10 +157,14 @@ export async function applyClineEdits(
         try { lifecycle.evidence.gitDiff = truncateGitDiff(await runGit(lifecycle.root, ["diff", "--binary", "--no-ext-diff", "HEAD"])); }
         catch { /* Recovery evidence must survive an inspection failure. */ }
       }
-      if (input.keepOnFailure && !signal?.aborted && lifecycle.waitReason !== "head_changed") await lifecycle.keep();
+      // Nothing to keep when the request was refused before its snapshot (e.g. a check that cannot start).
+      if (input.keepOnFailure && lifecycle.snapshot && !signal?.aborted && lifecycle.waitReason !== "head_changed") await lifecycle.keep();
       else await lifecycle.restore();
       const error = lifecycle.error instanceof ClineRunError ? lifecycle.error
-        : new ClineRunError("edits_inspection_failed", `Edit failed: ${reason ?? "verification failed"}.`);
+        // A check refused up front (plan S4): no run happened, so say what is wrong with the check itself.
+        : lifecycle.error instanceof VerificationError
+          ? new ClineRunError("launch_failed", `The final check cannot start (${lifecycle.error.kind}): ${lifecycle.error.message}`, { attempts: 0 })
+          : new ClineRunError("edits_inspection_failed", `Edit failed: ${reason ?? "verification failed"}.`);
       Object.assign(error, { verification: lifecycle.verification, evidence: lifecycle.evidence,
         codeMapSource: lifecycle.codeMapSource,
         usage: lifecycle.usage, cost: lifecycle.cost, durationMs: lifecycle.durationMs });
