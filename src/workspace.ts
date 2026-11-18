@@ -134,6 +134,16 @@ async function sweepEmptyWorktreeFolders(): Promise<void> {
   }
 }
 
+/** True when an emptied `review-*` worktree folder is left behind: the sign of a hub still holding it. */
+export async function hasEmptyWorktreeFolder(base = WORKTREE_BASE): Promise<boolean> {
+  let names: string[];
+  try { names = await readdir(base); } catch { return false; }
+  for (const name of names) {
+    if (name.startsWith("review-") && await folderIsEmptyOrGone(path.join(base, name))) return true;
+  }
+  return false;
+}
+
 async function folderIsEmptyOrGone(folder: string): Promise<boolean> {
   try {
     return (await readdir(folder)).length === 0;
@@ -153,7 +163,9 @@ async function ensureNeutralHub(options: Partial<ClineInvocationOptions>): Promi
   const base = `${normalizePathForMatch(WORKTREE_BASE)}/`;
   // The hub is shared by every Cline run on the machine, so a leftover one is stopped only while
   // this bridge has no other worktree run in flight, and only when its folder is already empty.
-  if (activeWorktreeRuns === 0) {
+  // The ~1 s process scan runs only when an emptied worktree folder is left behind (plan S6, B6): that is
+  // the sign of a hub still holding it. Each run's own hub is stopped by runCline itself.
+  if (activeWorktreeRuns === 0 && await hasEmptyWorktreeFolder()) {
     for (const { pid, commandLine } of await listClineProcesses()) {
       const cwd = hubDaemonCwd(commandLine);
       // Wait for the kill: the sweep below cannot remove a folder the hub still holds.

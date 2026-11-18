@@ -235,11 +235,15 @@ export interface ClineDependencies {
   statusPath?: string | null;
   /** Base folder for per-run traces (default %TEMP%/cline-tasks). */
   traceBase?: string;
+  /** Test seam: replaces the per-run hub factory (it also runs with a fake spawn/entry then). */
+  startHub?: (options: ClineInvocationOptions) => Promise<DedicatedHub | undefined>;
 }
 
 export interface ClineInvocationOptions {
   /** Internal: environment that points this run at its own Cline hub (set by runCline). */
   hubEnv?: Record<string, string>;
+  /** Internal: starts this run's hub on first use and returns its environment (set by runCline). */
+  hubProvider?: () => Promise<Record<string, string> | undefined>;
   /** Map preparation is part of the run's existing total deadline. */
   preparationMs?: number;
   codeMapSource?: CodeMapSource;
@@ -644,6 +648,51 @@ async function freeLoopbackPort(): Promise<number | undefined> {
 
 export const DEDICATED_HUB_BASE = path.join(os.tmpdir(), "cline-mcp-hubs");
 
+export interface DedicatedHub { env: Record<string, string>; stop: () => Promise<void> }
+
+export interface HubStopDeps {
+  /** True while something accepts connections on the hub's loopback port. */
+  isListening?: (port: number) => Promise<boolean>;
+  /** True when the hub wrote its discovery record, i.e. it started even if the port probe misses it. */
+  hubStarted?: () => Promise<boolean>;
+  /** Runs `cline hub stop` for this hub's discovery record. */
+  runHubStop?: () => Promise<void>;
+  listProcesses?: typeof listClineProcesses;
+  killTree?: (pid: number) => Promise<unknown>;
+  removeFiles?: () => Promise<void>;
+}
+
+export function loopbackPortListening(port: number, timeoutMs = 1_500): Promise<boolean> {
+  return new Promise((resolve) => {
+    const socket = net.createConnection({ host: "127.0.0.1", port });
+    const done = (open: boolean) => { socket.destroy(); resolve(open); };
+    socket.setTimeout(timeoutMs, () => done(false));
+    socket.once("connect", () => done(true));
+    socket.once("error", () => done(false));
+  });
+}
+
+/**
+ * Stop a per-run hub only as far as needed (plan S6, B6): a hub that never started (no discovery record and
+ * nothing listening on its port) costs nothing; `hub stop` runs only for a hub that started; the ~1 s
+ * PowerShell process scan runs only when the hub is still listening after `hub stop`.
+ */
+export async function stopDedicatedHub(port: number, deps: HubStopDeps): Promise<void> {
+  const isListening = deps.isListening ?? loopbackPortListening;
+  try {
+    // Either sign means the hub started; a slow probe alone must never leave a live hub behind.
+    if (!await (deps.hubStarted?.() ?? Promise.resolve(false)) && !await isListening(port)) return;
+    await deps.runHubStop?.();
+    // Safety net: never leave this run's hub behind, even when `hub stop` did not stop it.
+    if (process.platform === "win32" && await isListening(port)) {
+      const listProcesses = deps.listProcesses ?? listClineProcesses;
+      for (const pid of hubDaemonPidsOnPort(port, await listProcesses())) await (deps.killTree ?? killTreeAndWait)(pid);
+    }
+  } finally {
+    await deps.removeFiles?.();
+  }
+}
+
 /**
  * Cline 3.x runs sessions through a hub daemon and resolves a model's RELATIVE tool paths against the
  * hub's own cwd, not the session's --cwd. The shared hub sits wherever it was first started (the user's
@@ -651,7 +700,7 @@ export const DEDICATED_HUB_BASE = path.join(os.tmpdir(), "cline-mcp-hubs");
  * Each bridge run therefore gets its own hub (own discovery record and port): Cline starts it on demand in
  * the run's --cwd, and the bridge stops it when the run ends, so it never outlives the run or locks a worktree.
  */
-async function dedicatedHub(options: ClineInvocationOptions): Promise<{ env: Record<string, string>; stop: () => Promise<void> } | undefined> {
+async function dedicatedHub(options: ClineInvocationOptions): Promise<DedicatedHub | undefined> {
   if (options.hubEnv || options.deps?.spawn || options.deps?.entryPath) return undefined;
   const entry = resolveClineEntry();
   const port = await freeLoopbackPort();
@@ -659,8 +708,9 @@ async function dedicatedHub(options: ClineInvocationOptions): Promise<{ env: Rec
   await mkdir(DEDICATED_HUB_BASE, { recursive: true }).catch(() => {});
   const discovery = path.join(DEDICATED_HUB_BASE, `hub-${randomUUID()}.json`);
   const env = { CLINE_HUB_DISCOVERY_PATH: discovery, CLINE_HUB_PORT: String(port) };
-  const stop = async () => {
-    await new Promise<void>((resolve) => {
+  const stop = () => stopDedicatedHub(port, {
+    hubStarted: () => access(discovery).then(() => true, () => false),
+    runHubStop: () => new Promise<void>((resolve) => {
       const child = spawn(process.execPath, [entry, "hub", "stop"], {
         cwd: os.homedir(), windowsHide: true, stdio: "ignore", env: { ...process.env, ...env }
       });
@@ -668,15 +718,13 @@ async function dedicatedHub(options: ClineInvocationOptions): Promise<{ env: Rec
       timer.unref?.();
       child.on("error", () => { clearTimeout(timer); resolve(); });
       child.on("close", () => { clearTimeout(timer); resolve(); });
-    });
-    // Safety net: never leave this run's hub behind, even when `hub stop` did not stop it.
-    if (process.platform === "win32") {
-      for (const pid of hubDaemonPidsOnPort(port, await listClineProcesses())) await killTreeAndWait(pid);
+    }),
+    removeFiles: async () => {
+      for (const file of [discovery, `${discovery}.instance.lock`]) {
+        await rm(file, { force: true, maxRetries: 3, retryDelay: 200 }).catch(() => {});
+      }
     }
-    for (const file of [discovery, `${discovery}.instance.lock`]) {
-      await rm(file, { force: true, maxRetries: 3, retryDelay: 200 }).catch(() => {});
-    }
-  };
+  });
   return { env, stop };
 }
 
@@ -685,12 +733,17 @@ export async function runCline(
   signal?: AbortSignal,
   options: ClineInvocationOptions = {}
 ): Promise<ClineResponse> {
-  const hub = await dedicatedHub(options);
-  if (!hub) return runClineInner(input, signal, options);
+  if (options.hubEnv) return runClineInner(input, signal, options);
+  // The hub starts only when Cline is about to launch (plan S6, B6): a call refused before launch (quota
+  // lock, bad cwd, cancel) starts and stops nothing.
+  const startHub = options.deps?.startHub ?? dedicatedHub;
+  let hub: Promise<DedicatedHub | undefined> | undefined;
+  const hubProvider = async () => (await (hub ??= startHub(options).catch(() => undefined)))?.env;
   try {
-    return await runClineInner(input, signal, { ...options, hubEnv: hub.env });
+    return await runClineInner(input, signal, { ...options, hubProvider });
   } finally {
-    await hub.stop();
+    const started = await hub;
+    await started?.stop();
   }
 }
 
@@ -889,17 +942,9 @@ async function runClineCore(input: AskClineInput, signal: AbortSignal | undefine
           throw new ClineRunError("timeout", `Cline exceeded the ${timeoutSeconds}-second timeout.`, { attempts: attempt - 1 });
         }
 
-        // Budget calculation for this attempt
-        let attemptBudgetMs = totalBudgetMs;
-        if (attempt === 1) {
-          if (maxAttempts > 1 && Math.floor(totalBudgetMs * 0.40) >= minRetryBudgetMs) {
-            attemptBudgetMs = Math.floor(totalBudgetMs * 0.60);
-          }
-        } else {
-          attemptBudgetMs = remainingBeforeAttempt;
-        }
-
-        const effectiveAttemptBudgetMs = Math.min(attemptBudgetMs, remainingBeforeAttempt);
+        // Every attempt may use all the time left (plan S6, B1): a 60/40 split killed slow but healthy first
+        // attempts at 60%. A retry happens only when an attempt fails early enough to leave minRetryBudgetMs.
+        const effectiveAttemptBudgetMs = remainingBeforeAttempt;
         const attemptTimeoutSeconds = Math.max(1, Math.floor(effectiveAttemptBudgetMs / 1000));
         const attemptTimerMs = deps.timeoutMs !== undefined
           ? Math.min(deps.timeoutMs, effectiveAttemptBudgetMs)
@@ -938,6 +983,8 @@ async function runClineCore(input: AskClineInput, signal: AbortSignal | undefine
         recorder?.attemptStarted(thisAttempt);
         const guard = createGuard(options.guard ?? effectiveInput.guard);
         guards.push(guard);
+        // Never repeat an attempt whose model already ran tools (plan S6, B1): its work may be half done.
+        const canRetry = options.canRetry ?? (() => guard.snapshot().totalToolCalls === 0);
         const guardState: { verdict: GuardVerdict | null } = { verdict: null };
         let terminateChild!: (reason: "timeout" | "cancelled" | "guard") => void;
         const splitter = new LineSplitter(
@@ -966,11 +1013,12 @@ async function runClineCore(input: AskClineInput, signal: AbortSignal | undefine
         let timedOut = false;
         let cancelled = false;
 
+        const hubEnv = options.hubEnv ?? (options.hubProvider ? await options.hubProvider() : undefined);
         const spawnFn = deps.spawn ?? spawn;
         const env = {
           ...process.env,
           CLINE_NO_AUTO_UPDATE: "1",
-          ...(options.hubEnv ?? {})
+          ...(hubEnv ?? {})
         };
 
         // A cancel that arrived during the awaits above (entry access, budget checks) must stop the launch.
@@ -1324,8 +1372,8 @@ async function runClineCore(input: AskClineInput, signal: AbortSignal | undefine
           );
           const remainingBudgetMs = getRemainingBudgetMs();
           let allowRetry = remainingBudgetMs > 0 && remainingBudgetMs >= minRetryBudgetMs;
-          if (allowRetry && attempt < maxAttempts && options.canRetry) {
-            allowRetry = await options.canRetry({ stdout, stderr, attempt });
+          if (allowRetry && attempt < maxAttempts) {
+            allowRetry = await canRetry({ stdout, stderr, attempt });
             // A cancel during the retry check is a cancel, not the provider error that triggered it.
             if (signal?.aborted) throw new ClineRunError("cancelled", `The Cline request was cancelled.${aliveSentence}`, { attempts: attempt, processesStillAlive, killUnverified: exitInfo.killUnverified });
             allowRetry = allowRetry && getRemainingBudgetMs() > 0 && getRemainingBudgetMs() >= minRetryBudgetMs;
@@ -1356,8 +1404,8 @@ async function runClineCore(input: AskClineInput, signal: AbortSignal | undefine
           stderr.includes("Cannot find module")
         ) {
           let allowRetry = getRemainingBudgetMs() > 0 && getRemainingBudgetMs() >= minRetryBudgetMs;
-          if (allowRetry && attempt < maxAttempts && options.canRetry) {
-            allowRetry = await options.canRetry({ stdout, stderr, attempt });
+          if (allowRetry && attempt < maxAttempts) {
+            allowRetry = await canRetry({ stdout, stderr, attempt });
             // A cancel during the retry check is a cancel, not the provider error that triggered it.
             if (signal?.aborted) throw new ClineRunError("cancelled", "The Cline request was cancelled.", { attempts: attempt });
             allowRetry = allowRetry && getRemainingBudgetMs() > 0 && getRemainingBudgetMs() >= minRetryBudgetMs;
@@ -1404,8 +1452,8 @@ async function runClineCore(input: AskClineInput, signal: AbortSignal | undefine
         if (transient) {
           const remainingBudgetMs = getRemainingBudgetMs();
           let allowRetry = remainingBudgetMs > 0 && remainingBudgetMs >= minRetryBudgetMs;
-          if (allowRetry && attempt < maxAttempts && options.canRetry) {
-            allowRetry = await options.canRetry({ stdout, stderr, attempt });
+          if (allowRetry && attempt < maxAttempts) {
+            allowRetry = await canRetry({ stdout, stderr, attempt });
             // A cancel during the retry check is a cancel, not the provider error that triggered it.
             if (signal?.aborted) throw new ClineRunError("cancelled", "The Cline request was cancelled.", { attempts: attempt });
             allowRetry = allowRetry && getRemainingBudgetMs() > 0 && getRemainingBudgetMs() >= minRetryBudgetMs;
