@@ -216,13 +216,13 @@ test("refused verifier spends no fixes and reports local failure without a model
   assert.equal((await f.manager.result(task.taskId)).log_run_hint, null);
 });
 
-test("missing verifier does not trigger repair runs", async t => {
+test("missing verifier is refused before any run and triggers no repair runs", async t => {
+  // Plan S4: the check is resolved up front, so a missing verifier no longer wastes a model run.
   const f = await asyncFixture(t, { command: "cline-finalcheck-missing-executable-972643" });
-  const task = f.start({ maxFixRuns: 3 }); (await f.launched(1)).finish();
-  const waiting = await f.wait(task.taskId, "input_required");
-  assert.equal(waiting.waitReason, "verify_failed"); assert.equal(waiting.verification?.fixRuns, 0);
-  assert.equal(waiting.verification?.attempts[0].exitCode, null); assert.equal(f.runs.length, 1);
-  await f.manager.cancel(task.taskId);
+  const task = f.start({ maxFixRuns: 3 });
+  const failed = await f.wait(task.taskId, "failed");
+  assert.equal(failed.waitReason, "verify_failed"); assert.equal(failed.verification?.fixRuns, 0);
+  assert.equal(failed.verification?.attempts.length, 0); assert.equal(f.runs.length, 0);
 });
 
 test("overall active-time budget stops a run and survives manual retries", async t => {

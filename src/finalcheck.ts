@@ -1,12 +1,15 @@
 import { z } from "zod";
 import { acquire, ownsCheckoutLock, type CheckoutRelease } from "./checkoutlock.js";
 import { takeSnapshot, restoreSnapshot, discardSnapshot, createdFiles, headAndIndexIdentity, type SnapshotHandle, type SnapshotOptions } from "./snapshot.js";
-import { runVerification, VerificationError, type VerificationResult } from "./verify.js";
+import { resolveVerificationCommand, runVerification, VerificationError, type VerificationResult } from "./verify.js";
 import { ClineRunError, redactSecrets, guardOptionsSchema, type ClineResponse } from "./runner.js";
 import type { GuardOptions } from "./guard.js";
 
+const VERIFY_COMMAND_HELP = "Program for the final check, run without a shell. It must already be runnable before the edit "
+  + "starts (it is checked up front; a tool the edit would install is refused). On Windows, npm/pnpm/yarn and "
+  + "node_modules/.bin shims (vitest, tsc, eslint) are resolved to their program.";
 export const verificationSchema = z.union([
-  z.object({ command: z.string().min(1).refine(v => !v.includes("\0")),
+  z.object({ command: z.string().min(1).refine(v => !v.includes("\0")).describe(VERIFY_COMMAND_HELP),
     args: z.array(z.string().refine(v => !v.includes("\0"))).optional(),
     timeoutSeconds: z.number().int().min(1).max(300).optional() }).strict(),
   z.object({ none: z.literal(true), reason: z.string().trim().min(10).max(500) }).strict()
@@ -50,6 +53,8 @@ export interface FinalCheckDeps {
   question: (text: string) => { question: string; options?: string[] } | undefined;
   snapshotOptions?: SnapshotOptions; lockDirectory?: string; checkoutLock?: CheckoutRelease;
   verify?: typeof runVerification;
+  /** Up-front check that the verify command can start (default: the real resolver; skipped when only `verify` is injected). */
+  resolveVerify?: typeof resolveVerificationCommand;
 }
 export function aggregateUsage(target: Record<string, unknown>, source?: Record<string, unknown>): void {
   for (const [key, value] of Object.entries(source ?? {})) {
@@ -146,6 +151,17 @@ export class FinalCheckLifecycle {
         this.lock = ownsCheckoutLock(this.deps.checkoutLock, this.root) ? this.deps.checkoutLock
           : acquire(this.root, { lockDirectory: this.deps.lockDirectory });
         this.releaseOwnLock = this.lock !== this.deps.checkoutLock;
+      }
+      // A check that cannot even start makes the run pointless: refuse before the snapshot and any launch.
+      const resolveVerify = this.deps.resolveVerify ?? (this.deps.verify ? undefined : resolveVerificationCommand);
+      if (resolveVerify && !this.snapshot && this.launches === 0 && !("none" in this.input.verify)) {
+        const spec = this.input.verify;
+        try { await resolveVerify(spec.command, spec.args ?? [], this.root); }
+        catch (error) {
+          if (!(error instanceof VerificationError)) throw error;
+          this.wait("verify_failed", error); this.release(); return;
+        }
+        check();
       }
       if (!this.snapshot) {
         this.phase = "snapshot";
