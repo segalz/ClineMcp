@@ -711,6 +711,10 @@ export class CliStateManager {
   private shuttingDown = false;
   private backgroundPromise: Promise<void> | undefined;
   private activeInstallPromise: Promise<void> | undefined;
+  /** Tool calls of this process that are preparing or running (they may not be in the settings journal yet). */
+  private activeCalls = 0;
+  private updatePending = false;
+  private lastDeps: CliStateDeps | undefined;
 
   constructor(private readonly defaultDeps: CliStateDeps = {}) {}
 
@@ -724,6 +728,46 @@ export class CliStateManager {
 
   public isShuttingDown(): boolean {
     return this.shuttingDown;
+  }
+
+  /**
+   * Marks a tool call of this bridge as active until the returned release function is called (idempotent).
+   * No CLI install starts while any call is active; a deferred update starts when the last call releases.
+   */
+  public beginCall(): () => void {
+    this.activeCalls++;
+    let released = false;
+    return () => {
+      if (released) return;
+      released = true;
+      this.activeCalls = Math.max(0, this.activeCalls - 1);
+      if (this.activeCalls === 0) this.startPendingUpdate();
+    };
+  }
+
+  /** Runs a deferred update in the background once the bridge is idle; tracked by `backgroundPromise`. */
+  private startPendingUpdate(): void {
+    if (this.shuttingDown || this.activeCalls > 0 || !this.updatePending) return;
+    this.updatePending = false;
+    this.startBackgroundUpdate(this.mergeDeps(this.lastDeps));
+  }
+
+  private startBackgroundUpdate(deps: CliStateDeps): void {
+    const prev = this.backgroundPromise;
+    const bg: Promise<void> = (async () => {
+      if (prev) await prev.catch(() => {});
+      if (this.shuttingDown) return;
+      if (this.activeCalls > 0) {
+        this.updatePending = true;
+        return;
+      }
+      await this.runSafeUpdate(deps);
+    })()
+      .catch(() => {})
+      .finally(() => {
+        if (this.backgroundPromise === bg) this.backgroundPromise = undefined;
+      });
+    this.backgroundPromise = bg;
   }
 
   public async waitForBackgroundWork(): Promise<void> {
@@ -1029,12 +1073,24 @@ export class CliStateManager {
         return await readStateFile(statePath, deps);
       }
 
+      // Re-check right after the settings mutex is held (a call may have begun while waiting for it)
+      if (this.activeCalls > 0) {
+        this.updatePending = true;
+        return await readStateFile(statePath, deps);
+      }
+
       // Check settings journal for any live runs across all bridge processes on this machine
       const busy = await hasActiveRunsLocked(settingsPath, {
         wallNow,
         isProcessAlive: deps.isProcessAlive
       });
       if (busy) {
+        return await readStateFile(statePath, deps);
+      }
+
+      // A tool call of this bridge may still be preparing (not in the journal yet): never claim then.
+      if (this.activeCalls > 0) {
+        this.updatePending = true;
         return await readStateFile(statePath, deps);
       }
 
@@ -1294,12 +1350,14 @@ export class CliStateManager {
       !process.env.NODE_TEST_CONTEXT ||
       process.env.CLINE_MCP_ALLOW_REAL_NPM === "1";
 
+    this.lastDeps = deps;
     if (canRunNpm && !this.backgroundPromise) {
       if (checkDue && state.cli.update_state !== "updating") {
         const bg: Promise<void> = (async () => {
           const afterCheck = await this.checkForUpdates(deps);
           if (!this.shuttingDown && afterCheck.cli.update_state === "update_available") {
-            await this.runSafeUpdate(deps);
+            if (this.activeCalls > 0) this.updatePending = true;
+            else await this.runSafeUpdate(deps);
           }
         })()
           .catch(() => {})
@@ -1308,17 +1366,13 @@ export class CliStateManager {
           });
         this.backgroundPromise = bg;
       } else if (state.cli.update_state === "update_available") {
-        const bg: Promise<void> = (async () => {
-          await this.runSafeUpdate(deps);
-        })()
-          .catch(() => {})
-          .finally(() => {
-            if (this.backgroundPromise === bg) this.backgroundPromise = undefined;
-          });
-        this.backgroundPromise = bg;
+        if (this.activeCalls > 0) {
+          this.updatePending = true;
+        } else {
+          this.startBackgroundUpdate(deps);
+        }
       }
     }
-
     return state;
   }
 }
@@ -1335,6 +1389,10 @@ export function checkForCliUpdates(deps?: CliStateDeps) {
 
 export function runSafeCliUpdate(deps?: CliStateDeps) {
   return defaultCliStateManager.runSafeUpdate(deps);
+}
+
+export function beginCliCall(): () => void {
+  return defaultCliStateManager.beginCall();
 }
 
 export function onToolCall(deps?: CliStateDeps) {

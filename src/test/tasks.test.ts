@@ -1273,3 +1273,15 @@ test("minimum budget check rejects send when question + options + answer togethe
 
   await m.shutdown(1000);
 });
+
+test("S1: a task holds a bridge call until its run settles", async () => {
+  const c = controllable();
+  let active = 0;
+  const m = new TaskManager({ runners: { ask: c.runner }, traceBase: traceBase(), beginCall: () => { active++; let done = false; return () => { if (!done) { done = true; active--; } }; } });
+  const t = m.start({ mode: "ask", prompt: "x", ...sel });
+  assert.equal(active, 1, "the running task holds one call");
+  await c.runs[0].finish("answer");
+  await m.status(t.taskId, 5);
+  await m.result(t.taskId);
+  assert.equal(active, 0, "the hold is released when the run settles");
+});

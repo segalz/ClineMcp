@@ -13,6 +13,7 @@ import { PROHIBITED_NAMES, resolveProviderSettingsPath, recoverProviderSettingsJ
 import {
   attachCliToObject,
   attachCliToText,
+  beginCliCall,
   mutateStateFile,
   notifyCliStateShutdown,
   onToolCall,
@@ -24,7 +25,14 @@ import {
 const server = new McpServer({ name: "cline-local-bridge", version: "1.0.0" });
 
 async function beforeToolCall(): Promise<void> {
-  await onToolCall().catch(() => {});
+  // Hold a call while the hook runs, so the hook itself never starts a CLI install; release one tick later,
+  // after a Cline-running handler has taken its own hold in track() / cline_start / cline_send.
+  const endHookCall = beginCliCall();
+  try {
+    await onToolCall().catch(() => {});
+  } finally {
+    setImmediate(endHookCall);
+  }
 }
 
 async function replyJson(
@@ -58,13 +66,16 @@ function track<T>(clientSignal: AbortSignal, work: (signal: AbortSignal) => Prom
   if (shuttingDown) {
     return Promise.reject(new ClineRunError("cancelled", "The bridge is shutting down; no new Cline runs start.", { attempts: 0 }));
   }
+  // Hold a call for the whole preparation + run so no CLI update starts in between; released in finally.
+  const endCliCall = beginCliCall();
   const controller = new AbortController();
   const onClientAbort = () => controller.abort();
   if (clientSignal.aborted) controller.abort(); else clientSignal.addEventListener("abort", onClientAbort, { once: true });
-  const done = work(controller.signal);
+  // A call that arrives mid-install waits for it instead of failing on the settings lock.
+  const done = waitForActiveCliUpdate().then(() => work(controller.signal));
   const entry = { controller, done };
   activeCalls.add(entry);
-  return done.finally(() => { activeCalls.delete(entry); clientSignal.removeEventListener("abort", onClientAbort); });
+  return done.finally(() => { activeCalls.delete(entry); clientSignal.removeEventListener("abort", onClientAbort); endCliCall(); });
 }
 
 // Required on every tool: the bridge never runs on Cline's saved default selection.
@@ -306,7 +317,7 @@ try {
 
 // --- Async tasks --------------------------------------------------------------------------------------------
 
-const tasks = new TaskManager();
+const tasks = new TaskManager({ beginCall: beginCliCall });
 const asText = (value: unknown) => replyJson((value && typeof value === "object" ? value : { value }) as Record<string, unknown>);
 const asError = (error: unknown, fallback: string) => replyErrorText(error, fallback);
 
@@ -333,7 +344,13 @@ server.registerTool(
     await beforeToolCall();
     try {
       const { waitSeconds, ...input } = startTaskSchema.parse(rawInput);
-      const started = tasks.start(input);
+      // The task holds its own call from start() on; this one covers the wait for a running install.
+      const endCliCall = beginCliCall();
+      let started;
+      try {
+        await waitForActiveCliUpdate();
+        started = tasks.start(input);
+      } finally { endCliCall(); }
       return await asText(await tasks.status(started.taskId, waitSeconds ?? 3));
     } catch (error) {
       return await asError(error, "Starting the Cline task failed unexpectedly.");
@@ -376,12 +393,14 @@ server.registerTool(
   },
   async ({ taskId, message, action, waitSeconds }) => {
     await beforeToolCall();
+    const endCliCall = beginCliCall();
     try {
+      await waitForActiveCliUpdate();
       await tasks.send(taskId, message, action);
       return await asText(await tasks.status(taskId, waitSeconds ?? 3));
     } catch (error) {
       return await asError(error, "Sending message to the Cline task failed unexpectedly.");
-    }
+    } finally { endCliCall(); }
   }
 );
 

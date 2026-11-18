@@ -70,6 +70,12 @@ export interface TaskManagerDeps {
   platform?: NodeJS.Platform;
   snapshotOptions?: SnapshotOptions;
   runVerification?: typeof runVerification;
+  /**
+   * Marks a bridge call as active (see CliStateManager.beginCall). A task holds one for each run segment
+   * (start, or a cline_send resume) and releases it when that segment settles, including when it settles
+   * into input_required, so a task waiting for cline_send never blocks CLI updates.
+   */
+  beginCall?: () => () => void;
 }
 
 export function parseQuestionFromText(text: string): { question: string; options?: string[] } | undefined {
@@ -740,6 +746,13 @@ export class TaskManager {
     task.finalCheck?.release();
   }
 
+  /** Holds a bridge call until the task's current run segment settles (done, failed, cancelled or input_required). */
+  private holdCall(task: Task): void {
+    if (!this.deps.beginCall) return;
+    const release = this.deps.beginCall();
+    task.settled.then(release, release);
+  }
+
   /** Publish waiting/terminal only after the entire lifecycle segment has settled. */
   private launchFinalCheck(task: Task, action?: EditAction | "cancel", message = ""): void {
     const lifecycle = task.finalCheck!;
@@ -855,6 +868,7 @@ export class TaskManager {
     this.tasks.set(id, task);
     if (task.finalCheck) this.launchFinalCheck(task);
     else this.executeRun(task, input.prompt, trace);
+    this.holdCall(task);
     return this.view(task);
   }
 
@@ -869,7 +883,7 @@ export class TaskManager {
       if (!["retry", "restore", "keep"].includes(action) || typeof message !== "string" || message.length > 20_000)
         throw new ClineRunError("launch_failed", "Expected retry, restore or keep, and guidance up to 20000 characters.");
       if (action === "retry" && this.running().length >= MAX_RUNNING_TASKS) throw new ClineRunError("task_limit", "At most two tasks run at once.");
-      this.launchFinalCheck(task, action as EditAction, message); return this.view(task);
+      this.launchFinalCheck(task, action as EditAction, message); this.holdCall(task); return this.view(task);
     }
     if (action !== "retry") throw new ClineRunError("launch_failed", "Ask/workspace tasks support retry only.", { attempts: 0 });
     if (typeof message !== "string" || message.length < 1 || message.length > 20_000) {
@@ -907,6 +921,7 @@ export class TaskManager {
     let resolveSettled!: () => void;
     task.settled = new Promise<void>(resolve => { resolveSettled = resolve; });
     task.resolveSettled = resolveSettled;
+    this.holdCall(task);
 
     // Defect 1 & Defect 4: Clear old trace data & reserve synchronously before any await
     const savedQuestion = task.question;
