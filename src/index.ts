@@ -204,6 +204,8 @@ server.registerTool(
           ...(error.stdoutTail ? { stdoutTail: error.stdoutTail } : {}),
           ...(error.trace ? { trace: error.trace } : {}),
           ...(error.guard ? { guard: error.guard } : {}),
+          ...(error.processesStillAlive?.length ? { processesStillAlive: error.processesStillAlive } : {}),
+          ...(error.killUnverified ? { killUnverified: true } : {}),
           codeMapSource: error.codeMapSource ?? "none",
           ...(error.notes?.length ? { notes: error.notes } : {})
         }, { isError: true });

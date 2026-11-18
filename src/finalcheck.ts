@@ -203,6 +203,10 @@ export class FinalCheckLifecycle {
           verified = { passed: false, exitCode: null, signal: null, timedOut: false, killedForOutput: false,
             durationMs: performance.now() - verifyStarted, stdoutTail: "", stderrTail: message, error: message };
         }
+        if (verified.killConfirmed === false) {
+          this.evidence.processesStillAlive = verified.stillAlive ?? [];
+          if (verified.killUnverified) this.evidence.killUnverified = true;
+        }
         verified.stdoutTail = redactSecrets(verified.stdoutTail); verified.stderrTail = redactSecrets(verified.stderrTail);
         this.verification.attempts.push({ ...verified, run: this.launches });
         this.verification.passed = verified.passed;
@@ -217,6 +221,11 @@ export class FinalCheckLifecycle {
         this.automaticFixes++; repair = true;
       }
     } catch (error) {
+      // A stopped run whose processes could not be confirmed dead: keep that visible even when cancelled.
+      if (error instanceof ClineRunError && (error.processesStillAlive?.length || error.killUnverified)) {
+        this.evidence.processesStillAlive = error.processesStillAlive ?? [];
+        if (error.killUnverified) this.evidence.killUnverified = true;
+      }
       if (signal.aborted) { this.cancelled = true; this.error = new ClineRunError("cancelled", "The edit lifecycle was cancelled."); await this.restore(); }
       else this.wait(expired ? "budget" : "cline_error", error);
     } finally {

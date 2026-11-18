@@ -1,5 +1,6 @@
-import { spawn } from "node:child_process";
+import { ChildProcess, spawn } from "node:child_process";
 import { hubDaemonPidsOnPort, listClineProcesses } from "./procs.js";
+import { confirmTreeDead } from "./proctree.js";
 import { randomUUID } from "node:crypto";
 import { access, mkdir, rm } from "node:fs/promises";
 import net from "node:net";
@@ -125,6 +126,9 @@ export interface ClineRunErrorDetails {
   resetAt?: string;
   retryAfterSeconds?: number;
   guard?: GuardReport;
+  processesStillAlive?: number[];
+  /** The process list could not be read, so the stopped run's descendants are not confirmed dead. */
+  killUnverified?: boolean;
 }
 
 export class ClineRunError extends Error {
@@ -138,6 +142,8 @@ export class ClineRunError extends Error {
   public readonly resetAt?: string;
   public readonly retryAfterSeconds?: number;
   public readonly guard?: GuardReport;
+  public readonly processesStillAlive?: number[];
+  public readonly killUnverified?: boolean;
   /** Where the failed run's trace was written, when one was recorded. */
   public trace?: TraceInfo;
   /** Secondary problems that happened after this error, e.g. a cleanup that also failed. */
@@ -160,6 +166,8 @@ export class ClineRunError extends Error {
       this.resetAt = details.resetAt;
       this.retryAfterSeconds = details.retryAfterSeconds;
       this.guard = details.guard;
+      this.processesStillAlive = details.processesStillAlive;
+      this.killUnverified = details.killUnverified;
     }
   }
 }
@@ -396,6 +404,9 @@ export function formatErrorAsText(error: unknown, fallbackMessage: string): stri
     }
     if (error.guard) {
       lines.push(`Guard Report:\n${JSON.stringify(error.guard, null, 2)}`);
+    }
+    if (error.processesStillAlive && error.processesStillAlive.length > 0) {
+      lines.push(`Processes still alive: ${error.processesStillAlive.join(", ")}`);
     }
     if (error.codeMapSource) lines.push(`codeMapSource: ${error.codeMapSource}`);
     for (const note of error.notes ?? []) {
@@ -964,13 +975,17 @@ async function runClineCore(input: AskClineInput, signal: AbortSignal | undefine
         if (signal?.aborted) {
           throw new ClineRunError("cancelled", "The Cline request was cancelled.", { attempts: attempt - 1 });
         }
-        const execPromise = new Promise<{ code: number | null; signal: NodeJS.Signals | null; error?: any }>((resolve) => {
+        const execPromise = new Promise<{ code: number | null; signal: NodeJS.Signals | null; error?: any; processesStillAlive?: number[]; killUnverified?: boolean }>((resolve) => {
           let settled = false;
+          let terminating = false;
+          let hasRealPid = false;
           let child: ReturnType<typeof spawn>;
           let exitTimer: NodeJS.Timeout | undefined;
           let escalationTimer: NodeJS.Timeout | undefined;
           let settlementTimer: NodeJS.Timeout | undefined;
           let exitSeen = false;
+          let exitSeenAt: number | undefined;
+          let rootStartedMs = Date.now();
           let exitCode: number | null = null;
           let exitSignal: NodeJS.Signals | null = null;
           let spawnError: any;
@@ -993,7 +1008,8 @@ async function runClineCore(input: AskClineInput, signal: AbortSignal | undefine
             } else if (reason === "cancelled") {
               cancelled = true;
             }
-            if (settled || settlementTimer) return;
+            if (settled || terminating || settlementTimer) return;
+            terminating = true;
 
             const kill = (signal: NodeJS.Signals) => {
               if (exitSeen || settled || !child) return;
@@ -1012,6 +1028,49 @@ async function runClineCore(input: AskClineInput, signal: AbortSignal | undefine
             if (platform !== "win32" && !exitSeen) {
               escalationTimer = schedule(() => kill("SIGKILL"),
                 clampGrace(deps.killGracePeriodMs ?? deps.closeGracePeriodMs ?? 500));
+            }
+
+            const pid = child?.pid;
+            if (hasRealPid && typeof pid === "number") {
+              // A real child settles only once its whole tree is confirmed dead (not clamped to the budget):
+              // the caller restores the snapshot next, and a living child could still write after that.
+              if (exitTimer) {
+                unschedule(exitTimer);
+                exitTimer = undefined;
+              }
+              const killRoot = () => {
+                if (settled) return;
+                if (deps.killTree) deps.killTree(pid, "SIGKILL");
+                else defaultKillTree(pid, "SIGKILL", platform);
+              };
+              const settleAfterKill = (stillAlive?: number[], unverified?: boolean) => {
+                if (settled) return;
+                try {
+                  if (typeof child?.stdout?.destroy === "function") child.stdout.destroy();
+                  if (typeof child?.stderr?.destroy === "function") child.stderr.destroy();
+                } catch {}
+                if (cleanup()) {
+                  resolve({
+                    code: exitCode,
+                    signal: exitSignal ?? (reason === "timeout" ? "SIGTERM" : (reason === "guard" ? "SIGKILL" : null)),
+                    error: spawnError,
+                    ...(stillAlive ? { processesStillAlive: stillAlive } : {}),
+                    ...(unverified ? { killUnverified: true } : {})
+                  });
+                }
+              };
+              confirmTreeDead(pid, {
+                killRoot,
+                isRootAlive: () => !exitSeen && child.exitCode === null && child.signalCode === null,
+                rootStartedMs,
+                rootExitedMs: () => exitSeenAt,
+                firstPollMs: platform === "win32" ? undefined : (deps.killGracePeriodMs ?? deps.closeGracePeriodMs ?? 500),
+                platform
+              }).then(
+                ({ confirmed, alive, unverified }) => settleAfterKill(confirmed ? undefined : alive, unverified),
+                () => settleAfterKill([pid], true)
+              );
+              return;
             }
 
             settlementTimer = schedule(() => {
@@ -1043,6 +1102,7 @@ async function runClineCore(input: AskClineInput, signal: AbortSignal | undefine
           signal?.addEventListener("abort", abort, { once: true });
 
           try {
+            rootStartedMs = Date.now();
             child = spawnFn(executable, spawnArgs, {
               shell: false,
               windowsHide: true,
@@ -1060,6 +1120,8 @@ async function runClineCore(input: AskClineInput, signal: AbortSignal | undefine
             return;
           }
 
+          // Only a real child process gets the confirmed tree kill; a fake child's PID may belong to an unrelated process.
+          hasRealPid = child instanceof ChildProcess && Number.isInteger(child.pid) && (child.pid as number) > 0;
           if (typeof child.pid === "number") recorder?.processStarted(child.pid);
 
           child.stdout?.on("data", (chunk: Buffer | string) => {
@@ -1080,6 +1142,7 @@ async function runClineCore(input: AskClineInput, signal: AbortSignal | undefine
           child.on("exit", (code, sig) => {
             if (exitSeen) return;
             exitSeen = true;
+            exitSeenAt = Date.now();
             // The group remains addressable while descendants live, even after its leader exits.
             if (platform !== "win32" && typeof child.pid === "number") {
               try {
@@ -1091,7 +1154,8 @@ async function runClineCore(input: AskClineInput, signal: AbortSignal | undefine
             if (settled) return;
             exitCode = code;
             exitSignal = sig;
-            exitTimer = schedule(() => {
+            if (terminating && hasRealPid) return;
+            const settleExit = (stillAlive?: number[], unverified?: boolean) => {
               try {
                 if (typeof child.stdout?.destroy === "function") {
                   child.stdout.destroy();
@@ -1103,8 +1167,22 @@ async function runClineCore(input: AskClineInput, signal: AbortSignal | undefine
                 }
               } catch {}
               if (cleanup()) {
-                resolve({ code: exitCode, signal: exitSignal, error: spawnError });
+                resolve({ code: exitCode, signal: exitSignal, error: spawnError,
+                  ...(stillAlive ? { processesStillAlive: stillAlive } : {}), ...(unverified ? { killUnverified: true } : {}) });
               }
+            };
+            exitTimer = schedule(() => {
+              // The root exited but its pipes stayed open, so descendants still run. On Windows nothing else
+              // stops them (POSIX signalled the group above) and the caller may restore next: reap them first.
+              const pid = child.pid;
+              if (hasRealPid && platform === "win32" && typeof pid === "number" && !terminating) {
+                terminating = true;
+                confirmTreeDead(pid, { killRoot: () => {}, isRootAlive: () => false, rootStartedMs, rootExitedMs: () => exitSeenAt, platform })
+                  .then((result) => result, () => ({ confirmed: false, alive: [pid], unverified: true }))
+                  .then(({ confirmed, alive, unverified }) => settleExit(confirmed ? undefined : alive, unverified));
+                return;
+              }
+              settleExit();
             }, clampGrace(deps.closeGracePeriodMs ?? 500));
             if (!deps.closeGracePeriodMs) {
               exitTimer.unref();
@@ -1112,13 +1190,16 @@ async function runClineCore(input: AskClineInput, signal: AbortSignal | undefine
           });
 
           child.on("close", (code, sig) => {
+            exitCode = code ?? exitCode;
+            exitSignal = sig ?? exitSignal;
+            if (terminating && hasRealPid) return;
             if (cleanup()) {
-              resolve({ code: code ?? exitCode, signal: sig ?? exitSignal, error: spawnError });
+              resolve({ code: exitCode, signal: exitSignal, error: spawnError });
             }
           });
         });
 
-        let exitInfo: { code: number | null; signal: NodeJS.Signals | null; error?: any };
+        let exitInfo: { code: number | null; signal: NodeJS.Signals | null; error?: any; processesStillAlive?: number[]; killUnverified?: boolean };
         try {
           exitInfo = await execPromise;
           splitter?.flush();
@@ -1146,10 +1227,16 @@ async function runClineCore(input: AskClineInput, signal: AbortSignal | undefine
         const stdoutTail = getTail(redactSecrets(stdout));
         const stderrTail = getTail(redactSecrets(stderr));
         const effectiveCode = code !== null ? code : -1;
+        const processesStillAlive = exitInfo.processesStillAlive && exitInfo.processesStillAlive.length > 0
+          ? exitInfo.processesStillAlive
+          : undefined;
+        const aliveSentence = processesStillAlive
+          ? ` Process tree kill was not confirmed; PIDs still alive: ${processesStillAlive.join(", ")}.`
+          : (exitInfo.killUnverified ? " The process list could not be read, so the stopped run's child processes are not confirmed dead." : "");
 
         if (guardState.verdict) {
           const verdict = guardState.verdict;
-          const summary = buildGuardTripMessage(verdict, options.guard);
+          const summary = buildGuardTripMessage(verdict, options.guard) + aliveSentence;
           // The final run_result carries cumulative token counts, so the guard can trip on the very
           // event that holds the finished answer. A completed answer is kept, with the trip as a warning.
           const finished = verdict.kind === "budget_exceeded" ? parseUsableResult(stdout, effectiveCode) : null;
@@ -1166,24 +1253,28 @@ async function runClineCore(input: AskClineInput, signal: AbortSignal | undefine
             stderrTail,
             stdoutTail,
             attempts: attempt,
-            guard: verdict
+            guard: verdict,
+            processesStillAlive, killUnverified: exitInfo.killUnverified
           });
         }
 
         if (cancelled || signal?.aborted) {
-          const cancelSummary = "The Cline request was cancelled.";
+          const cancelSummary = `The Cline request was cancelled.${aliveSentence}`;
           const cancelMsg = buildErrorTextWithTails(cancelSummary, stderrTail, stdoutTail);
           throw new ClineRunError("cancelled", cancelMsg, {
             exitCode: code,
             stderrTail,
             stdoutTail,
-            attempts: attempt
+            attempts: attempt,
+            processesStillAlive, killUnverified: exitInfo.killUnverified
           });
         }
 
         // 1. Usable completed result check FIRST
         const usableResult = parseUsableResult(stdout, effectiveCode);
         if (usableResult) {
+          // A finished run whose leftover processes could not be confirmed dead keeps its answer, with a warning.
+          const aliveWarnings = aliveSentence ? [aliveSentence.trim()] : [];
           if (code !== 0) {
             const rawExtracted = extractLastJsonlError(stdout, stderr);
             const extractedError = rawExtracted ? redactSecrets(rawExtracted) : undefined;
@@ -1193,7 +1284,7 @@ async function runClineCore(input: AskClineInput, signal: AbortSignal | undefine
               ? `with signal ${exitInfo.signal}`
               : "without exit code";
             const warning = `cline exited ${exitDetail} after a completed result${extractedError ? `: ${extractedError}` : ""}`;
-            const warnings = [...(usableResult.warnings ?? []), warning];
+            const warnings = [...(usableResult.warnings ?? []), warning, ...aliveWarnings];
             return {
               ...usableResult,
               warnings,
@@ -1202,6 +1293,7 @@ async function runClineCore(input: AskClineInput, signal: AbortSignal | undefine
           }
           return {
             ...usableResult,
+            ...(aliveWarnings.length ? { warnings: [...(usableResult.warnings ?? []), ...aliveWarnings] } : {}),
             durationMs: usableResult.durationMs ?? Math.round(nowFn() - started)
           };
         }
@@ -1210,12 +1302,13 @@ async function runClineCore(input: AskClineInput, signal: AbortSignal | undefine
         const earlyQuotaText = [extractLastJsonlError(stdout, stderr), extractRunResultErrorText(stdout), stderr].filter(Boolean).join("\n");
         if (isDailyQuotaText(earlyQuotaText)) {
           const quota = classifyErrorText(earlyQuotaText, wallNow());
-          throw new ClineRunError("quota_exhausted", "Cline daily free quota exhausted. Not retried.", {
+          throw new ClineRunError("quota_exhausted", `Cline daily free quota exhausted. Not retried.${aliveSentence}`, {
             exitCode: code, stderrTail, stdoutTail, attempts: attempt,
             extractedMessage: redactSecrets(earlyQuotaText) + (quota.assumedReset ? " (reset time not given; assumed next UTC midnight)" : ""),
             providerState: "quota_exhausted",
             resetAt: quota.resetAtMs !== undefined ? new Date(quota.resetAtMs).toISOString() : undefined,
-            retryAfterSeconds: quota.retryAfterSeconds
+            retryAfterSeconds: quota.retryAfterSeconds,
+            processesStillAlive, killUnverified: exitInfo.killUnverified
           });
         }
 
@@ -1223,7 +1316,7 @@ async function runClineCore(input: AskClineInput, signal: AbortSignal | undefine
         if (timedOut) {
           const timeoutMsg = buildErrorTextWithTails(
             `Cline timeout: attempt ${attempt}/${maxAttempts} killed at ${elapsedSec}s of ${formatSeconds(attemptTimerMs)} budget ` +
-              `(total ${timeoutSeconds}s).`,
+              `(total ${timeoutSeconds}s).${aliveSentence}`,
             stderrTail,
             stdoutTail
           );
@@ -1232,17 +1325,17 @@ async function runClineCore(input: AskClineInput, signal: AbortSignal | undefine
           if (allowRetry && attempt < maxAttempts && options.canRetry) {
             allowRetry = await options.canRetry({ stdout, stderr, attempt });
             // A cancel during the retry check is a cancel, not the provider error that triggered it.
-            if (signal?.aborted) throw new ClineRunError("cancelled", "The Cline request was cancelled.", { attempts: attempt });
+            if (signal?.aborted) throw new ClineRunError("cancelled", `The Cline request was cancelled.${aliveSentence}`, { attempts: attempt, processesStillAlive, killUnverified: exitInfo.killUnverified });
             allowRetry = allowRetry && getRemainingBudgetMs() > 0 && getRemainingBudgetMs() >= minRetryBudgetMs;
           }
           if (allowRetry && attempt < maxAttempts) {
             if (signal?.aborted) {
-              throw new ClineRunError("cancelled", "The Cline request was cancelled.", { attempts: attempt });
+              throw new ClineRunError("cancelled", `The Cline request was cancelled.${aliveSentence}`, { attempts: attempt, processesStillAlive, killUnverified: exitInfo.killUnverified });
             }
             const sleepMs = Math.min(backoffMs, Math.max(0, getRemainingBudgetMs() - minRetryBudgetMs));
             if (sleepMs > 0) await sleep(sleepMs);
             if (signal?.aborted) {
-              throw new ClineRunError("cancelled", "The Cline request was cancelled.", { attempts: attempt });
+              throw new ClineRunError("cancelled", `The Cline request was cancelled.${aliveSentence}`, { attempts: attempt, processesStillAlive, killUnverified: exitInfo.killUnverified });
             }
             continue;
           }
@@ -1250,7 +1343,8 @@ async function runClineCore(input: AskClineInput, signal: AbortSignal | undefine
             exitCode: typeof code === "number" ? code : null,
             stderrTail,
             stdoutTail,
-            attempts: attempt
+            attempts: attempt,
+            processesStillAlive, killUnverified: exitInfo.killUnverified
           });
         }
 
