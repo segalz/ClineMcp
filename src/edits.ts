@@ -143,10 +143,10 @@ export async function applyClineEdits(
   const verify = verificationSchema.parse(input.verify);
   const lifecycle: FinalCheckLifecycle = new FinalCheckLifecycle({ ...input, guard: options.guard ?? input.guard, verify, timeoutSeconds: input.timeoutSeconds ?? 180 }, {
     resolveRoot: editsCheckoutRoot, checkoutLock: options.checkoutLock, lockDirectory: options.checkoutLockDirectory,
-    fits: prompt => editPromptFits({ ...input, cwd: lifecycle.root, prompt }, options), question: editQuestion,
-    run: (prompt, runSignal, lock, guard, remainingSeconds) => runEdits({ ...input, prompt, cwd: lifecycle.root,
-      timeoutSeconds: remainingSeconds, guard }, lifecycle.root, runSignal,
-      { ...options, checkoutLock: lock, guard, maxAttempts: 1 })
+    fits: prompt => editPromptFits({ ...input, cwd: lifecycle.workDir, prompt }, options), question: editQuestion,
+    run: (prompt, runSignal, lock, guard, remainingSeconds) => runEdits({ ...input, prompt, cwd: lifecycle.workDir,
+      timeoutSeconds: remainingSeconds, guard }, lifecycle.workDir, runSignal,
+      { ...options, checkoutLock: lock, checkoutRoot: lifecycle.root, guard, maxAttempts: 1 })
   });
   try {
     await lifecycle.execute(signal ?? new AbortController().signal);
@@ -214,7 +214,7 @@ export async function editsCheckoutRoot(cwd: string, signal?: AbortSignal): Prom
 /** A lifecycle-owned run must inspect identity itself: no Git status refresh or commit recovery is allowed here. */
 export async function runClineEditRun(input: Omit<ApplyClineEditsInput, "verify">, signal: AbortSignal,
   options: Partial<ClineInvocationOptions>): Promise<ClineResponse> {
-  if (!ownsCheckoutLock(options.checkoutLock, input.cwd)) {
+  if (!ownsCheckoutLock(options.checkoutLock, options.checkoutRoot ?? input.cwd)) {
     throw new ClineRunError("checkout_busy", "An edit run requires its lifecycle's checkout lock.", { attempts: 0 });
   }
   return runEdits(input, input.cwd, signal, options);

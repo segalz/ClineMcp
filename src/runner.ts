@@ -246,6 +246,8 @@ export interface ClineInvocationOptions {
   onCodeMapSource?: (source: CodeMapSource) => void;
   /** Internal task-owned lease; a sync run otherwise acquires its own lease. */
   checkoutLock?: import("./checkoutlock.js").CheckoutRelease;
+  /** Internal: the checkout root that `checkoutLock` covers, when the run itself works in a subfolder of it. */
+  checkoutRoot?: string;
   /** Override for isolated tests; production uses ~/.cline-mcp/locks. */
   checkoutLockDirectory?: string;
   autoApprove?: boolean;

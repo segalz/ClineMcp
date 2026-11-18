@@ -834,7 +834,7 @@ export class TaskManager {
         fits: prompt => !isPromptTooLarge(prompt, task, getEffectivePreamble("edits", this.deps.runOptions?.promptPreamble ?? ""),
           this.deps.platform ?? process.platform, this.deps.runOptions?.deps),
         run: async (prompt, signal, lock, guard, remainingSeconds, run) => {
-          task.cwd = task.finalCheck!.root;
+          task.cwd = task.finalCheck!.workDir;
           if (run > 1) {
             task.run = run;
             const runId = `${task.id}-run-${run}`, dir = path.join(resolveTraceBase(this.deps.traceBase), runId);
@@ -843,7 +843,7 @@ export class TaskManager {
           }
           task.recorder = undefined;
           task.codeMapSource = "none";
-          const options: Partial<ClineInvocationOptions> = { ...this.deps.runOptions, checkoutLock: lock,
+          const options: Partial<ClineInvocationOptions> = { ...this.deps.runOptions, checkoutLock: lock, checkoutRoot: task.finalCheck!.root,
             onCodeMapSource: source => { task.codeMapSource = source; this.deps.runOptions?.onCodeMapSource?.(source); },
             trace: true, traceRunId: task.trace.runId, maxAttempts: 1, maxTimeoutSeconds: MAX_TASK_TIMEOUT_SECONDS,
             promptPreamble: (this.deps.runOptions?.promptPreamble ?? "") + TASK_QUESTION_PREAMBLE,

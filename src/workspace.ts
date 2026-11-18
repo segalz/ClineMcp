@@ -1,10 +1,11 @@
-import { mkdir, readdir, rm } from "node:fs/promises";
+import { access, mkdir, readdir, rm } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { randomUUID } from "node:crypto";
 import { spawn } from "node:child_process";
 import { buildEnvironmentLine, WORKING_RULES } from "./rules.js";
 import { withCodeMap } from "./codemap.js";
+import { subfolderOf } from "./finalcheck.js";
 import { listClineProcesses, type ProcessInfo } from "./procs.js";
 import {
   defaultKillTree,
@@ -224,6 +225,16 @@ export async function askClineWorkspace(
     throw new ClineRunError("workspace_setup_failed", "Unable to create a temporary Git worktree for Cline.");
   }
 
+  // A monorepo subfolder runs in the same subfolder of the worktree (plan S5); an uncommitted folder does not
+  // exist at HEAD, so that run starts at the worktree root and says so.
+  const inRepository = await subfolderOf(repositoryRoot, requestedCwd);
+  const relative = inRepository === undefined ? "" : path.relative(repositoryRoot, inRepository);
+  const wantsSubfolder = relative !== "";
+  const subfolder = wantsSubfolder ? path.join(worktreePath, relative) : undefined;
+  const runCwd = subfolder && await access(subfolder).then(() => true, () => false) ? subfolder : worktreePath;
+  const cwdNote = wantsSubfolder && runCwd === worktreePath
+    ? `The folder ${relative} does not exist at HEAD; Cline ran at the repository root of the snapshot.` : undefined;
+
   let result: ClineResponse | undefined;
   let runError: unknown;
   try {
@@ -231,13 +242,13 @@ export async function askClineWorkspace(
     activeWorktreeRuns++;
     try {
     result = await runCline(
-      { ...input, cwd: worktreePath },
+      { ...input, cwd: runCwd },
       signal,
-      await withCodeMap(worktreePath, input, {
+      await withCodeMap(runCwd, input, {
         ...options,
         autoApprove: true,
-        cwd: worktreePath,
-        systemPrompt: buildWorkspaceSystemPrompt(worktreePath),
+        cwd: runCwd,
+        systemPrompt: buildWorkspaceSystemPrompt(runCwd),
         provider: input.provider,
         model: input.model
       }, signal)
@@ -255,7 +266,7 @@ export async function askClineWorkspace(
     const note = `The temporary worktree ${worktreePath} could not be removed: ${(cleanupError as Error)?.message ?? String(cleanupError)}`;
     // A finished answer is never discarded because the worktree could not be removed.
     if (runError === undefined && result !== undefined) {
-      return { ...result, warnings: [...(result.warnings ?? []), note] };
+      return { ...result, warnings: [...(result.warnings ?? []), ...(cwdNote ? [cwdNote] : []), note] };
     }
     // A failed run's own error stays primary, but the leftover worktree must still be reported.
     if (runError instanceof ClineRunError) {
@@ -270,5 +281,5 @@ export async function askClineWorkspace(
     }
   }
   if (runError !== undefined) throw runError;
-  return result!;
+  return cwdNote ? { ...result!, warnings: [...(result!.warnings ?? []), cwdNote] } : result!;
 }

@@ -1,4 +1,6 @@
 import { z } from "zod";
+import path from "node:path";
+import { realpath } from "node:fs/promises";
 import { acquire, ownsCheckoutLock, type CheckoutRelease } from "./checkoutlock.js";
 import { takeSnapshot, restoreSnapshot, discardSnapshot, createdFiles, headAndIndexIdentity, type SnapshotHandle, type SnapshotOptions } from "./snapshot.js";
 import { resolveVerificationCommand, runVerification, VerificationError, type VerificationResult } from "./verify.js";
@@ -85,10 +87,26 @@ export function buildFixPrompt(objective: string, spec: VerifySpec, attempt: Fin
   return render();
 }
 
+/**
+ * The requested folder spelled under `root`, or undefined when it is outside. Both sides are canonicalised first
+ * (symlinks, junctions, macOS /tmp), because Git reports the checkout root resolved. Mirrors openCodeHelperMcp edits.js.
+ */
+export async function subfolderOf(root: string, directory: string): Promise<string | undefined> {
+  const [realRoot, realDirectory] = await Promise.all([realpath(root).catch(() => path.resolve(root)),
+    realpath(directory).catch(() => path.resolve(directory))]);
+  const inside = path.relative(realRoot, realDirectory);
+  if (inside.startsWith("..") || path.isAbsolute(inside)) return undefined;
+  return inside ? path.join(root, inside) : root;
+}
+
 /** Stateful across async waits; a single baseline and lease survive every repair. */
 export class FinalCheckLifecycle {
   readonly verification: FinalVerification;
-  root: string; lock?: CheckoutRelease; snapshot?: SnapshotHandle;
+  /** The checkout (lock, identity, snapshot). */
+  root: string;
+  /** The requested folder, maybe a monorepo package inside `root`: the Cline run and the check work here. */
+  workDir: string;
+  lock?: CheckoutRelease; snapshot?: SnapshotHandle;
   identity?: Awaited<ReturnType<typeof headAndIndexIdentity>>;
   phase: "snapshot" | "run" | "verify" | "restore" | "waiting" | "done" = "snapshot";
   waitReason?: EditWaitReason; question?: { question: string; options?: string[] }; error?: unknown;
@@ -104,7 +122,7 @@ export class FinalCheckLifecycle {
     if (Buffer.byteLength(JSON.stringify(input), "utf8") > 64 * 1024) throw new ClineRunError("launch_failed", "Input exceeds 64 KiB.");
     input.verify = verificationSchema.parse(input.verify);
     maxFixRunsSchema.parse(input.maxFixRuns ?? 2);
-    this.root = input.cwd;
+    this.root = input.cwd; this.workDir = path.resolve(input.cwd);
     this.verification = { required: !("none" in input.verify), passed: null,
       command: "none" in input.verify ? null : input.verify,
       ...("none" in input.verify ? { reason: input.verify.reason } : {}), attempts: [], fixRuns: 0, restored: false, kept: false };
@@ -127,7 +145,7 @@ export class FinalCheckLifecycle {
   }
   preview(guidance = ""): string {
     const prompt = buildFixPrompt(this.input.prompt, this.input.verify, this.verification.attempts.at(-1), guidance,
-      this.deps.fits, this.question?.question, this.root);
+      this.deps.fits, this.question?.question, this.workDir);
     const interruption = this.error ? `\nPrevious interruption (diagnostic evidence):\n${redactSecrets(String(this.error)).slice(0, 2000)}` : "";
     return this.deps.fits(prompt + interruption) ? prompt + interruption : prompt;
   }
@@ -148,6 +166,9 @@ export class FinalCheckLifecycle {
       check();
       if (!this.lock) {
         this.root = await this.deps.resolveRoot(this.input.cwd, controller.signal); check();
+        const workDir = await subfolderOf(this.root, this.input.cwd);
+        if (workDir === undefined) throw new ClineRunError("workspace_not_git", "The requested cwd is not inside its Git checkout.");
+        this.workDir = workDir;
         this.lock = ownsCheckoutLock(this.deps.checkoutLock, this.root) ? this.deps.checkoutLock
           : acquire(this.root, { lockDirectory: this.deps.lockDirectory });
         this.releaseOwnLock = this.lock !== this.deps.checkoutLock;
@@ -156,7 +177,7 @@ export class FinalCheckLifecycle {
       const resolveVerify = this.deps.resolveVerify ?? (this.deps.verify ? undefined : resolveVerificationCommand);
       if (resolveVerify && !this.snapshot && this.launches === 0 && !("none" in this.input.verify)) {
         const spec = this.input.verify;
-        try { await resolveVerify(spec.command, spec.args ?? [], this.root); }
+        try { await resolveVerify(spec.command, spec.args ?? [], this.workDir); }
         catch (error) {
           if (!(error instanceof VerificationError)) throw error;
           this.wait("verify_failed", error); this.release(); return;
@@ -212,7 +233,7 @@ export class FinalCheckLifecycle {
         this.phase = "verify";
         const verifyStarted = performance.now();
         let verified: VerificationResult & { error?: string };
-        try { verified = await (this.deps.verify ?? runVerification)(this.input.verify, this.root, controller.signal); }
+        try { verified = await (this.deps.verify ?? runVerification)(this.input.verify, this.workDir, controller.signal); }
         catch (error) {
           if (!(error instanceof VerificationError)) throw error;
           const message = redactSecrets(error.message);
