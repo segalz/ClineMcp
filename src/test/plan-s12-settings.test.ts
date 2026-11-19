@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test, { after } from "node:test";
 import { spawn } from "node:child_process";
-import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, readdir, readFile, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import {
@@ -112,9 +112,33 @@ test("S12: a restore whose rename is refused while a reader holds providers.json
   { skip: process.platform !== "win32", timeout: 30_000 }, async () => fixture(async file => {
   const snapshot = await readProviderSettingsSnapshot(file, "default");
   await writeFile(file, JSON.stringify(overridden));
-  // Open without FILE_SHARE_DELETE, as a Windows reader may: replacing the file fails until it closes.
+  const { exited } = await holdOpen(file, 300);
+  try {
+    assert.equal(await restoreProviderSettingsSnapshot(snapshot), "restored");
+  } finally { await exited; }
+  assert.equal((await json(file)).providers.default.settings.model, "baseline");
+}));
+
+test("S12: a rename refused for longer than the retry window fails the restore and leaves no temp file",
+  { skip: process.platform !== "win32", timeout: 30_000 }, async () => fixture(async file => {
+  const snapshot = await readProviderSettingsSnapshot(file, "default");
+  await writeFile(file, JSON.stringify(overridden));
+  const { exited } = await holdOpen(file, 2_500);
+  let result: string;
+  try { result = await restoreProviderSettingsSnapshot(snapshot); } finally { await exited; }
+  assert.equal(result, "failed");
+  assert.deepEqual((await readdir(path.dirname(file))).filter(name => name.endsWith(".tmp")), []);
+  assert.equal((await json(file)).providers.default.settings.model, "override");
+}));
+
+/** Opens the file without FILE_SHARE_DELETE, as a Windows reader may: replacing it fails until it closes.
+ * Resolves once the file is open; `exited` resolves when the holder has exited. (Wrapped: an async function
+ * returning a bare Promise would make the caller wait for the holder to exit.) */
+async function holdOpen(file: string, ms: number): Promise<{ exited: Promise<void> }> {
   const holder = spawn("powershell.exe", ["-NoProfile", "-NonInteractive", "-Command",
-    `$f = [IO.File]::Open('${file.replace(/'/g, "''")}', 'Open', 'Read', 'Read'); 'open'; Start-Sleep -Milliseconds 300; $f.Close()`],
+    // Without a console PowerShell buffers its output until exit, so flush the signal explicitly.
+    `$f = [IO.File]::Open('${file.replace(/'/g, "''")}', 'Open', 'Read', 'Read'); [Console]::Out.WriteLine('open'); ` +
+    `[Console]::Out.Flush(); Start-Sleep -Milliseconds ${ms}; $f.Close()`],
     { stdio: ["ignore", "pipe", "inherit"], windowsHide: true });
   const exited = new Promise<void>(resolve => holder.once("exit", () => resolve()));
   await new Promise<void>((resolve, reject) => {
@@ -122,8 +146,5 @@ test("S12: a restore whose rename is refused while a reader holds providers.json
     holder.stdout.on("data", (chunk: string) => { if (chunk.includes("open")) resolve(); });
     holder.once("exit", () => reject(new Error("holder exited before opening the file")));
   });
-  try {
-    assert.equal(await restoreProviderSettingsSnapshot(snapshot), "restored");
-  } finally { await exited; }
-  assert.equal((await json(file)).providers.default.settings.model, "baseline");
-}));
+  return { exited };
+}

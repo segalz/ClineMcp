@@ -121,6 +121,18 @@ async function deadHolder(file: string): Promise<boolean> {
   return false;
 }
 
+/** Removes the lock only if it still holds the exact metadata that was found dead. The death check awaits a process
+ * launch, so the holder may release meanwhile and a new writer may create a fresh lock at the same path; that lock
+ * must never be unlinked. The re-read and the unlink run with no await in between. */
+async function unlinkIfStillDead(file: string): Promise<boolean> {
+  let text: string;
+  try { text = readFileSync(file, "utf8"); } catch { return false; }
+  try { if (!await holderIsDead(JSON.parse(text))) return false; } catch { return false; }
+  try { if (readFileSync(file, "utf8") !== text) return false; } catch { return false; }
+  unlinkSync(file);
+  return true;
+}
+
 function createHolder(file: string, token: string): void {
   const fd = openSync(file, "wx", 0o600);
   try { writeFileSync(fd, JSON.stringify({ pid: process.pid, time: new Date().toISOString(), token })); }
@@ -182,8 +194,7 @@ export async function acquire(checkoutRoot: string, options: { lockDirectory?: s
           if ((err as NodeJS.ErrnoException).code === "EEXIST") throw new CheckoutBusyError(root);
           throw err;
         }
-        if (!await deadHolder(file)) throw new CheckoutBusyError(root);
-        unlinkSync(file);
+        if (!await unlinkIfStillDead(file)) throw new CheckoutBusyError(root);
         try { create(); }
         catch (err) {
           if ((err as NodeJS.ErrnoException).code === "EEXIST") throw new CheckoutBusyError(root);
