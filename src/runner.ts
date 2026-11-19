@@ -1,6 +1,7 @@
 import { ChildProcess, spawn } from "node:child_process";
 import { hubDaemonPidsOnPort, listClineProcesses } from "./procs.js";
 import { confirmTreeDead } from "./proctree.js";
+import { createWindowsJob, type WindowsJob } from "./jobobject.js";
 import { randomUUID } from "node:crypto";
 import { access, mkdir, rm } from "node:fs/promises";
 import net from "node:net";
@@ -734,12 +735,16 @@ async function dedicatedHub(options: ClineInvocationOptions): Promise<DedicatedH
   return { env, stop };
 }
 
+interface RunJobs {
+  current?: WindowsJob;
+  stopped?: boolean;
+}
+
 export async function runCline(
   input: AskClineInput,
   signal?: AbortSignal,
   options: ClineInvocationOptions = {}
 ): Promise<ClineResponse> {
-  if (options.hubEnv) return runClineInner(input, signal, options);
   // The hub starts only when Cline is about to launch (plan S6, B6): a call refused before launch (quota
   // lock, bad cwd, cancel) starts and stops nothing.
   const startHub = options.deps?.startHub ?? dedicatedHub;
@@ -753,27 +758,39 @@ export async function runCline(
   let launched = false;
   let result: ClineResponse | undefined;
   let runError: unknown;
+  let hubStopNote: string | undefined;
+  const jobs: RunJobs = {};
+  async function stopHubAndJob() {
+    try {
+      if (jobs.stopped) await jobs.current?.close();
+      if (launched) await started?.stop();
+    } catch (error) {
+      hubStopNote = redactSecrets(`Failed to stop the dedicated Cline hub: ${error instanceof Error ? error.message : String(error)}`);
+    } finally {
+      await jobs.current?.close();
+    }
+  }
   try {
-    result = await runClineInner(input, signal, { ...options, hubProvider, onLaunched: () => { launched = true; } });
+    const invocation = options.hubEnv ? options : { ...options, hubProvider, onLaunched: () => { launched = true; } };
+    result = await runClineInner(input, signal, invocation, jobs);
     return result;
   } catch (error) {
     runError = error;
     throw error;
   } finally {
-    try {
-      if (launched) await started?.stop();
-    } catch (error) {
-      const note = redactSecrets(`Failed to stop the dedicated Cline hub: ${error instanceof Error ? error.message : String(error)}`);
-      if (result) (result.warnings ??= []).push(note);
-      else if (runError instanceof ClineRunError) (runError.notes ??= []).push(note);
+    await stopHubAndJob();
+    if (hubStopNote) {
+      if (result) (result.warnings ??= []).push(hubStopNote);
+      else if (runError instanceof ClineRunError) (runError.notes ??= []).push(hubStopNote);
     }
   }
 }
 
 async function runClineInner(
   input: AskClineInput,
-  signal?: AbortSignal,
-  options: ClineInvocationOptions = {}
+  signal: AbortSignal | undefined,
+  options: ClineInvocationOptions,
+  jobs: RunJobs
 ): Promise<ClineResponse> {
   const guards: Guard[] = [];
   const finalReport = (existing?: GuardReport): GuardReport => {
@@ -788,7 +805,7 @@ async function runClineInner(
       filesTouched: [...new Set(reports.length ? reports.flatMap(report => report.filesTouched) : last.filesTouched)] });
   };
   try {
-    const response = await runClineCore(input, signal, options, guards);
+    const response = await runClineCore(input, signal, options, guards, jobs);
     response.guard = finalReport();
     if (options.codeMapSource) response.codeMapSource = options.codeMapSource;
     return response;
@@ -803,7 +820,7 @@ async function runClineInner(
 }
 
 async function runClineCore(input: AskClineInput, signal: AbortSignal | undefined,
-  options: ClineInvocationOptions, guards: Guard[]): Promise<ClineResponse> {
+  options: ClineInvocationOptions, guards: Guard[], jobs: RunJobs): Promise<ClineResponse> {
   if (signal?.aborted) {
     throw new ClineRunError("cancelled", "The Cline request was cancelled.", { attempts: 0 });
   }
@@ -1058,6 +1075,15 @@ async function runClineCore(input: AskClineInput, signal: AbortSignal | undefine
             { attempts: attempt - 1 });
         }
         const spawnFn = deps.spawn ?? spawn;
+        // A hub launched by this CLI inherits its job, even when it detaches. Its job spans retries.
+        const ownsHub = !!hubEnv && !options.hubEnv;
+        const useJob = !deps.spawn && platform === "win32";
+        const prepareStarted = performance.now();
+        if (useJob && !jobs.current?.alive) {
+          jobs.current = await createWindowsJob(Math.min(attemptTimerMs, remainingLaunchBudgetMs()), signal);
+        }
+        const job = jobs.current;
+        const setupMs = useJob ? performance.now() - prepareStarted : 0;
         const env = {
           ...process.env,
           CLINE_NO_AUTO_UPDATE: "1",
@@ -1065,6 +1091,7 @@ async function runClineCore(input: AskClineInput, signal: AbortSignal | undefine
         };
 
         remainingLaunchBudgetMs();
+        jobs.stopped = false;
         const execPromise = new Promise<{ code: number | null; signal: NodeJS.Signals | null; error?: any; processesStillAlive?: number[]; killUnverified?: boolean }>((resolve) => {
           let settled = false;
           let terminating = false;
@@ -1079,6 +1106,7 @@ async function runClineCore(input: AskClineInput, signal: AbortSignal | undefine
           let exitCode: number | null = null;
           let exitSignal: NodeJS.Signals | null = null;
           let spawnError: any;
+          let closeStoppedJob: (() => Promise<void>) | undefined;
 
           const clampGrace = (ms: number) => Math.max(0, Math.min(ms, getRemainingBudgetMs()));
           const cleanup = () => {
@@ -1100,6 +1128,12 @@ async function runClineCore(input: AskClineInput, signal: AbortSignal | undefine
             }
             if (settled || terminating || settlementTimer) return;
             terminating = true;
+            jobs.stopped = true;
+            if (job) {
+              const retryPossible = reason === "timeout" && attempt < maxAttempts &&
+                getRemainingBudgetMs() > 0 && getRemainingBudgetMs() >= minRetryBudgetMs;
+              if (!ownsHub || !retryPossible) closeStoppedJob = job.close;
+            }
 
             const kill = (signal: NodeJS.Signals) => {
               if (exitSeen || settled || !child) return;
@@ -1130,9 +1164,14 @@ async function runClineCore(input: AskClineInput, signal: AbortSignal | undefine
               }
               const killRoot = () => {
                 if (settled) return;
-                if (deps.killTree) deps.killTree(pid, "SIGKILL");
-                else defaultKillTree(pid, "SIGKILL", platform);
+                try {
+                  if (deps.killTree) deps.killTree(pid, "SIGKILL");
+                  else defaultKillTree(pid, "SIGKILL", platform);
+                } finally { void closeStoppedJob?.(); }
               };
+              // A final hub stop closes the job before S3 and before the hub's discovery cleanup.
+              // Other jobs give taskkill the live root and close on root exit or the first S3 retry.
+              if (ownsHub || exitSeen) void closeStoppedJob?.();
               const settleAfterKill = (stillAlive?: number[], unverified?: boolean) => {
                 if (settled) return;
                 try {
@@ -1181,7 +1220,7 @@ async function runClineCore(input: AskClineInput, signal: AbortSignal | undefine
 
           const timer = schedule(() => {
             terminateChild("timeout");
-          }, Math.min(attemptTimerMs, getRemainingBudgetMs()));
+          }, Math.max(0, Math.min(attemptTimerMs - setupMs, getRemainingBudgetMs())));
           if (!deps.timeoutMs) {
             timer.unref();
           }
@@ -1212,6 +1251,7 @@ async function runClineCore(input: AskClineInput, signal: AbortSignal | undefine
 
           // Only a real child process gets the confirmed tree kill; a fake child's PID may belong to an unrelated process.
           hasRealPid = child instanceof ChildProcess && Number.isInteger(child.pid) && (child.pid as number) > 0;
+          if (hasRealPid) job?.assign(child);
           options.onLaunched?.();
           if (typeof child.pid === "number") recorder?.processStarted(child.pid);
 
@@ -1234,6 +1274,11 @@ async function runClineCore(input: AskClineInput, signal: AbortSignal | undefine
             if (exitSeen) return;
             exitSeen = true;
             exitSeenAt = Date.now();
+            if (job) {
+              if (job.assigned) unschedule(timer);
+              if (terminating) void closeStoppedJob?.();
+              else if (!ownsHub) void job.close();
+            }
             // The group remains addressable while descendants live, even after its leader exits.
             if (platform !== "win32" && typeof child.pid === "number") {
               try {
@@ -1301,6 +1346,11 @@ async function runClineCore(input: AskClineInput, signal: AbortSignal | undefine
             exitCode: null,
             attempts: attempt
           });
+        } finally {
+          if (job && !ownsHub) {
+            await job.close();
+            jobs.current = undefined;
+          }
         }
 
         if (exitInfo.error) {

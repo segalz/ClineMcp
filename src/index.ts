@@ -7,6 +7,7 @@ import { askClineWorkspace } from "./workspace.js";
 import { clinePing } from "./ping.js";
 import { listFreeModels, writeCatalogSnapshot } from "./models.js";
 import { cleanupTraces } from "./trace.js";
+import { shutdownJobObjects } from "./jobobject.js";
 import { TaskManager, MAX_TASK_TIMEOUT_SECONDS, MAX_WAIT_SECONDS } from "./tasks.js";
 import { startTaskObjectSchema, startTaskSchema, verificationSchema, maxFixRunsSchema, editActionSchema } from "./finalcheck.js";
 import { PROHIBITED_NAMES, resolveProviderSettingsPath, recoverProviderSettingsJournal } from "./settings.js";
@@ -453,6 +454,7 @@ const shutdown = async () => {
     new Promise<void>(resolve => { timer = setTimeout(resolve, SHUTDOWN_WAIT_MS); })
   ]);
   if (timer) clearTimeout(timer);
+  shutdownJobObjects();
   process.exit(0);
 };
 process.stdin.on("end", () => { void shutdown(); });

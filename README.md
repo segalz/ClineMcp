@@ -273,6 +273,8 @@ It lists free models, refreshes status via sequential forced pings and emits a o
 
 ## Errors, traces and cleanup
 
+On Windows, each CLI run and verification command uses a kill-on-close Job Object that also contains detached descendants. Cline keeps its dedicated hub in the same job across retries and closes the job after stopping the hub. A small helper is compiled once per source version in the user's temporary directory with the Windows .NET Framework compiler. The existing `taskkill /T /F` and process-tree confirmation cover unavailable jobs and children started before assignment.
+
 MCP replies carry text content; JSON tools encode their payload in that content. Sync edits return structured JSON errors with available verification/recovery evidence, guard, trace and metrics; other handlers can return formatted error text. Validation or early setup errors need not contain `verification`. Preserve recovery paths before discarding a result.
 
 Common error identifiers include `launch_failed`, `catalog_unavailable`, `workspace_not_git`, `workspace_setup_failed`, `workspace_cleanup_failed`, `edits_inspection_failed`, `checkout_busy`, `settings_lock_timeout`, `settings_restore_failed`, `cline_updating`, `quota_exhausted`, `non_zero_exit`, `transient_provider_error`, `timeout`, `cancelled`, `malformed_json`, `missing_final_result`, `loop_detected` and `budget_exceeded`. Task-control errors are `task_limit`, `task_not_found`, `task_running` and `task_not_waiting`. Verification internally distinguishes `verification_refused` and `verification_launch_failed`; these become failed attempt evidence, with async `verify_failed` waiting or a sync failure. They are not guaranteed top-level MCP error kinds.
