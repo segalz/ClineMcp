@@ -45,6 +45,49 @@ export interface ProviderSettingsSnapshot {
   warning?: string;
 }
 
+const TRANSIENT_FS_CODES = new Set(["EBUSY", "EPERM", "EACCES"]);
+const TRANSIENT_IO_BUDGET_MS = 1_000;
+const delay = (ms: number) => new Promise<void>(resolve => setTimeout(resolve, ms));
+
+type SettingsReadOutcome =
+  | { ok: true; data: Record<string, any> }
+  | { ok: false; stage: "enoent" | "read" | "parse"; error: unknown };
+
+async function readSettingsWithRetry(settingsPath: string): Promise<SettingsReadOutcome> {
+  const deadline = performance.now() + TRANSIENT_IO_BUDGET_MS;
+  let backoff = 25;
+  while (true) {
+    let content: string;
+    try {
+      content = await readFile(settingsPath, "utf8");
+    } catch (err: any) {
+      if (err?.code === "ENOENT") return { ok: false, stage: "enoent", error: err };
+      const remaining = deadline - performance.now();
+      if (!TRANSIENT_FS_CODES.has(err?.code) || remaining <= 0) {
+        return { ok: false, stage: "read", error: err };
+      }
+      await delay(Math.min(backoff, remaining));
+      backoff = Math.min(250, backoff * 2);
+      continue;
+    }
+
+    try {
+      const parsed = JSON.parse(content.replace(/^\uFEFF/, ""));
+      if (!isPlainObject(parsed)) {
+        throw new Error("Provider settings root must be a JSON object");
+      }
+      return { ok: true, data: parsed };
+    } catch (err: unknown) {
+      const remaining = deadline - performance.now();
+      if (remaining <= 0) {
+        return { ok: false, stage: "parse", error: err };
+      }
+      await delay(Math.min(backoff, remaining));
+      backoff = Math.min(250, backoff * 2);
+    }
+  }
+}
+
 export async function readProviderSettingsSnapshot(
   settingsPath: string,
   requestedProvider?: string
@@ -53,11 +96,9 @@ export async function readProviderSettingsSnapshot(
     throw new ClineRunError("launch_failed", `provider "${requestedProvider}" is prohibited.`);
   }
 
-  let content: string;
-  try {
-    content = await readFile(settingsPath, "utf8");
-  } catch (err: any) {
-    if (err?.code === "ENOENT") {
+  const outcome = await readSettingsWithRetry(settingsPath);
+  if (!outcome.ok) {
+    if (outcome.stage === "enoent") {
       return {
         settingsPath,
         targetProvider: requestedProvider ?? "cline",
@@ -69,6 +110,10 @@ export async function readProviderSettingsSnapshot(
         hadReasoning: false
       };
     }
+    const err = outcome.error as any;
+    const prefix = outcome.stage === "read"
+      ? "Unable to read provider settings file"
+      : "Unable to parse provider settings JSON";
     return {
       settingsPath,
       targetProvider: requestedProvider,
@@ -78,32 +123,10 @@ export async function readProviderSettingsSnapshot(
       hadLastUsedProvider: false,
       hadModel: false,
       hadReasoning: false,
-      warning: `Unable to read provider settings file: ${err?.message || String(err)}`
+      warning: `${prefix}: ${err?.message || String(err)}`
     };
   }
-
-  content = content.replace(/^\uFEFF/, "");
-
-  let data: Record<string, any>;
-  try {
-    const parsed = JSON.parse(content);
-    if (!isPlainObject(parsed)) {
-      throw new Error("Provider settings root must be a JSON object");
-    }
-    data = parsed;
-  } catch (err: any) {
-    return {
-      settingsPath,
-      targetProvider: requestedProvider,
-      hadFile: true,
-      skipRestore: true,
-      hadEntry: false,
-      hadLastUsedProvider: false,
-      hadModel: false,
-      hadReasoning: false,
-      warning: `Unable to parse provider settings JSON: ${err?.message || String(err)}`
-    };
-  }
+  const data = outcome.data;
 
   const hadLastUsedProvider = Object.hasOwn(data, "lastUsedProvider");
   const originalLastUsedProvider = typeof data.lastUsedProvider === "string" ? data.lastUsedProvider : undefined;
@@ -247,15 +270,28 @@ async function atomicWrite(destination: string, data: unknown): Promise<void> {
   const temp = destination + "." + randomUUID() + ".tmp";
   try {
     await writeFile(temp, JSON.stringify(data, null, 2), { encoding: "utf8", mode: 0o600, flag: "wx" });
-    await rename(temp, destination);
+    // Windows rename fails briefly while a reader holds the destination open.
+    const deadline = performance.now() + TRANSIENT_IO_BUDGET_MS;
+    let backoff = 25;
+    while (true) {
+      try {
+        await rename(temp, destination);
+        return;
+      } catch (err: any) {
+        const remaining = deadline - performance.now();
+        if (!TRANSIENT_FS_CODES.has(err?.code) || remaining <= 0) throw err;
+        await delay(Math.min(backoff, remaining));
+        backoff = Math.min(250, backoff * 2);
+      }
+    }
   } finally {
     await unlink(temp).catch((err: NodeJS.ErrnoException) => { if (err.code !== "ENOENT") throw err; });
   }
 }
 async function readSettings(settingsPath: string): Promise<Record<string, any>> {
-  const parsed = JSON.parse((await readFile(settingsPath, "utf8")).replace(/^\uFEFF/, ""));
-  if (!isPlainObject(parsed)) throw new Error("Provider settings root must be an object.");
-  return parsed;
+  const outcome = await readSettingsWithRetry(settingsPath);
+  if (outcome.ok) return outcome.data;
+  throw outcome.error;
 }
 /** Original values of one provider entry, as captured before the first bridge override touched it. */
 export interface ProviderBaseline {
@@ -475,11 +511,16 @@ export async function withProviderOverride<T extends { warnings?: string[] }>(
       try { existing = await readJournal(settingsPath); }
       catch { throw new ClineRunError("settings_restore_failed", "Unable to read the settings restore journal."); }
       const provider = input.provider;
-      const snapshot = await readProviderSettingsSnapshot(settingsPath, provider);
-      if (snapshot.skipRestore) throw new ClineRunError("settings_restore_failed", "Unable to snapshot provider settings.");
-      const journal: RestoreJournal = existing ?? { version: 2, base: baselineFrom(snapshot), runs: {} };
-      // Capture a provider's original values only the first time any live run overrides it.
-      if (!Object.hasOwn(journal.base.providers, provider)) journal.base.providers[provider] = providerBaselineFrom(snapshot);
+      let journal: RestoreJournal;
+      if (existing && Object.hasOwn(existing.base.providers, provider)) {
+        journal = existing;
+      } else {
+        const snapshot = await readProviderSettingsSnapshot(settingsPath, provider);
+        if (snapshot.skipRestore) throw new ClineRunError("settings_restore_failed", "Unable to snapshot provider settings.");
+        journal = existing ?? { version: 2, base: baselineFrom(snapshot), runs: {} };
+        // Capture a provider's original values only the first time any live run overrides it.
+        if (!Object.hasOwn(journal.base.providers, provider)) journal.base.providers[provider] = providerBaselineFrom(snapshot);
+      }
       journal.runs[runId] = { pid: process.pid, provider, startedAtMs: wallNow() };
       if (release.verifyOwnership && !await release.verifyOwnership()) continue;
       await atomicWrite(journalPath, journal);
