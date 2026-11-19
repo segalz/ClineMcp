@@ -14,6 +14,7 @@ const TIME_BUDGET_MS = 1_500;
 const CODEINDEX_TIME_BUDGET_MS = 10_000;
 const KILL_BUDGET_MS = 1_500;
 const SKIP_DIRS = new Set(["node_modules", "dist", "build", "out", "vendor", ".git"]);
+const PER_FILE_IO_ERRORS = new Set(["ENOENT", "ENOTDIR", "EACCES", "EPERM", "EBUSY", "ELOOP", "EISDIR"]);
 const BINARY_EXTENSION = /\.(?:png|jpe?g|gif|webp|ico|pdf|zip|gz|7z|rar|exe|dll|so|dylib|woff2?|ttf|eot|mp[34]|wav|ogg|wasm|class|pyc|db|sqlite)$/i;
 
 export interface CodeMapOptions {
@@ -169,8 +170,10 @@ async function buildRegexCodeMap(root: string, options: CodeMapOptions = {}): Pr
         });
         entries.push({ base: `${file} (${lines.length} lines):`, symbols: symbols.length ? " " + symbols.join(", ") : "" });
       } catch (error) {
-        // The overall scan budget is a normal partial-result boundary. Other I/O errors omit the map.
+        // The overall scan budget is a normal partial-result boundary. Per-file I/O errors skip only that file.
         if (controller.signal.aborted && !options.signal?.aborted && entries.length > 0) break;
+        const code = error && typeof error === "object" && "code" in error ? (error as { code?: unknown }).code : undefined;
+        if (!controller.signal.aborted && typeof code === "string" && PER_FILE_IO_ERRORS.has(code)) continue;
         throw error;
       }
     }
@@ -239,8 +242,8 @@ function codeindexMap(cli: string, root: string, prompt: string, budget: number,
       try {
         const raw = new TextDecoder("utf-8", { fatal: true }).decode(Buffer.concat(chunks));
         const reply = JSON.parse(raw);
-        finish(raw.length <= budget && reply?.schemaVersion === 2 && reply.command === "map" &&
-          typeof reply.map === "string" ? reply.map : undefined);
+        finish(reply?.schemaVersion === 2 && reply.command === "map" &&
+          typeof reply.map === "string" && reply.map.length <= budget ? reply.map : undefined);
       } catch { finish(); }
     });
     child.stdin.end(prompt, "utf8");

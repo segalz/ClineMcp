@@ -315,7 +315,6 @@ test("codeindex silently falls back for every nonzero exit and invalid/oversize 
     "nonstring map": 'process.stdout.write(JSON.stringify({schemaVersion:2, command:"map", map:123}))',
     "missing map": 'process.stdout.write(JSON.stringify({schemaVersion:2, command:"map"}))',
     "stdout cap": 'process.stdout.write("x".repeat(70 * 1024)); setInterval(() => {}, 1000)',
-    "JSON budget cap": emitMap('"x".repeat(6000)'),
     "map cap": emitMap('"x".repeat(6001)'),
     "empty map": emitMap('""')
   };
