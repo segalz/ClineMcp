@@ -29,6 +29,7 @@ Branches holding tonight's fixes (pushed, not merged): `fix/remaining-edge-cases
 | B8 | Cline | The codeindex map is checked against the JSON envelope length → near-budget maps are thrown away (`codemap.ts:242`) | verified |
 | B9 | Cline | Async edits (`cline_start` mode edits) return no `gitDiff` / `status` | verified |
 | B10 | Both | The first edit run does not reserve verify time when the budget is small (OpenCode `run === 0`); Cline maps a timeout to `cline_error` instead of `budget` | reviewer claim |
+| B11 | Cline | Cache reads count toward `maxInputTokens` (`guard.ts` takes `usage.inputTokens`, which includes the cached part for at least the free Cline provider): long cached prompts trip the budget early. Parity with O, fixed there in S7 | verified 2026-11-19 (live trace) |
 
 ## C. Lower priority
 
