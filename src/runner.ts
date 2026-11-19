@@ -779,10 +779,12 @@ async function runClineInner(
   const finalReport = (existing?: GuardReport): GuardReport => {
     const reports = guards.map(guard => guard.snapshot());
     const last = reports.at(-1) ?? existing ?? { window: options.guard?.window ?? input.guard?.window ?? 10,
-      lastErrors: [], totalToolCalls: 0, totalInputTokens: 0, filesTouched: [] };
+      lastErrors: [], totalToolCalls: 0, totalInputTokens: 0, budgetInputTokens: 0, filesTouched: [] };
     return Object.assign(last, {
       totalToolCalls: reports.length ? reports.reduce((sum, report) => sum + report.totalToolCalls, 0) : last.totalToolCalls,
       totalInputTokens: reports.length ? reports.reduce((sum, report) => sum + report.totalInputTokens, 0) : last.totalInputTokens,
+      budgetInputTokens: reports.length ? reports.reduce((sum, report) => sum + (report.budgetInputTokens ?? report.totalInputTokens), 0)
+        : last.budgetInputTokens ?? last.totalInputTokens,
       filesTouched: [...new Set(reports.length ? reports.flatMap(report => report.filesTouched) : last.filesTouched)] });
   };
   try {
@@ -1325,7 +1327,7 @@ async function runClineCore(input: AskClineInput, signal: AbortSignal | undefine
 
         if (guardState.verdict) {
           const verdict = guardState.verdict;
-          const summary = buildGuardTripMessage(verdict, options.guard) + aliveSentence;
+          const summary = buildGuardTripMessage(verdict, options.guard ?? effectiveInput.guard) + aliveSentence;
           // The final run_result carries cumulative token counts, so the guard can trip on the very
           // event that holds the finished answer. A completed answer is kept, with the trip as a warning.
           const finished = verdict.kind === "budget_exceeded" ? parseUsableResult(stdout, effectiveCode) : null;

@@ -21,6 +21,8 @@ export interface GuardReport {
   totalToolCalls: number;
   toolCalls?: number;
   totalInputTokens: number;
+  /** Input charged to the guard. Older reports contain only totalInputTokens. */
+  budgetInputTokens?: number;
   inputTokens?: number;
   filesTouched: string[];
   files?: string[];
@@ -322,10 +324,8 @@ export function extractInputTokens(event: Record<string, any>): number | undefin
   const obj = inner ?? event;
 
   const u = isObject(obj.usage) ? obj.usage : (isObject(event.usage) ? event.usage : undefined);
-  if (u) {
-    const val = u.inputTokens ?? u.input_tokens ?? u.promptTokens ?? u.prompt_tokens;
-    if (typeof val === "number" && Number.isFinite(val) && val > 0) return val;
-  }
+  const val = u?.inputTokens ?? u?.input_tokens ?? u?.promptTokens ?? u?.prompt_tokens;
+  if (typeof val === "number" && Number.isFinite(val) && val > 0) return val;
 
   const direct = obj.inputTokens ?? obj.input_tokens ?? event.inputTokens ?? event.input_tokens;
   if (typeof direct === "number" && Number.isFinite(direct) && direct > 0) return direct;
@@ -355,6 +355,23 @@ function validatePositiveInteger(value: unknown, name: string): number {
     throw new Error(`Guard option '${name}' must be a positive integer, got ${value}`);
   }
   return value;
+}
+
+const CACHE_READ_FIELDS = ["cacheReadTokens", "cache_read_tokens", "cache_read_input_tokens"];
+const CACHE_WRITE_FIELDS = ["cacheWriteTokens", "cache_write_tokens", "cache_creation_input_tokens"];
+const CACHE_FIELDS = [...CACHE_READ_FIELDS, ...CACHE_WRITE_FIELDS];
+
+function cacheTokenCount(usage: Record<string, any>, fields: string[]): number {
+  const field = fields.find(name => usage[name] != null);
+  const value = field === undefined ? 0 : usage[field];
+  return Number.isFinite(value) && value > 0 ? value : 0;
+}
+
+function budgetTokensFor(input: number, usage: Record<string, any>): number {
+  const cacheRead = cacheTokenCount(usage, CACHE_READ_FIELDS);
+  const cacheWrite = cacheTokenCount(usage, CACHE_WRITE_FIELDS);
+  // A cache read larger than input is reported separately by the provider.
+  return (cacheRead > input ? input : input - cacheRead) + cacheWrite;
 }
 
 function formatAndRedactError(rawError: string | undefined): string {
@@ -391,7 +408,10 @@ export function createGuard(options?: GuardOptions): Guard {
   let totalToolCalls = 0;
   let incrementalTokens = 0;
   let cumulativeTokens = 0;
-  let totalInputTokens = 0;
+  let incrementalBudgetTokens = 0;
+  let cumulativeBudgetTokens = 0;
+  // Largest total charged to the budget from a total (not a step), paired with cumulativeBudgetTokens.
+  let chargedTotalTokens = 0;
   let lastAssistantText: string | undefined;
 
   const filesTouched: string[] = [];
@@ -404,18 +424,7 @@ export function createGuard(options?: GuardOptions): Guard {
 
   let trippedVerdict: GuardVerdict | null = null;
 
-  function buildReport(data: {
-    kind?: GuardVerdictKind;
-    tool?: string;
-    target?: string;
-    count?: number;
-    window: number;
-    lastErrors: string[];
-    totalToolCalls: number;
-    totalInputTokens: number;
-    filesTouched: string[];
-    lastAssistantText?: string;
-  }): GuardReport {
+  function buildReport(data: GuardReport): GuardReport {
     const report: GuardReport = {
       ...(data.kind !== undefined ? { kind: data.kind } : {}),
       ...(data.tool !== undefined ? { tool: redactSecrets(data.tool) } : {}),
@@ -425,6 +434,7 @@ export function createGuard(options?: GuardOptions): Guard {
       lastErrors: data.lastErrors.map(e => redactSecrets(e)),
       totalToolCalls: data.totalToolCalls,
       totalInputTokens: data.totalInputTokens,
+      budgetInputTokens: data.budgetInputTokens,
       filesTouched: data.filesTouched.map(p => redactSecrets(p)),
       ...(data.lastAssistantText !== undefined ? { lastAssistantText: redactSecrets(data.lastAssistantText).slice(-400) } : {})
     };
@@ -468,7 +478,8 @@ export function createGuard(options?: GuardOptions): Guard {
       window: windowSize,
       lastErrors: reportErrors,
       totalToolCalls,
-      totalInputTokens,
+      totalInputTokens: Math.max(incrementalTokens, cumulativeTokens),
+      budgetInputTokens: Math.max(incrementalBudgetTokens, cumulativeBudgetTokens),
       filesTouched,
       lastAssistantText
     }) as GuardVerdict;
@@ -497,41 +508,39 @@ export function createGuard(options?: GuardOptions): Guard {
     }
 
     // 1. Process usage tokens (usage events are incremental; done and run_result are cumulative)
-    if (isUsageEvent(event)) {
-      const inc = extractInputTokens(event);
-      if (inc !== undefined && inc > 0) {
-        incrementalTokens += inc;
+    const usageEvent = isUsageEvent(event);
+    const input = extractInputTokens(event);
+    const cumulativeEvent = isCumulativeTokenEvent(event);
+    if (usageEvent || cumulativeEvent || input !== undefined) {
+      const usage = isObject(inner.usage) ? inner.usage : isObject(event.usage) ? event.usage : inner;
+      const total = cumulativeEvent ? (input ?? 0) : extractTotalInputTokens(event);
+      // A step input of 0 (e.g. only a cache write) is still a step; a usage event with only a
+      // running total is not, so its total is charged instead.
+      const hasStepInput = input !== undefined || ["inputTokens", "input_tokens", "promptTokens", "prompt_tokens"]
+        .some(field => Number.isFinite(usage[field]) && usage[field] >= 0);
+      const isIncrement = !cumulativeEvent && hasStepInput && (usageEvent || total === undefined);
+      // The budget pair that had seen more input before this event, for a cumulative result without
+      // cache fields. On a tie the steps win: they carry cache writes a bare total does not.
+      const [seenTokens, seenBudget] = chargedTotalTokens > incrementalTokens
+        ? [chargedTotalTokens, cumulativeBudgetTokens] : [incrementalTokens, incrementalBudgetTokens];
+      if (isIncrement) {
+        incrementalTokens += input ?? 0;
+        incrementalBudgetTokens += budgetTokensFor(input ?? 0, usage);
       }
-      const tot = extractTotalInputTokens(event);
-      if (tot !== undefined && tot > 0) {
-        cumulativeTokens = Math.max(cumulativeTokens, tot);
-      }
-      totalInputTokens = Math.max(incrementalTokens, cumulativeTokens);
-      if (totalInputTokens > maxInputTokens) {
-        return trip("budget_exceeded", undefined, undefined, undefined, allErrors.slice(-3));
-      }
-    } else if (isCumulativeTokenEvent(event)) {
-      const cum = extractInputTokens(event);
-      if (cum !== undefined && cum > 0) {
-        cumulativeTokens = Math.max(cumulativeTokens, cum);
-      }
-      totalInputTokens = Math.max(incrementalTokens, cumulativeTokens);
-      if (totalInputTokens > maxInputTokens) {
-        return trip("budget_exceeded", undefined, undefined, undefined, allErrors.slice(-3));
-      }
-    } else {
-      const tokens = extractInputTokens(event);
-      if (tokens !== undefined && tokens > 0) {
-        const tot = extractTotalInputTokens(event);
-        if (tot !== undefined && tot > 0) {
-          cumulativeTokens = Math.max(cumulativeTokens, tot);
-        } else {
-          incrementalTokens += tokens;
+      if (total !== undefined) {
+        cumulativeTokens = Math.max(cumulativeTokens, total);
+        // A usage event's running total next to a step input is for reporting only. A cumulative
+        // result without cache fields charges in full only the input not seen before.
+        if (!isIncrement) {
+          const budget = cumulativeEvent && !CACHE_FIELDS.some(field => usage[field] != null)
+            ? seenBudget + Math.max(0, total - seenTokens)
+            : budgetTokensFor(total, usage);
+          cumulativeBudgetTokens = Math.max(cumulativeBudgetTokens, budget);
+          chargedTotalTokens = Math.max(chargedTotalTokens, total);
         }
-        totalInputTokens = Math.max(incrementalTokens, cumulativeTokens);
-        if (totalInputTokens > maxInputTokens) {
-          return trip("budget_exceeded", undefined, undefined, undefined, allErrors.slice(-3));
-        }
+      }
+      if (Math.max(incrementalBudgetTokens, cumulativeBudgetTokens) > maxInputTokens) {
+        return trip("budget_exceeded");
       }
     }
 
@@ -664,7 +673,8 @@ export function createGuard(options?: GuardOptions): Guard {
       window: windowSize,
       lastErrors: allErrors.slice(-3),
       totalToolCalls,
-      totalInputTokens,
+      totalInputTokens: Math.max(incrementalTokens, cumulativeTokens),
+      budgetInputTokens: Math.max(incrementalBudgetTokens, cumulativeBudgetTokens),
       filesTouched,
       lastAssistantText
     });
@@ -674,6 +684,7 @@ export function createGuard(options?: GuardOptions): Guard {
 }
 
 export function buildGuardTripMessage(verdict: GuardVerdict, options?: GuardOptions): string {
+  const budgetTokens = verdict.budgetInputTokens ?? verdict.totalInputTokens;
   let msg: string;
   if (verdict.kind === "loop_detected") {
     const count = verdict.count ?? 3;
@@ -684,10 +695,10 @@ export function buildGuardTripMessage(verdict: GuardVerdict, options?: GuardOpti
     msg = `Stopped by the bridge: ${count} failed ${action} on ${target} within ${window} tool calls`;
   } else if (verdict.totalToolCalls > (options?.maxToolCalls ?? 150)) {
     msg = `Stopped by the bridge: tool-call budget exceeded (${verdict.totalToolCalls} > ${options?.maxToolCalls ?? 150} tool calls)`;
-  } else if (verdict.totalInputTokens > (options?.maxInputTokens ?? 1_500_000)) {
-    msg = `Stopped by the bridge: input-token budget exceeded (${verdict.totalInputTokens} > ${options?.maxInputTokens ?? 1_500_000} tokens)`;
+  } else if (budgetTokens > (options?.maxInputTokens ?? 1_500_000)) {
+    msg = `Stopped by the bridge: input-token budget exceeded (${budgetTokens} > ${options?.maxInputTokens ?? 1_500_000} tokens)`;
   } else {
-    msg = "Stopped by the bridge: budget exceeded";
+    msg = `Stopped by the bridge: ${formatReportSummary(verdict)}`;
   }
   return redactSecrets(msg);
 }
@@ -703,10 +714,10 @@ export function formatReportSummary(report?: GuardReport, errorMessage?: string)
       return redactSecrets(`${count} failed ${action} on ${target} within ${window} tool calls`);
     }
     if (report.kind === "budget_exceeded") {
-      if (report.totalToolCalls > 150) {
+      if (report.tool !== undefined || (report.budgetInputTokens === undefined && report.totalToolCalls > 150)) {
         return `tool-call budget exceeded (${report.totalToolCalls} calls)`;
       }
-      return `input-token budget exceeded (${report.totalInputTokens} tokens)`;
+      return `input-token budget exceeded (${report.budgetInputTokens ?? report.totalInputTokens} tokens)`;
     }
   }
   if (errorMessage) {

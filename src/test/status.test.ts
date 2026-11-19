@@ -122,7 +122,7 @@ test("rate limits carry retry_after; other failures are unreachable", () => {
 
 test("run errors map to states; cancellation and workspace errors are not recorded", () => {
   assert.equal(classifyRunError(new ClineRunError("timeout", "slow"), NOW)?.state, "unreachable");
-  assert.equal(classifyRunError(new ClineRunError("launch_failed", "ENOENT"), NOW)?.state, "unreachable");
+  assert.equal(classifyRunError(new ClineRunError("launch_failed", "ENOENT"), NOW), undefined);
   assert.equal(classifyRunError(new ClineRunError("transient_provider_error", "x", { extractedMessage: "429 rate limit" }), NOW)?.state, "rate_limited");
   assert.equal(classifyRunError(new ClineRunError("non_zero_exit", "Upstream 502"), NOW)?.state, "unreachable");
   assert.equal(classifyRunError(new ClineRunError("cancelled", "stop"), NOW), undefined);

@@ -224,7 +224,7 @@ Edits now require `verify` (command or reasoned `none`). `steps`, `stepBudget`, 
 | `maxToolCalls` | 150 | 10-1,000 |
 | `maxInputTokens` | 1,500,000 | 10,000-20,000,000 |
 
-`loop_detected` means repeated failures with the same tool/target signature within the sliding window. File tools use normalized paths, command tools use their command, and other tools use an input signature. Successes and unrelated calls consume window positions. `budget_exceeded` means tool calls or input tokens exceeded their limit; input usage combines incremental/cumulative reports without counting both twice.
+`loop_detected` means repeated failures with the same tool/target signature within the sliding window. File tools use normalized paths, command tools use their command, and other tools use an input signature. Successes and unrelated calls consume window positions. `budget_exceeded` means tool calls or input tokens exceeded their limit. The guard reports full input as `totalInputTokens` and enforces `maxInputTokens` against `budgetInputTokens`. It subtracts cache reads when they fit within the reported input, treats larger reads as separately reported, and adds cache writes. Incremental usage and cumulative results count only once.
 
 When available, a final guard report includes counters, window, touched files, recent redacted errors and optional tripped kind/tool/target/count and assistant-text excerpt. Async guard trips pause; sync calls fail. Edit recovery follows the final-check rules above; guard trips do not automatically launch repairs.
 
@@ -248,7 +248,9 @@ Known source mismatch: the generated header and working rules describe positions
 
 `cline_list_models` reads the installed CLI's advertised free list from `@cline/llms`, enriches metadata and attaches recorded `last_status`; it does not infer free models from zero prices or guess IDs. Its JSON reply includes `provider`, `models`, `source`, `note` and, when state is readable, `cli`. Catalog snapshots are refreshed best-effort after listing and at startup.
 
-`cline_ping` makes a one-attempt, no-tools PONG request and returns `state:available | rate_limited | quota_exhausted | unreachable`, provider/model, timestamps, reason, source and cache status, with available latency/reset/retry details. `force:true` bypasses fresh cached ping results. Default TTLs are 60 seconds for available/unreachable, 180 seconds for rate limits (reported retry delays are clamped to 5-3600 seconds), and the reported quota reset or next UTC midnight. A catalog entry is not proof that a model can answer.
+`cline_ping` makes a one-attempt, no-tools PONG request and returns `state:available | rate_limited | quota_exhausted | unreachable`, provider/model, timestamps, reason, source and cache status, with available latency/reset/retry details. `force:true` bypasses fresh cached ping results. Available and unreachable entries expire after 60 seconds. Daily quota entries expire at the reported reset or next UTC midnight. A catalog entry is not proof that a model can answer.
+
+Consecutive rate limits on the same provider and model use cooldowns of 1, 3, 10 and then 30 minutes. Reports less than 2 seconds apart share a strike and preserve the later expiry. A different state or a gap over 30 minutes resets the ladder. A provider's `Retry-After` sets the cooldown for that strike, clamped to 5–3600 seconds.
 
 | Local data | Default path | Override |
 |---|---|---|

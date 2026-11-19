@@ -114,6 +114,7 @@ export class FinalCheckLifecycle {
   codeMapSource: NonNullable<ClineResponse["codeMapSource"]> = "none";
   usage: Record<string, unknown> = Object.create(null); cost = 0; durationMs = 0;
   totalToolCalls = 0; totalInputTokens = 0; launches = 0; activeMs = 0; automaticFixes = 0;
+  private budgetInputTokens = 0;
   cancelled = false;
   /** New, non-ignored files present when the edit finished (absent when there are none). */
   createdFiles?: string[];
@@ -199,7 +200,7 @@ export class FinalCheckLifecycle {
         if (!await this.unchanged()) return;
         check();
         const calls = (this.input.guard?.maxToolCalls ?? 150) - this.totalToolCalls;
-        const tokens = (this.input.guard?.maxInputTokens ?? 1_500_000) - this.totalInputTokens;
+        const tokens = (this.input.guard?.maxInputTokens ?? 1_500_000) - this.budgetInputTokens;
         if (calls <= 0 || tokens <= 0) { this.wait("guard", new ClineRunError("budget_exceeded", "Cumulative edit guard budget exhausted.")); return; }
         this.phase = "run";
         this.launches++;
@@ -215,6 +216,7 @@ export class FinalCheckLifecycle {
         this.codeMapSource = metrics?.codeMapSource ?? "none";
         this.totalToolCalls += metrics?.guard?.totalToolCalls ?? 0;
         this.totalInputTokens += metrics?.guard?.totalInputTokens ?? 0;
+        this.budgetInputTokens += metrics?.guard?.budgetInputTokens ?? metrics?.guard?.totalInputTokens ?? 0;
         aggregateUsage(this.usage, metrics?.usage ?? (metrics?.guard ? { inputTokens: metrics.guard.totalInputTokens } : undefined));
         if (typeof metrics?.cost === "number") this.cost += metrics.cost;
         this.durationMs += metrics?.durationMs ?? 0;
@@ -224,7 +226,7 @@ export class FinalCheckLifecycle {
         if (failure) {
           this.wait(failure instanceof ClineRunError && ["loop_detected", "budget_exceeded"].includes(failure.kind) ? "guard" : "cline_error", failure); return;
         }
-        if (this.totalToolCalls > (this.input.guard?.maxToolCalls ?? 150) || this.totalInputTokens > (this.input.guard?.maxInputTokens ?? 1_500_000)) {
+        if (this.totalToolCalls > (this.input.guard?.maxToolCalls ?? 150) || this.budgetInputTokens > (this.input.guard?.maxInputTokens ?? 1_500_000)) {
           this.wait("guard", new ClineRunError("budget_exceeded", "Cumulative edit guard budget exceeded.")); return;
         }
         this.question = this.deps.question(response!.text);

@@ -12,6 +12,7 @@ import {
 
 export const PING_PROMPT = "Reply with exactly the word PONG.";
 export const DEFAULT_PING_TIMEOUT_SECONDS = 25;
+const LOCAL_FAILURE_KINDS = ["cancelled", "launch_failed", "cline_updating", "settings_lock_timeout", "settings_restore_failed"];
 
 export interface ClinePingInput {
   provider?: string;
@@ -29,6 +30,7 @@ export interface ClinePingResult {
   expires_at: string;
   reason: string;
   retry_after_s?: number;
+  strikes?: number;
   reset_at?: string;
   source: StatusEntry["source"];
   cached: boolean;
@@ -93,7 +95,8 @@ export async function clinePing(
       latencyMs: wallNow() - started
     }, wallNow());
   } catch (error) {
-    if (error instanceof ClineRunError && error.kind === "cancelled") throw error;
+    if (error instanceof ClineRunError &&
+        (LOCAL_FAILURE_KINDS.includes(error.kind) || error.kind.startsWith("workspace_"))) throw error;
     const classified = classifyRunError(error, wallNow()) ?? {
       state: "unreachable" as const,
       reason: error instanceof ClineRunError ? `${error.kind}: ${error.message.split(/\r?\n/)[0]}` : "ping failed unexpectedly"
@@ -106,6 +109,5 @@ export async function clinePing(
       latencyMs: wallNow() - started
     }, wallNow());
   }
-  await recordStatusSafely(statusPath, entry);
-  return toResult(entry, false);
+  return toResult(await recordStatusSafely(statusPath, entry), false);
 }
