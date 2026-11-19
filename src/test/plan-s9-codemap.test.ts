@@ -51,11 +51,12 @@ test("S9 B7: a tracked file deleted from the working tree is skipped; the rest o
 });
 
 test("S9 B7: a tracked path whose parent became a file is skipped too", async () => {
-  const repo = await repository({ "a.ts": "export const kept = 1;\n", "dir/inner.ts": "export const inner = 1;\n" });
+  const repo = await repository({ "a.ts": "export const kept = 1;\n", "dir/inner.ts": "export const inner = 1;\n", "z.ts": "export const last = 1;\n" });
   await rm(path.join(repo, "dir"), { recursive: true });
   await writeFile(path.join(repo, "dir"), "a file where Git expects a folder\n");
   const map = await withoutCodeindex(() => buildCodeMap(repo));
   assert.match(map ?? "", /a\.ts/);
+  assert.match(map ?? "", /z\.ts/, "files after the bad path are still scanned");
 });
 
 const envelope = (map: string) => ({ schemaVersion: 2, command: "map", referencesAreCandidates: true, truncated: false, anchors: [], map });
@@ -75,6 +76,13 @@ test("S9 B8: a 5,990-char structural map in a longer JSON envelope fits a 6,000 
   const result = await withCodeindex(reply, () => buildCodeMapWithSource(repo));
   assert.equal(result.source, "codeindex");
   assert.equal(result.map?.length, 5_990);
+});
+
+test("S9 review: a structural map of exactly the budget (6,000 chars) is kept", async () => {
+  const repo = await repository({ "a.ts": "export const first = 1;\n" });
+  const result = await withCodeindex(JSON.stringify(envelope("x".repeat(6_000))), () => buildCodeMapWithSource(repo));
+  assert.equal(result.source, "codeindex");
+  assert.equal(result.map?.length, 6_000);
 });
 
 test("S9 B8: a structural map longer than the budget is still refused (regex fallback)", async () => {
