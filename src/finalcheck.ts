@@ -7,6 +7,9 @@ import { resolveVerificationCommand, runVerification, VerificationError, type Ve
 import { ClineRunError, redactSecrets, guardOptionsSchema, type ClineResponse } from "./runner.js";
 import type { GuardOptions } from "./guard.js";
 
+/** Extra margin reserved alongside the final check's timeout so each run leaves time to verify. */
+export const VERIFY_RESERVE_MARGIN_MS = 10_000;
+
 const VERIFY_COMMAND_HELP = "Program for the final check, run without a shell. It must already be runnable before the edit "
   + "starts (it is checked up front; a tool the edit would install is refused). On Windows, npm/pnpm/yarn and "
   + "node_modules/.bin shims (vitest, tsc, eslint) are resolved to their program.";
@@ -195,6 +198,7 @@ export class FinalCheckLifecycle {
       if (!this.deps.fits(prompt)) throw new ClineRunError("launch_failed", "Edit prompt exceeds prompt limits.");
       this.question = undefined; this.waitReason = undefined; this.error = undefined;
       const manual = guidance !== undefined;
+      const verifyReserveMs = "none" in this.input.verify ? 0 : (this.input.verify.timeoutSeconds ?? 60) * 1000 + VERIFY_RESERVE_MARGIN_MS;
       while (true) {
         check();
         if (!await this.unchanged()) return;
@@ -202,6 +206,11 @@ export class FinalCheckLifecycle {
         const calls = (this.input.guard?.maxToolCalls ?? 150) - this.totalToolCalls;
         const tokens = (this.input.guard?.maxInputTokens ?? 1_500_000) - this.budgetInputTokens;
         if (calls <= 0 || tokens <= 0) { this.wait("guard", new ClineRunError("budget_exceeded", "Cumulative edit guard budget exhausted.")); return; }
+        const remainingSeconds = Math.floor((remaining - (performance.now() - started) - verifyReserveMs) / 1000);
+        if (remainingSeconds < 1) {
+          this.wait("budget", new ClineRunError("budget_exceeded", "Not enough time left for a run and its final check."));
+          return;
+        }
         this.phase = "run";
         this.launches++;
         if (repair) this.verification.fixRuns++;
@@ -209,7 +218,7 @@ export class FinalCheckLifecycle {
         let response: ClineResponse | undefined, failure: unknown;
         try {
           response = await this.deps.run(prompt, controller.signal, this.lock!, { ...this.input.guard, maxToolCalls: calls, maxInputTokens: tokens },
-            Math.max(1, Math.floor((remaining - (performance.now() - started)) / 1000)), this.launches);
+            remainingSeconds, this.launches);
           this.result = response;
         } catch (error) { failure = error; }
         const metrics = (response ?? failure) as Partial<ClineResponse> | undefined;
@@ -224,7 +233,11 @@ export class FinalCheckLifecycle {
         if (!await this.unchanged()) return;
         check();
         if (failure) {
-          this.wait(failure instanceof ClineRunError && ["loop_detected", "budget_exceeded"].includes(failure.kind) ? "guard" : "cline_error", failure); return;
+          const reason: EditWaitReason = failure instanceof ClineRunError
+            ? (["loop_detected", "budget_exceeded"].includes(failure.kind) ? "guard"
+              : failure.kind === "timeout" ? "budget" : "cline_error")
+            : "cline_error";
+          this.wait(reason, failure); return;
         }
         if (this.totalToolCalls > (this.input.guard?.maxToolCalls ?? 150) || this.budgetInputTokens > (this.input.guard?.maxInputTokens ?? 1_500_000)) {
           this.wait("guard", new ClineRunError("budget_exceeded", "Cumulative edit guard budget exceeded.")); return;

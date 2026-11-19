@@ -10,7 +10,7 @@ import {
 } from "./runner.js";
 import { formatReportSummary, type GuardOptions, type GuardReport } from "./guard.js";
 import { askClineWorkspace, buildWorkspaceSystemPrompt, WORKTREE_BASE } from "./workspace.js";
-import { applyClineEdits, buildEditSystemPrompt, editsCheckoutRoot, runClineEditRun } from "./edits.js";
+import { applyClineEdits, buildEditSystemPrompt, collectEditsGitReport, editsCheckoutRoot, runClineEditRun } from "./edits.js";
 import { FinalCheckLifecycle, startTaskSchema, editActionSchema, type VerifySpec, type FinalVerification, type EditAction, type EditWaitReason } from "./finalcheck.js";
 import { resolveTraceBase, type TraceInfo, type TraceRecorder, type TraceStatus } from "./trace.js";
 import type { SnapshotOptions } from "./snapshot.js";
@@ -763,6 +763,7 @@ export class TaskManager {
     const started = this.wallNow();
     let nextState: TaskState = "failed";
     let nextError: unknown;
+    let gitReport: { gitDiff: string; status: string; headBefore?: string; headAfter?: string; warnings: string[] } | undefined;
     task.settled = (async () => {
       if (action === "restore" || action === "cancel") await lifecycle.restore();
       else if (action === "keep") await lifecycle.keep();
@@ -772,7 +773,14 @@ export class TaskManager {
         nextState = "cancelled"; nextError = new ClineRunError("cancelled", "The task was cancelled.");
       } else if (lifecycle.phase === "waiting") {
         nextState = lifecycle.lock ? "input_required" : "failed"; nextError = lifecycle.error;
-      } else { nextState = "done"; }
+      } else {
+        nextState = "done";
+        // Collect report-only Git diff/status before releasing the checkout lock.
+        if (action !== "restore" && !lifecycle.verification.restored &&
+            (lifecycle.verification.passed === true || !lifecycle.verification.required || lifecycle.verification.kept)) {
+          gitReport = await collectEditsGitReport(lifecycle.root, lifecycle.identity?.head, lifecycle.verification.kept ? "kept edits" : "verified edits");
+        }
+      }
     })().catch(error => {
       nextError = error; nextState = "failed";
       lifecycle.evidence.cleanupError = redactSecrets(String(error));
@@ -781,11 +789,22 @@ export class TaskManager {
       task.question = lifecycle.question ?? (nextState === "input_required" ? {
         question: `Edit stopped: ${lifecycle.waitReason}. Retry with guidance, restore baseline, or keep unverified changes?`,
         options: ["retry", "restore", "keep"] } : undefined);
-      task.result = { ...lifecycle.result, text: lifecycle.result?.text ?? "", durationMs: lifecycle.durationMs,
+      const warnings = [...(lifecycle.result?.warnings ?? []), ...(gitReport?.warnings ?? [])];
+      if (lifecycle.createdFiles?.length) {
+        warnings.push(`The edit created ${lifecycle.createdFiles.length} new file(s): ${lifecycle.createdFiles.slice(0, 20).join(", ")}${lifecycle.createdFiles.length > 20 ? ", ..." : ""}. Check each belongs to the task.`);
+      }
+      task.result = {
+        ...lifecycle.result, text: lifecycle.result?.text ?? "", durationMs: lifecycle.durationMs,
         codeMapSource: task.codeMapSource ?? lifecycle.codeMapSource,
         usage: lifecycle.usage, cost: lifecycle.cost, verification: structuredClone(lifecycle.verification),
-        ...(lifecycle.createdFiles?.length ? { createdFiles: [...lifecycle.createdFiles],
-          warnings: [...(lifecycle.result?.warnings ?? []), `The edit created ${lifecycle.createdFiles.length} new file(s): ${lifecycle.createdFiles.slice(0, 20).join(", ")}${lifecycle.createdFiles.length > 20 ? ", ..." : ""}. Check each belongs to the task.`] } : {}) };
+        ...(gitReport ? {
+          gitDiff: gitReport.gitDiff, status: gitReport.status,
+          ...(gitReport.headBefore !== undefined ? { headBefore: gitReport.headBefore } : {}),
+          ...(gitReport.headAfter !== undefined ? { headAfter: gitReport.headAfter } : {})
+        } : {}),
+        ...(lifecycle.createdFiles?.length ? { createdFiles: [...lifecycle.createdFiles] } : {}),
+        ...(warnings.length ? { warnings } : {})
+      };
       task.endedAt = this.wallNow(); task.activeMs += task.endedAt - started;
       if (nextState !== "input_required") this.releaseCheckout(task);
       task.error = nextError; task.state = nextState;

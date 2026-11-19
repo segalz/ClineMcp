@@ -122,7 +122,7 @@ Every initial Cline request requires `provider` and `model`, matching `^[A-Za-z0
 - **Workspace:** tool-enabled analysis in a detached worktree at committed `HEAD`, excluding existing dirty changes. Cleanup is attempted after success, failure or cancellation; failed cleanup reports the leftover worktree. Its base is the OS temp directory's `cline-mcp-worktrees`.
 - **Edits:** tool-enabled work in the checkout, with instructions forbidding commits and branch/history changes. Verification/recovery follow the rules below. Workspace/edits require a Git repository with at least one commit.
 
-Sync answers include `text`, `durationMs` and available `model`, `usage`, `cost`, `guard`, `warnings` and `trace`. Successful sync edits also include `gitDiff` (up to 48,000 characters), `status`, `headBefore`, `headAfter`, `commitWasReverted:false` and `verification`. Async edit results aggregate numeric usage/cost across launches; they do not include the sync Git diff fields.
+Sync answers include `text`, `durationMs` and available `model`, `usage`, `cost`, `guard`, `warnings` and `trace`. Successful sync edits also include `gitDiff` (up to 48,000 characters), `status`, `headBefore`, `headAfter`, `commitWasReverted:false` and `verification`. Async edit results aggregate numeric usage/cost across launches; passing or kept edits also include `gitDiff` (up to 48,000 characters), `status`, `headBefore` and `headAfter`.
 
 Async states are `running | resuming | input_required | done | failed | cancelled`. Status includes `taskId`, mode/state, elapsed time, `run`, `runs`, trace and `resultReady`, plus available progress, question, run history, guard and error. Edits also expose `phase`, `verification`, `waitReason` and recovery `evidence`; phases are `snapshot | run | verify | restore | waiting | done`. `done` alone does not mean verified: restoration and keeping edits also finish as `done`.
 
@@ -186,7 +186,7 @@ Identity is checked before/after launches, after verification and before restore
 
 ### Budgets and verification result
 
-Each edit launch has one runner attempt, without hidden transient/timeout retries. Tool-call and input-token caps accumulate across initial work, fixes, questions and manual retries; each launch receives remaining capacity. Loop/window detection remains per invocation. `timeoutSeconds` is the cumulative active lifecycle budget (sync default 180/max 300; async default 600/max 1800), excluding caller waits; the check's timeout is an additional bound. Recovery, cleanup and final Git inspection can extend call wall time.
+Each edit launch has one runner attempt, without hidden transient/timeout retries. Tool-call and input-token caps accumulate across initial work, fixes, questions and manual retries; each launch receives remaining capacity. Loop/window detection remains per invocation. `timeoutSeconds` is the cumulative active lifecycle budget (sync default 180/max 300; async default 600/max 1800), excluding caller waits; when verification is required, each run reserves the check's timeout plus 10 seconds and stops with `budget` if less than 1 second remains. Recovery, cleanup and final Git inspection can extend call wall time.
 
 `verification` appears in sync lifecycle responses/errors, async status and async results (also inside `result`):
 

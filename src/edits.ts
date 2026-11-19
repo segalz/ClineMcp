@@ -84,7 +84,13 @@ export const POST_RUN_GIT_BUDGET_MS = 60_000;
 /** Total for the read-only Git checks before a retry. */
 export const RETRY_CHECK_GIT_BUDGET_MS = 20_000;
 
-function runGit(cwd: string, args: string[], signal?: AbortSignal, timeoutMs = GIT_TIMEOUT_MS): Promise<string> {
+export function runGit(
+  cwd: string,
+  args: string[],
+  signal?: AbortSignal,
+  timeoutMs = GIT_TIMEOUT_MS,
+  options?: { trim?: "both" | "end" }
+): Promise<string> {
   return new Promise((resolve, reject) => {
     let stdout = "";
     let stderr = "";
@@ -125,7 +131,7 @@ function runGit(cwd: string, args: string[], signal?: AbortSignal, timeoutMs = G
     child.stderr.on("data", (chunk: Buffer) => { stderr += chunk.toString("utf8"); });
     child.on("error", () => settle(() => reject(new Error("git launch failed"))));
     child.on("close", (code) => settle(() => {
-      if (code === 0) return resolve(stdout.trim());
+      if (code === 0) return resolve(options?.trim === "end" ? stdout.replace(/[\r\n]+$/, "") : stdout.trim());
       reject(new Error(stderr.trim() || "git command failed"));
     }));
   });
@@ -134,6 +140,30 @@ function runGit(cwd: string, args: string[], signal?: AbortSignal, timeoutMs = G
 export function truncateGitDiff(diff: string): string {
   if (diff.length <= MAX_DIFF_CHARACTERS) return diff;
   return `${diff.slice(0, MAX_DIFF_CHARACTERS)}\n\n[Diff truncated at ${MAX_DIFF_CHARACTERS} characters.]`;
+}
+
+/** Collects report-only diff, status, and current HEAD at checkout root; Git failures add warnings and never throw. */
+export async function collectEditsGitReport(
+  root: string,
+  headBefore?: string,
+  labelSuffix = "verified edits"
+): Promise<{ gitDiff: string; status: string; headBefore?: string; headAfter?: string; warnings: string[] }> {
+  const warnings: string[] = [];
+  const report = async (args: string[], label: string, options?: { trim?: "both" | "end" }): Promise<string | undefined> => {
+    try { return await runGit(root, args, undefined, GIT_TIMEOUT_MS, options); }
+    catch (error) { warnings.push(`git ${label} failed after ${labelSuffix}: ${(error as Error)?.message ?? String(error)}`); return undefined; }
+  };
+  const gitDiff = truncateGitDiff((await report(["diff", "--binary", "--no-ext-diff", "HEAD"], "diff")) ?? "");
+  const status = (await report(["--no-optional-locks", "status", "--short"], "status", { trim: "end" })) ?? "";
+  const currentHead = await report(["rev-parse", "HEAD"], "rev-parse");
+  const headAfter = currentHead || headBefore;
+  return {
+    gitDiff,
+    status,
+    ...(headBefore !== undefined ? { headBefore } : {}),
+    ...(headAfter !== undefined ? { headAfter } : {}),
+    warnings
+  };
 }
 
 export async function applyClineEdits(
@@ -175,19 +205,14 @@ export async function applyClineEdits(
       Object.assign(error, { verification: lifecycle.verification, evidence: lifecycle.evidence,
         codeMapSource: lifecycle.codeMapSource }); throw error;
     }
-    const head = lifecycle.identity!.head;
+    const headBefore = lifecycle.identity!.head;
     // The edits passed and are kept: a failing report-only Git call must not turn that into an error.
-    const warnings = [...(lifecycle.result!.warnings ?? [])];
-    const report = async (args: string[], label: string): Promise<string> => {
-      try { return await runGit(lifecycle.root, args); }
-      catch (error) { warnings.push(`git ${label} failed after verified edits: ${(error as Error)?.message ?? String(error)}`); return ""; }
-    };
-    const gitDiff = truncateGitDiff(await report(["diff", "--binary", "--no-ext-diff", "HEAD"], "diff"));
-    const status = await report(["--no-optional-locks", "status", "--short"], "status");
+    const { gitDiff, status, headAfter, warnings: gitWarnings } = await collectEditsGitReport(lifecycle.root, headBefore, "verified edits");
+    const warnings = [...(lifecycle.result!.warnings ?? []), ...gitWarnings];
     const created = lifecycle.createdFiles;
     if (created?.length) warnings.push(`The edit created ${created.length} new file(s): ${created.slice(0, 20).join(", ")}${created.length > 20 ? ", ..." : ""}. Check each belongs to the task.`);
     return { ...lifecycle.result!, ...(warnings.length ? { warnings } : {}), ...(created?.length ? { createdFiles: created } : {}), usage: lifecycle.usage, cost: lifecycle.cost, durationMs: lifecycle.durationMs,
-      gitDiff, status, headBefore: head, headAfter: head, commitWasReverted: false, verification: lifecycle.verification };
+      gitDiff, status, headBefore, headAfter: headAfter ?? headBefore, commitWasReverted: false, verification: lifecycle.verification };
   } finally { lifecycle.release(); }
 }
 
