@@ -139,10 +139,11 @@ test("S6 review: a hub that wrote its discovery record is stopped even when the 
 
 test("S6 review: the neutral-hub scan is triggered only by an emptied worktree folder", async () => {
   const base = await mkdtemp(path.join(dir, "worktrees-"));
-  assert.equal(await hasEmptyWorktreeFolder(base), false, "no folders");
+  assert.equal(await hasEmptyWorktreeFolder(base, 0), false, "no folders");
   await mkdir(path.join(base, "review-busy", "src"), { recursive: true });
-  assert.equal(await hasEmptyWorktreeFolder(base), false, "a folder in use is not a leftover");
+  await writeFile(path.join(base, "review-busy", "src", "index.ts"), "export {};"); // in use = holds a file (S6b)
+  assert.equal(await hasEmptyWorktreeFolder(base, 0), false, "a folder in use is not a leftover");
   await mkdir(path.join(base, "review-left"));
-  assert.equal(await hasEmptyWorktreeFolder(base), true);
-  assert.equal(await hasEmptyWorktreeFolder(path.join(base, "missing")), false);
+  assert.equal(await hasEmptyWorktreeFolder(base, 0), true);
+  assert.equal(await hasEmptyWorktreeFolder(path.join(base, "missing"), 0), false);
 });

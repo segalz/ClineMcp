@@ -1,4 +1,4 @@
-import { access, mkdir, readdir, rm } from "node:fs/promises";
+import { access, mkdir, readdir, rm, rmdir, stat } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { randomUUID } from "node:crypto";
@@ -120,35 +120,43 @@ function hubDaemonCwd(commandLine: string): string | undefined {
   return match?.[1] ?? match?.[2];
 }
 
-/** Worktree runs in flight in this process; leftovers are only touched when it is zero. */
+/** Includes the run checking for leftovers, from worktree setup through cleanup. */
 let activeWorktreeRuns = 0;
 
-/** Removes empty `review-*` folders that an earlier run could not delete (best effort). */
-async function sweepEmptyWorktreeFolders(): Promise<void> {
-  let names: string[];
-  try { names = await readdir(WORKTREE_BASE); } catch { return; }
-  for (const name of names) {
-    if (!name.startsWith("review-")) continue;
-    const folder = path.join(WORKTREE_BASE, name);
-    if (await folderIsEmptyOrGone(folder)) await rm(folder, { recursive: true, force: true }).catch(() => {});
+/**
+ * A worktree folder younger than this may still be filling up (another bridge process running `git worktree
+ * add`), so it is never treated as a leftover.
+ */
+export const LEFTOVER_MIN_AGE_MS = 60_000;
+
+/** Yield directories children-first, only after checking the entire worktree for files. */
+async function* emptyWorktreeFolders(base: string, minAgeMs = LEFTOVER_MIN_AGE_MS) {
+  const entries = await readdir(base, { withFileTypes: true }).catch(() => []);
+  for (const entry of entries) {
+    if (!entry.isDirectory() || !entry.name.startsWith("review-")) continue;
+    const modified = await stat(path.join(base, entry.name)).then(info => info.mtimeMs, () => undefined);
+    if (modified === undefined || (minAgeMs > 0 && Date.now() - modified < minAgeMs)) continue;
+    const folders: string[] = [];
+    if (await folderIsEmptyOrGone(path.join(base, entry.name), folders) && folders.length) yield folders;
   }
 }
 
 /** True when an emptied `review-*` worktree folder is left behind: the sign of a hub still holding it. */
-export async function hasEmptyWorktreeFolder(base = WORKTREE_BASE): Promise<boolean> {
-  let names: string[];
-  try { names = await readdir(base); } catch { return false; }
-  for (const name of names) {
-    if (name.startsWith("review-") && await folderIsEmptyOrGone(path.join(base, name))) return true;
-  }
-  return false;
+export async function hasEmptyWorktreeFolder(base = WORKTREE_BASE, minAgeMs = LEFTOVER_MIN_AGE_MS): Promise<boolean> {
+  const first = await emptyWorktreeFolders(base, minAgeMs).next();
+  return !first.done;
 }
 
-async function folderIsEmptyOrGone(folder: string): Promise<boolean> {
+async function folderIsEmptyOrGone(folder: string, folders?: string[]): Promise<boolean> {
   try {
-    return (await readdir(folder)).length === 0;
-  } catch {
+    const entries = await readdir(folder, { withFileTypes: true });
+    for (const entry of entries) {
+      if (!entry.isDirectory() || !await folderIsEmptyOrGone(path.join(folder, entry.name), folders)) return false;
+    }
+    folders?.push(folder);
     return true;
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code === "ENOENT";
   }
 }
 
@@ -159,19 +167,27 @@ async function folderIsEmptyOrGone(folder: string): Promise<boolean> {
  * leftover `review-*` folders.
  */
 async function ensureNeutralHub(options: Partial<ClineInvocationOptions>): Promise<void> {
-  if (process.platform !== "win32" || options.deps?.spawn || options.deps?.entryPath) return;
+  if (process.platform !== "win32" || options.deps?.spawn || options.deps?.entryPath || activeWorktreeRuns !== 1) return;
   const base = `${normalizePathForMatch(WORKTREE_BASE)}/`;
   // The hub is shared by every Cline run on the machine, so a leftover one is stopped only while
   // this bridge has no other worktree run in flight, and only when its folder is already empty.
   // The ~1 s process scan runs only when an emptied worktree folder is left behind (plan S6, B6): that is
   // the sign of a hub still holding it. Each run's own hub is stopped by runCline itself.
-  if (activeWorktreeRuns === 0 && await hasEmptyWorktreeFolder()) {
-    for (const { pid, commandLine } of await listClineProcesses()) {
-      const cwd = hubDaemonCwd(commandLine);
-      // Wait for the kill: the sweep below cannot remove a folder the hub still holds.
-      if (cwd && normalizePathForMatch(cwd).startsWith(base) && await folderIsEmptyOrGone(cwd)) await killTreeAndWait(pid);
+  if (!await hasEmptyWorktreeFolder() || activeWorktreeRuns !== 1) return;
+  for (const { pid, commandLine } of await listClineProcesses()) {
+    const cwd = hubDaemonCwd(commandLine);
+    // Wait for the kill: the sweep below cannot remove a folder the hub still holds.
+    if (cwd && normalizePathForMatch(cwd).startsWith(base) && await folderIsEmptyOrGone(cwd)) {
+      if (activeWorktreeRuns !== 1) return;
+      await killTreeAndWait(pid);
     }
-    await sweepEmptyWorktreeFolders();
+  }
+  for await (const folders of emptyWorktreeFolders(WORKTREE_BASE)) {
+    for (const folder of folders) {
+      if (activeWorktreeRuns !== 1) return;
+      // rmdir also checks at removal time: a file created since the sweep must survive.
+      await rmdir(folder).catch(() => {});
+    }
   }
 }
 
@@ -200,6 +216,16 @@ export async function askClineWorkspace(
   signal?: AbortSignal,
   options: Partial<ClineInvocationOptions> = {}
 ): Promise<ClineResponse> {
+  activeWorktreeRuns++;
+  try {
+    return await runWorkspace(input, signal, options);
+  } finally {
+    activeWorktreeRuns--;
+  }
+}
+
+async function runWorkspace(input: AskClineWorkspaceInput, signal: AbortSignal | undefined,
+  options: Partial<ClineInvocationOptions>): Promise<ClineResponse> {
   const requestedCwd = path.resolve(input.cwd);
   let repositoryRoot: string;
   let commit: string;
@@ -251,8 +277,6 @@ export async function askClineWorkspace(
   let runError: unknown;
   try {
     await ensureNeutralHub(options);
-    activeWorktreeRuns++;
-    try {
     result = await runCline(
       { ...input, cwd: runCwd },
       signal,
@@ -265,9 +289,6 @@ export async function askClineWorkspace(
         model: input.model
       }, signal)
     );
-    } finally {
-      activeWorktreeRuns--;
-    }
   } catch (err) {
     runError = err;
   }

@@ -244,6 +244,8 @@ export interface ClineInvocationOptions {
   hubEnv?: Record<string, string>;
   /** Internal: starts this run's hub on first use and returns its environment (set by runCline). */
   hubProvider?: () => Promise<Record<string, string> | undefined>;
+  /** Internal: called once Cline was actually launched with the hub environment (set by runCline). */
+  onLaunched?: () => void;
   /** Map preparation is part of the run's existing total deadline. */
   preparationMs?: number;
   codeMapSource?: CodeMapSource;
@@ -551,6 +553,11 @@ export function hasMadeToolCallsOrModifications(stdout: string): boolean {
   return false;
 }
 
+function isToolEvent(event?: { type?: unknown; contentType?: unknown }): boolean {
+  return typeof event?.type === "string" &&
+    (event.type.toLowerCase().includes("tool") || (event.type === "content_start" && event.contentType === "tool"));
+}
+
 async function validateCwd(cwd: string | undefined, accessFn?: typeof access): Promise<string | undefined> {
   if (!cwd) return undefined;
   const resolved = path.resolve(cwd);
@@ -655,8 +662,8 @@ export interface HubStopDeps {
   isListening?: (port: number) => Promise<boolean>;
   /** True when the hub wrote its discovery record, i.e. it started even if the port probe misses it. */
   hubStarted?: () => Promise<boolean>;
-  /** Runs `cline hub stop` for this hub's discovery record. */
-  runHubStop?: () => Promise<void>;
+  /** Runs `cline hub stop` for this hub's discovery record. False signals a failed stop. */
+  runHubStop?: () => Promise<boolean | void>;
   listProcesses?: typeof listClineProcesses;
   killTree?: (pid: number) => Promise<unknown>;
   removeFiles?: () => Promise<void>;
@@ -672,19 +679,17 @@ export function loopbackPortListening(port: number, timeoutMs = 1_500): Promise<
   });
 }
 
-/**
- * Stop a per-run hub only as far as needed (plan S6, B6): a hub that never started (no discovery record and
- * nothing listening on its port) costs nothing; `hub stop` runs only for a hub that started; the ~1 s
- * PowerShell process scan runs only when the hub is still listening after `hub stop`.
- */
+/** Stop a detected hub and fall back to a Windows process scan if the stop fails or the port stays open. */
 export async function stopDedicatedHub(port: number, deps: HubStopDeps): Promise<void> {
   const isListening = deps.isListening ?? loopbackPortListening;
+  const hubDetected = async () => (await deps.hubStarted?.()) || isListening(port);
   try {
-    // Either sign means the hub started; a slow probe alone must never leave a live hub behind.
-    if (!await (deps.hubStarted?.() ?? Promise.resolve(false)) && !await isListening(port)) return;
-    await deps.runHubStop?.();
-    // Safety net: never leave this run's hub behind, even when `hub stop` did not stop it.
-    if (process.platform === "win32" && await isListening(port)) {
+    if (!await hubDetected()) {
+      await new Promise(resolve => setTimeout(resolve, 300));
+      if (!await hubDetected()) return;
+    }
+    const stopped = await deps.runHubStop?.();
+    if (process.platform === "win32" && (stopped === false || await isListening(port))) {
       const listProcesses = deps.listProcesses ?? listClineProcesses;
       for (const pid of hubDaemonPidsOnPort(port, await listProcesses())) await (deps.killTree ?? killTreeAndWait)(pid);
     }
@@ -703,22 +708,23 @@ export async function stopDedicatedHub(port: number, deps: HubStopDeps): Promise
 async function dedicatedHub(options: ClineInvocationOptions): Promise<DedicatedHub | undefined> {
   if (options.hubEnv || options.deps?.spawn || options.deps?.entryPath) return undefined;
   const entry = resolveClineEntry();
+  if (!entry) return undefined;
   const port = await freeLoopbackPort();
-  if (!entry || port === undefined) return undefined;
-  await mkdir(DEDICATED_HUB_BASE, { recursive: true }).catch(() => {});
+  if (port === undefined) throw new Error("No free loopback port.");
+  await mkdir(DEDICATED_HUB_BASE, { recursive: true });
   const discovery = path.join(DEDICATED_HUB_BASE, `hub-${randomUUID()}.json`);
   const env = { CLINE_HUB_DISCOVERY_PATH: discovery, CLINE_HUB_PORT: String(port) };
   const stop = () => stopDedicatedHub(port, {
     hubStarted: () => access(discovery).then(() => true, () => false),
-    runHubStop: () => new Promise<void>((resolve) => {
+    runHubStop: () => new Promise<boolean>((resolve) => {
       const child = spawn(process.execPath, [entry, "hub", "stop"], {
         cwd: os.homedir(), windowsHide: true, stdio: "ignore", env: { ...process.env, ...env }
       });
-      const timer = setTimeout(() => { try { child.kill(); } catch { /* gone */ } resolve(); }, 20_000);
+      const timer = setTimeout(() => { try { child.kill(); } catch { /* gone */ } resolve(false); }, 20_000);
       timer.unref?.();
-      child.on("error", () => { clearTimeout(timer); resolve(); });
-      child.on("close", () => { clearTimeout(timer); resolve(); });
-    }),
+      child.once("error", () => { clearTimeout(timer); resolve(false); });
+      child.once("close", code => { clearTimeout(timer); resolve(code === 0); });
+    }).catch(() => false),
     removeFiles: async () => {
       for (const file of [discovery, `${discovery}.instance.lock`]) {
         await rm(file, { force: true, maxRetries: 3, retryDelay: 200 }).catch(() => {});
@@ -737,13 +743,30 @@ export async function runCline(
   // The hub starts only when Cline is about to launch (plan S6, B6): a call refused before launch (quota
   // lock, bad cwd, cancel) starts and stops nothing.
   const startHub = options.deps?.startHub ?? dedicatedHub;
-  let hub: Promise<DedicatedHub | undefined> | undefined;
-  const hubProvider = async () => (await (hub ??= startHub(options).catch(() => undefined)))?.env;
+  let started: DedicatedHub | undefined;
+  let hubEnv: Promise<Record<string, string> | undefined> | undefined;
+  const hubProvider = () => hubEnv ??= startHub(options).then(hub => {
+    started = hub;
+    return hub?.env;
+  });
+  // Cline starts its hub on demand: if Cline never launched, no hub exists and stopping it would only cost time.
+  let launched = false;
+  let result: ClineResponse | undefined;
+  let runError: unknown;
   try {
-    return await runClineInner(input, signal, { ...options, hubProvider });
+    result = await runClineInner(input, signal, { ...options, hubProvider, onLaunched: () => { launched = true; } });
+    return result;
+  } catch (error) {
+    runError = error;
+    throw error;
   } finally {
-    const started = await hub;
-    await started?.stop();
+    try {
+      if (launched) await started?.stop();
+    } catch (error) {
+      const note = redactSecrets(`Failed to stop the dedicated Cline hub: ${error instanceof Error ? error.message : String(error)}`);
+      if (result) (result.warnings ??= []).push(note);
+      else if (runError instanceof ClineRunError) (runError.notes ??= []).push(note);
+    }
   }
 }
 
@@ -904,6 +927,17 @@ async function runClineCore(input: AskClineInput, signal: AbortSignal | undefine
       const maxAttempts = Math.max(1, options.maxAttempts ?? 2);
       let attempt = 0;
 
+      function remainingLaunchBudgetMs(): number {
+        if (signal?.aborted) {
+          throw new ClineRunError("cancelled", "The Cline request was cancelled.", { attempts: attempt - 1 });
+        }
+        const remaining = getRemainingBudgetMs();
+        if (remaining <= 0) {
+          throw new ClineRunError("timeout", `Cline exceeded the ${timeoutSeconds}-second timeout.`, { attempts: attempt - 1 });
+        }
+        return remaining;
+      }
+
       while (attempt < maxAttempts) {
         attempt++;
 
@@ -937,15 +971,10 @@ async function runClineCore(input: AskClineInput, signal: AbortSignal | undefine
           }
         }
 
-        const remainingBeforeAttempt = getRemainingBudgetMs();
-        if (remainingBeforeAttempt <= 0) {
-          throw new ClineRunError("timeout", `Cline exceeded the ${timeoutSeconds}-second timeout.`, { attempts: attempt - 1 });
-        }
-
         // Every attempt may use all the time left (plan S6, B1): a 60/40 split killed slow but healthy first
         // attempts at 60%. A retry happens only when an attempt fails early enough to leave minRetryBudgetMs.
-        const effectiveAttemptBudgetMs = remainingBeforeAttempt;
-        const attemptTimeoutSeconds = Math.max(1, Math.floor(effectiveAttemptBudgetMs / 1000));
+        const effectiveAttemptBudgetMs = remainingLaunchBudgetMs();
+        const attemptTimeoutSeconds = Math.max(1, Math.ceil(effectiveAttemptBudgetMs / 1000));
         const attemptTimerMs = deps.timeoutMs !== undefined
           ? Math.min(deps.timeoutMs, effectiveAttemptBudgetMs)
           : effectiveAttemptBudgetMs;
@@ -974,7 +1003,6 @@ async function runClineCore(input: AskClineInput, signal: AbortSignal | undefine
           }
         }
 
-        if (getRemainingBudgetMs() <= 0) throw new ClineRunError("timeout", "Cline exceeded the global deadline.", { attempts: attempt - 1 });
         const started = nowFn();
         let stdout = "";
         let stderr = "";
@@ -984,7 +1012,8 @@ async function runClineCore(input: AskClineInput, signal: AbortSignal | undefine
         const guard = createGuard(options.guard ?? effectiveInput.guard);
         guards.push(guard);
         // Never repeat an attempt whose model already ran tools (plan S6, B1): its work may be half done.
-        const canRetry = options.canRetry ?? (() => guard.snapshot().totalToolCalls === 0);
+        let toolActivity = false;
+        const canRetry = options.canRetry ?? (() => !toolActivity && guard.snapshot().totalToolCalls === 0);
         const guardState: { verdict: GuardVerdict | null } = { verdict: null };
         let terminateChild!: (reason: "timeout" | "cancelled" | "guard") => void;
         const splitter = new LineSplitter(
@@ -994,6 +1023,7 @@ async function runClineCore(input: AskClineInput, signal: AbortSignal | undefine
             try {
               const parsed = JSON.parse(line.trim());
               if (parsed && typeof parsed === "object") {
+                toolActivity ||= isToolEvent(parsed) || isToolEvent(parsed.event);
                 const verdict = guard.observe(parsed);
                 if (verdict) {
                   guardState.verdict = verdict;
@@ -1008,12 +1038,23 @@ async function runClineCore(input: AskClineInput, signal: AbortSignal | undefine
               }
             } catch {}
           },
-          () => recorder?.oversizedLine(thisAttempt)
+          () => {
+            toolActivity = true;
+            recorder?.oversizedLine(thisAttempt);
+          }
         );
         let timedOut = false;
         let cancelled = false;
 
-        const hubEnv = options.hubEnv ?? (options.hubProvider ? await options.hubProvider() : undefined);
+        remainingLaunchBudgetMs();
+        let hubEnv: Record<string, string> | undefined;
+        try {
+          hubEnv = options.hubEnv ?? await options.hubProvider?.();
+        } catch (error) {
+          throw new ClineRunError("launch_failed",
+            redactSecrets(`Failed to start the dedicated Cline hub: ${error instanceof Error ? error.message : String(error)}`),
+            { attempts: attempt - 1 });
+        }
         const spawnFn = deps.spawn ?? spawn;
         const env = {
           ...process.env,
@@ -1021,10 +1062,7 @@ async function runClineCore(input: AskClineInput, signal: AbortSignal | undefine
           ...(hubEnv ?? {})
         };
 
-        // A cancel that arrived during the awaits above (entry access, budget checks) must stop the launch.
-        if (signal?.aborted) {
-          throw new ClineRunError("cancelled", "The Cline request was cancelled.", { attempts: attempt - 1 });
-        }
+        remainingLaunchBudgetMs();
         const execPromise = new Promise<{ code: number | null; signal: NodeJS.Signals | null; error?: any; processesStillAlive?: number[]; killUnverified?: boolean }>((resolve) => {
           let settled = false;
           let terminating = false;
@@ -1172,6 +1210,7 @@ async function runClineCore(input: AskClineInput, signal: AbortSignal | undefine
 
           // Only a real child process gets the confirmed tree kill; a fake child's PID may belong to an unrelated process.
           hasRealPid = child instanceof ChildProcess && Number.isInteger(child.pid) && (child.pid as number) > 0;
+          options.onLaunched?.();
           if (typeof child.pid === "number") recorder?.processStarted(child.pid);
 
           child.stdout?.on("data", (chunk: Buffer | string) => {

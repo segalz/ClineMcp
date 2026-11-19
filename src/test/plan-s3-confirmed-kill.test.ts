@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import test, { after } from "node:test";
 import { spawnSync } from "node:child_process";
 import { existsSync, readFileSync } from "node:fs";
-import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { runCline, ClineRunError, defaultKillTree } from "../runner.js";
@@ -13,11 +13,25 @@ import { runCline, ClineRunError, defaultKillTree } from "../runner.js";
 // run settles, so the write never lands after the restore.
 
 const root = await mkdtemp(path.join(os.tmpdir(), "cline-s3-test-"));
-const spawnedPids: number[] = [];
+const spawnedProcesses: { pid: number; beat: string }[] = [];
+
+async function heartbeatGrowing(beat: string): Promise<boolean> {
+  const before = await stat(beat).catch(() => undefined);
+  if (!before) return false;
+  await sleep(150);
+  const after = await stat(beat).catch(() => undefined);
+  return after !== undefined && after.size > before.size;
+}
+
 after(async () => {
-  for (const pid of spawnedPids) {
-    if (process.platform === "win32") spawnSync("taskkill", ["/PID", String(pid), "/T", "/F"], { stdio: "ignore", windowsHide: true });
-    else { try { process.kill(pid, "SIGKILL"); } catch { /* gone */ } }
+  // Check each heartbeat after the previous taskkill: killing a root can also stop its child.
+  for (const { pid, beat } of spawnedProcesses) {
+    if (!await heartbeatGrowing(beat)) continue;
+    if (process.platform === "win32") {
+      const stopped = spawnSync("taskkill", ["/PID", String(pid), "/T", "/F"], { stdio: "ignore", windowsHide: true });
+      if (stopped.status === 0 || !await heartbeatGrowing(beat)) continue;
+    }
+    try { process.kill(pid, "SIGKILL"); } catch { /* gone */ }
   }
   await rm(root, { recursive: true, force: true }).catch(() => {});
 });
@@ -67,15 +81,15 @@ async function fakeCli(dir: string, writeAfterMs: number, rootExitsAfterMs?: num
   return { entryPath, pidsPath, trackedPath, rootBeat, childBeat };
 }
 
-async function readPids(pidsPath: string): Promise<{ root: number; child: number }> {
+async function readPids(pidsPath: string, rootBeat: string, childBeat: string): Promise<{ root: number; child: number }> {
   const pids = JSON.parse(await readFile(pidsPath, "utf8"));
-  spawnedPids.push(pids.root, pids.child);
+  spawnedProcesses.push({ pid: pids.root, beat: rootBeat }, { pid: pids.child, beat: childBeat });
   return pids;
 }
 
 test("S3: a timed-out run settles only after the whole CLI tree is dead, even when the first kill is ignored", { timeout: 60_000 }, async () => {
   const dir = await mkdtemp(path.join(root, "case-"));
-  const timeoutMs = 3_000;
+  const timeoutMs = 6_000; // startup alone can take seconds under full-suite load
   const { entryPath, pidsPath, trackedPath, rootBeat, childBeat } = await fakeCli(dir, timeoutMs + 250);
   const settingsPath = path.join(dir, "providers.json");
   await writeFile(settingsPath, JSON.stringify({ lastUsedProvider: "cline", providers: {} }));
@@ -95,7 +109,7 @@ test("S3: a timed-out run settles only after the whole CLI tree is dead, even wh
   await assert.rejects(work, (error: unknown) => error instanceof ClineRunError && error.kind === "timeout");
   const settledAt = Date.now();
 
-  const pids = await readPids(pidsPath);
+  const pids = await readPids(pidsPath, rootBeat, childBeat);
   await assertSilent([rootBeat, childBeat], "the CLI tree must be dead when the run settles");
   assert.ok(killCalls >= 2, "an ignored kill must be retried until the tree is confirmed dead");
 
@@ -106,7 +120,7 @@ test("S3: a timed-out run settles only after the whole CLI tree is dead, even wh
 
 test("S3: a timed-out run with budget to spare still confirms the tree is dead before it settles", { timeout: 60_000 }, async () => {
   const dir = await mkdtemp(path.join(root, "case-"));
-  const timeoutMs = 3_000;
+  const timeoutMs = 6_000; // startup alone can take seconds under full-suite load
   const { entryPath, pidsPath, trackedPath, rootBeat, childBeat } = await fakeCli(dir, timeoutMs + 250);
   const settingsPath = path.join(dir, "providers.json");
   await writeFile(settingsPath, JSON.stringify({ lastUsedProvider: "cline", providers: {} }));
@@ -124,7 +138,7 @@ test("S3: a timed-out run with budget to spare still confirms the tree is dead b
   await assert.rejects(work, (error: unknown) => error instanceof ClineRunError && error.kind === "timeout");
   const settledAt = Date.now();
 
-  const pids = await readPids(pidsPath);
+  const pids = await readPids(pidsPath, rootBeat, childBeat);
   await assertSilent([rootBeat, childBeat], "the CLI tree must be dead when the run settles");
   await sleep(timeoutMs);
   assertNoWriteAfter(trackedPath, settledAt, "no write may land after the run settled");
@@ -132,7 +146,7 @@ test("S3: a timed-out run with budget to spare still confirms the tree is dead b
 
 test("S3 review: a child left behind by an exited root is found and killed; the exited root's PID is never killed", { timeout: 60_000 }, async () => {
   const dir = await mkdtemp(path.join(root, "case-"));
-  const timeoutMs = 3_000;
+  const timeoutMs = 6_000; // startup alone can take seconds under full-suite load
   const { entryPath, pidsPath, trackedPath, rootBeat, childBeat } = await fakeCli(dir, timeoutMs + 250, 300);
   const settingsPath = path.join(dir, "providers.json");
   await writeFile(settingsPath, JSON.stringify({ lastUsedProvider: "cline", providers: {} }));
@@ -151,7 +165,7 @@ test("S3 review: a child left behind by an exited root is found and killed; the 
   await assert.rejects(work, (error: unknown) => error instanceof ClineRunError);
   const settledAt = Date.now();
 
-  const pids = await readPids(pidsPath);
+  const pids = await readPids(pidsPath, rootBeat, childBeat);
   await assertSilent([childBeat], "the orphaned child must be dead when the run settles");
   if (process.platform === "win32") assert.equal(killCalls, 0, "the root had exited: its PID may belong to another process now");
   await sleep(timeoutMs);
