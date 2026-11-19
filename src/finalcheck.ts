@@ -174,7 +174,7 @@ export class FinalCheckLifecycle {
         if (workDir === undefined) throw new ClineRunError("workspace_not_git", "The requested cwd is not inside its Git checkout.");
         this.workDir = workDir;
         this.lock = ownsCheckoutLock(this.deps.checkoutLock, this.root) ? this.deps.checkoutLock
-          : acquire(this.root, { lockDirectory: this.deps.lockDirectory });
+          : await acquire(this.root, { lockDirectory: this.deps.lockDirectory });
         this.releaseOwnLock = this.lock !== this.deps.checkoutLock;
       }
       // A check that cannot even start makes the run pointless: refuse before the snapshot and any launch.

@@ -40,12 +40,12 @@ test("orphaned reaper metadata and incomplete dead claims are reclaimed; live re
   `, file], { encoding: "utf8", windowsHide: true, timeout: 10_000 });
   assert.equal(orphan.status, 0, orphan.stderr);
   const staleMetadata = await readFile(file, "utf8");
-  const release = acquire(root, { lockDirectory: locks }); release();
+  const release = await acquire(root, { lockDirectory: locks }); release();
   await assert.rejects(readFile(file + ".reap"), { code: "ENOENT" });
   assert.deepEqual(fs.readdirSync(file + ".reap-claims"), []);
   await writeFile(file, staleMetadata);
   await writeFile(file + ".reap", JSON.stringify({ pid: process.pid, time: new Date().toISOString() }));
-  assert.throws(() => acquire(root, { lockDirectory: locks }), busy);
+  await assert.rejects(acquire(root, { lockDirectory: locks }), busy);
   assert.equal(await readFile(file, "utf8"), staleMetadata);
 });
 
@@ -62,11 +62,11 @@ test("failed lock writes close the descriptor before Windows-style unlink cleanu
     originalUnlink(target); unlinked = true;
   });
   syncBuiltinESMExports();
-  try { assert.throws(() => acquire(root, { lockDirectory: locks }), error => error === injected); }
+  try { await assert.rejects(acquire(root, { lockDirectory: locks }), error => error === injected); }
   finally { t.mock.restoreAll(); syncBuiltinESMExports(); }
   assert.equal(closed, true); assert.equal(unlinked, true);
   await assert.rejects(readFile(file), { code: "ENOENT" });
-  const release = acquire(root, { lockDirectory: locks }); release();
+  const release = await acquire(root, { lockDirectory: locks }); release();
 });
 async function until(check: () => Promise<boolean>) {
   // Whole-suite parallel Git/process work can delay a fake runner before it is scheduled.
@@ -81,17 +81,17 @@ test("canonical path aliases share one writer, releases are idempotent and repla
   const { base, root, locks } = await fixture(t);
   const alias = path.join(base, "alias");
   await symlink(root, alias, process.platform === "win32" ? "junction" : "dir");
-  const release = acquire(root, { lockDirectory: locks });
+  const release = await acquire(root, { lockDirectory: locks });
   t.after(release);
   assert.equal(ownsCheckoutLock(release, alias), true);
-  assert.throws(() => acquire(alias, { lockDirectory: locks }), busy);
+  await assert.rejects(acquire(alias, { lockDirectory: locks }), busy);
   const file = checkoutLockPath(root, locks);
   const holder = JSON.parse(await readFile(file, "utf8"));
   assert.equal(holder.pid, process.pid); assert.ok(Number.isFinite(Date.parse(holder.time)));
   release(); release();
   assert.equal(ownsCheckoutLock(release, root), false);
-  const next = acquire(alias, { lockDirectory: locks });
-  release(); assert.throws(() => acquire(root, { lockDirectory: locks }), busy);
+  const next = await acquire(alias, { lockDirectory: locks });
+  release(); await assert.rejects(acquire(root, { lockDirectory: locks }), busy);
   await writeFile(file, JSON.stringify({ pid: process.pid, token: "external" }));
   next(); assert.equal(JSON.parse(await readFile(file, "utf8")).token, "external");
 });
@@ -100,13 +100,13 @@ test("cross-process contention and a dead holder's stale lock", async t => {
   const { root, locks } = await fixture(t);
   const moduleUrl = new URL("../checkoutlock.js", import.meta.url).href;
   const child = (source: string) => spawnSync(process.execPath, ["--input-type=module", "-e", source, root, locks], { encoding: "utf8", windowsHide: true, timeout: 10_000 });
-  const release = acquire(root, { lockDirectory: locks });
-  const result = child(`import { acquire } from ${JSON.stringify(moduleUrl)}; try { acquire(process.argv[1], {lockDirectory:process.argv[2]}); process.exit(2); } catch(e) { if(e.kind !== 'checkout_busy') throw e; console.log(e.kind); }`);
+  const release = await acquire(root, { lockDirectory: locks });
+  const result = child(`import { acquire } from ${JSON.stringify(moduleUrl)}; try { await acquire(process.argv[1], {lockDirectory:process.argv[2]}); process.exit(2); } catch(e) { if(e.kind !== 'checkout_busy') throw e; console.log(e.kind); }`);
   assert.equal(result.status, 0, result.stderr); assert.match(result.stdout, /checkout_busy/);
   release();
-  const stale = child(`import { acquire } from ${JSON.stringify(moduleUrl)}; acquire(process.argv[1], {lockDirectory:process.argv[2]});`);
+  const stale = child(`import { acquire } from ${JSON.stringify(moduleUrl)}; await acquire(process.argv[1], {lockDirectory:process.argv[2]});`);
   assert.equal(stale.status, 0, stale.stderr);
-  const next = acquire(root, { lockDirectory: locks }); next();
+  const next = await acquire(root, { lockDirectory: locks }); next();
   await assert.rejects(readFile(checkoutLockPath(root, locks)), { code: "ENOENT" });
 });
 
@@ -115,13 +115,13 @@ test("live and incomplete file locks are busy, regardless of their age", async t
   const file = checkoutLockPath(root, locks);
   for (const content of [JSON.stringify({ pid: process.pid, time: "1900-01-01" }), "", "{", JSON.stringify({ pid: -1 })]) {
     await writeFile(file, content);
-    assert.throws(() => acquire(root, { lockDirectory: locks }), busy);
+    await assert.rejects(acquire(root, { lockDirectory: locks }), busy);
   }
 });
 
 test("sync edits refuses a held checkout before launching Cline", async t => {
   const { root, locks } = await fixture(t);
-  const release = acquire(root, { lockDirectory: locks }); t.after(release);
+  const release = await acquire(root, { lockDirectory: locks }); t.after(release);
   await mkdir(path.join(root, "subdir"));
   await assert.rejects(applyClineEdits({ cwd: path.join(root, "subdir"), prompt: "edit", provider: "p", model: "m", verify: { none: true as const, reason: "Lock behavior fixture" } }, undefined,
     { checkoutLockDirectory: locks }), busy);
@@ -140,7 +140,7 @@ test("async edits retains its lock across waiting and resume, blocks sync/async 
   assert.ok(ownsCheckoutLock(lease, root));
   runs[0].resolve({ text: "QUESTION: Continue?", durationMs: 1 });
   await until(async () => (await manager.status(first.taskId, 0)).state === "input_required");
-  assert.throws(() => acquire(root, { lockDirectory: locks }), busy);
+  await assert.rejects(acquire(root, { lockDirectory: locks }), busy);
   await assert.rejects(applyClineEdits(input, undefined, { checkoutLockDirectory: locks }), busy);
   const second = manager.start(input);
   await until(async () => (await manager.status(second.taskId, 0)).state === "failed");
@@ -150,7 +150,7 @@ test("async edits retains its lock across waiting and resume, blocks sync/async 
   await until(async () => runs.length === 2); assert.equal(runs[1].options.checkoutLock, lease);
   runs[1].resolve({ text: "done", durationMs: 1 });
   await until(async () => (await manager.status(first.taskId, 0)).state === "done");
-  const release = acquire(root, { lockDirectory: locks }); release();
+  const release = await acquire(root, { lockDirectory: locks }); release();
 });
 
 test("async edits releases on runner failure, waiting cancellation, shutdown and active abort", async t => {
@@ -174,7 +174,7 @@ test("async edits releases on runner failure, waiting cancellation, shutdown and
       await until(async () => (await manager.status(task.taskId, 0)).state === "input_required");
       if (action === "shutdown-wait") await manager.shutdown(30_000); else await manager.cancel(task.taskId);
     }
-    const release = acquire(root, { lockDirectory: locks }); release();
+    const release = await acquire(root, { lockDirectory: locks }); release();
     await manager.shutdown();
   }
 });

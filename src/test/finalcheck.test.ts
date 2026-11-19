@@ -144,7 +144,7 @@ test("async exhausted verification waits with retained edits; restore, keep and 
     assert.equal("plan" in waiting, false); assert.equal("outcome" in waiting, false);
     assert.equal(waiting.waitReason, "verify_failed"); assert.equal(waiting.verification?.fixRuns, 1);
     assert.equal((await f.manager.result(task.taskId)).log_run_hint, null);
-    assert.throws(() => acquire(f.cwd, { lockDirectory: f.locks }));
+    await assert.rejects(acquire(f.cwd, { lockDirectory: f.locks }));
     await f.manager.send(task.taskId, "Use the failing test", action);
     if (action === "retry") { const repair = await f.launched(3); assert.match(repair.input.prompt, /Use the failing test/); await f.put("pass"); repair.finish(); }
     const done = await f.wait(task.taskId, "done");
@@ -152,7 +152,7 @@ test("async exhausted verification waits with retained edits; restore, keep and 
     const result = await f.manager.result(task.taskId); assert.equal(result.log_run_hint?.ok, action === "retry");
     assert.equal("plan" in result, false); assert.equal("outcome" in result, false);
     if (action === "restore") await f.clean(); else assert.equal(await f.bytes(), action === "retry" ? "pass" : "failed");
-    const release = acquire(f.cwd, { lockDirectory: f.locks }); release(); assert.deepEqual(await readdir(f.snapshots), []);
+    const release = await acquire(f.cwd, { lockDirectory: f.locks }); release(); assert.deepEqual(await readdir(f.snapshots), []);
   }
 });
 

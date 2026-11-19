@@ -1,6 +1,7 @@
-import { spawnSync } from "node:child_process";
+import { execFile } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
 import { closeSync, existsSync, linkSync, mkdirSync, openSync, readFileSync, readdirSync, realpathSync, unlinkSync, writeFileSync } from "node:fs";
+import { readFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { ClineRunError } from "./runner.js";
@@ -14,6 +15,7 @@ export class CheckoutBusyError extends ClineRunError {
 
 export type CheckoutRelease = (() => void) & { readonly checkoutRoot: string };
 const held = new Map<string, CheckoutRelease>();
+const acquiring = new Set<string>();
 
 export function canonicalCheckoutPath(checkoutRoot: string): string {
   const resolved = realpathSync(checkoutRoot);
@@ -27,48 +29,94 @@ export function checkoutLockPath(checkoutRoot: string, lockDirectory = path.join
 function pidIsGone(pid: number): boolean {
   if (!Number.isSafeInteger(pid) || pid <= 0) return false;
   try { process.kill(pid, 0); }
-  catch (error) { return (error as NodeJS.ErrnoException).code === "ESRCH"; }
+  catch (error) {
+    const code = (error as NodeJS.ErrnoException).code;
+    // ESRCH: PID does not exist. EPERM: PID belongs to another user or a protected/system process, not a bridge of ours.
+    return code === "ESRCH" || code === "EPERM";
+  }
   return false;
 }
 
-/** Start time of a live process in ms, or undefined when it cannot be read (then nothing is reclaimed). */
-export function processStartMs(pid: number): number | undefined {
+function execFileText(command: string, args: string[], timeout = 10_000): Promise<{ ok: boolean; stdout: string }> {
+  return new Promise(resolve => {
+    execFile(command, args, { encoding: "utf8", windowsHide: true, timeout }, (error, stdout) => {
+      resolve({ ok: !error, stdout: stdout ?? "" });
+    });
+  });
+}
+
+async function readProcessStartMs(pid: number): Promise<number | "denied" | undefined> {
+  if (!Number.isSafeInteger(pid) || pid <= 0) return undefined;
   try {
     if (process.platform === "win32") {
-      const out = spawnSync("powershell.exe", ["-NoProfile", "-NonInteractive", "-Command",
-        `$p = Get-Process -Id ${pid} -ErrorAction Stop; $p.StartTime.ToUniversalTime().ToString('o')`],
-        { encoding: "utf8", windowsHide: true, timeout: 10_000 });
-      const ms = out.status === 0 ? Date.parse(out.stdout.trim()) : NaN;
+      // Call get_StartTime() directly so Win32 ERROR_ACCESS_DENIED (5) surfaces instead of PowerShell yielding $null.
+      const command =
+        `try { [System.Diagnostics.Process]::GetProcessById(${pid}).get_StartTime().ToUniversalTime().ToString('o') } ` +
+        `catch { $e = $_.Exception; while ($e) { ` +
+        `if (($e -is [System.ComponentModel.Win32Exception] -and $e.NativeErrorCode -eq 5) -or $e -is [System.UnauthorizedAccessException]) { Write-Output 'ACCESS_DENIED'; exit 0 }; ` +
+        `$e = $e.InnerException }; exit 1 }`;
+      const out = await execFileText("powershell.exe", ["-NoProfile", "-NonInteractive", "-Command", command], 10_000);
+      if (!out.ok) return undefined;
+      const text = out.stdout.trim();
+      if (text === "ACCESS_DENIED") return "denied";
+      const ms = Date.parse(text);
       return Number.isFinite(ms) ? ms : undefined;
     }
     if (process.platform === "linux") {
-      const stat = readFileSync(`/proc/${pid}/stat`, "utf8");
+      let stat: string;
+      try { stat = await readFile(`/proc/${pid}/stat`, "utf8"); }
+      catch (error) {
+        const code = (error as NodeJS.ErrnoException).code;
+        if (code === "EACCES" || code === "EPERM") return "denied";
+        return undefined;
+      }
       const ticks = Number(stat.slice(stat.lastIndexOf(")") + 2).split(" ")[19]);
-      const boot = Number(/^btime (\d+)$/m.exec(readFileSync("/proc/stat", "utf8"))?.[1]);
-      const hz = Number(spawnSync("getconf", ["CLK_TCK"], { encoding: "utf8" }).stdout.trim()) || 100;
+      const boot = Number(/^btime (\d+)$/m.exec(await readFile("/proc/stat", "utf8"))?.[1]);
+      const getconf = await execFileText("getconf", ["CLK_TCK"], 10_000);
+      const hz = (getconf.ok ? Number(getconf.stdout.trim()) : NaN) || 100;
       return Number.isFinite(ticks) && Number.isFinite(boot) ? boot * 1000 + (ticks / hz) * 1000 : undefined;
     }
   } catch { /* unknown */ }
   return undefined;
 }
 
+/** Start time of a live process in ms, or undefined when it cannot be read (then nothing is reclaimed). */
+export async function processStartMs(pid: number): Promise<number | undefined> {
+  const result = await readProcessStartMs(pid);
+  return typeof result === "number" ? result : undefined;
+}
+
 /** Slack between the OS start time and the holder's own clock reading. */
 const START_TOLERANCE_MS = 5_000;
 
-/** A holder is dead when its PID is gone, or when that PID now belongs to a process started after the lock was
- * written (PID reuse). An unreadable start time keeps the lock busy: a live lock is never reclaimed by age. */
-export function holderIsDead(holder: { pid: unknown; time?: unknown }, startMs: (pid: number) => number | undefined = processStartMs): boolean {
-  const pid = Number(holder.pid);
+/** A holder is dead when its PID is gone or inaccessible (protected/other-user process), or when that PID now belongs
+ * to a process started after the lock was written (PID reuse). An unreadable start time otherwise keeps the lock busy:
+ * a live lock is never reclaimed by age. */
+export async function holderIsDead(
+  holder: { pid: unknown; time?: unknown },
+  startMs?: (pid: number) => number | undefined | Promise<number | undefined>
+): Promise<boolean> {
+  const pid = Number(holder?.pid);
   if (pidIsGone(pid)) return true;
   if (!Number.isSafeInteger(pid) || pid <= 0 || pid === process.pid) return false;
-  const written = typeof holder.time === "string" ? Date.parse(holder.time) : NaN;
+  const written = typeof holder?.time === "string" ? Date.parse(holder.time) : NaN;
   if (!Number.isFinite(written)) return false;
-  const started = startMs(pid);
-  return started !== undefined && started > written + START_TOLERANCE_MS;
+  if (!startMs || startMs === processStartMs) {
+    const result = await readProcessStartMs(pid);
+    if (result === "denied") return true;
+    return result !== undefined && result > written + START_TOLERANCE_MS;
+  }
+  try {
+    const started = await startMs(pid);
+    return started !== undefined && started > written + START_TOLERANCE_MS;
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException | undefined)?.code;
+    return code === "EACCES" || code === "EPERM";
+  }
 }
 
-function deadHolder(file: string): boolean {
-  try { return holderIsDead(JSON.parse(readFileSync(file, "utf8"))); }
+async function deadHolder(file: string): Promise<boolean> {
+  try { return await holderIsDead(JSON.parse(readFileSync(file, "utf8"))); }
   catch { /* An incomplete or unreadable lock is busy, never stale by age alone. */ }
   return false;
 }
@@ -86,7 +134,7 @@ function createHolder(file: string, token: string): void {
 
 /** Unique claims cannot be replaced while being inspected. Refuse if another live claimant exists.
  * Keeping our claim through the critical section prevents two stale-reaper recoverers from both entering. */
-function claimReclamation(file: string, token: string, root: string): { file: string; release: () => void } {
+async function claimReclamation(file: string, token: string, root: string): Promise<{ file: string; release: () => void }> {
   const directory = file + ".reap-claims";
   mkdirSync(directory, { recursive: true });
   const own = `${process.pid}-${token}.json`;
@@ -96,7 +144,7 @@ function claimReclamation(file: string, token: string, root: string): { file: st
     for (const name of readdirSync(directory)) {
       if (name === own) continue;
       const pid = /^(\d+)-[a-f0-9-]+\.json$/i.exec(name)?.[1];
-      if (!pid || !(pidIsGone(Number(pid)) || deadHolder(path.join(directory, name)))) throw new CheckoutBusyError(root);
+      if (!pid || !(pidIsGone(Number(pid)) || await deadHolder(path.join(directory, name)))) throw new CheckoutBusyError(root);
       // The pid is encoded before creation, so even a crash before writing metadata is recoverable.
       try { unlinkSync(path.join(directory, name)); }
       catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
@@ -106,55 +154,60 @@ function claimReclamation(file: string, token: string, root: string): { file: st
 }
 
 /** Exclusive across this process and bridge processes. Callers pass the Git checkout root. */
-export function acquire(checkoutRoot: string, options: { lockDirectory?: string } = {}): CheckoutRelease {
+export async function acquire(checkoutRoot: string, options: { lockDirectory?: string } = {}): Promise<CheckoutRelease> {
   const root = canonicalCheckoutPath(checkoutRoot);
-  if (held.has(root)) throw new CheckoutBusyError(root);
-  const file = checkoutLockPath(root, options.lockDirectory);
-  mkdirSync(path.dirname(file), { recursive: true });
-  const token = randomUUID();
-  const create = () => createHolder(file, token);
-  try { create(); }
-  catch (error) {
-    if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
-    if (!deadHolder(file)) throw new CheckoutBusyError(root);
-    // Serialize reclaimers: none may unlink a newly created live lock after another reclaimed it.
-    const reaper = file + ".reap";
-    const claim = claimReclamation(file, token, root);
-    let reaperOwned = false;
-    try {
-      if (existsSync(reaper)) {
-        if (!deadHolder(reaper)) throw new CheckoutBusyError(root);
-        unlinkSync(reaper);
+  if (held.has(root) || acquiring.has(root)) throw new CheckoutBusyError(root);
+  acquiring.add(root);
+  try {
+    const file = checkoutLockPath(root, options.lockDirectory);
+    mkdirSync(path.dirname(file), { recursive: true });
+    const token = randomUUID();
+    const create = () => createHolder(file, token);
+    try { create(); }
+    catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+      if (!await deadHolder(file)) throw new CheckoutBusyError(root);
+      // Serialize reclaimers: none may unlink a newly created live lock after another reclaimed it.
+      const reaper = file + ".reap";
+      const claim = await claimReclamation(file, token, root);
+      let reaperOwned = false;
+      try {
+        if (existsSync(reaper)) {
+          if (!await deadHolder(reaper)) throw new CheckoutBusyError(root);
+          unlinkSync(reaper);
+        }
+        // Publish complete, closed metadata atomically; a crash cannot leave an empty .reap file.
+        try { linkSync(claim.file, reaper); reaperOwned = true; }
+        catch (err) {
+          if ((err as NodeJS.ErrnoException).code === "EEXIST") throw new CheckoutBusyError(root);
+          throw err;
+        }
+        if (!await deadHolder(file)) throw new CheckoutBusyError(root);
+        unlinkSync(file);
+        try { create(); }
+        catch (err) {
+          if ((err as NodeJS.ErrnoException).code === "EEXIST") throw new CheckoutBusyError(root);
+          throw err;
+        }
+      } finally {
+        try { if (reaperOwned) unlinkSync(reaper); }
+        finally { claim.release(); }
       }
-      // Publish complete, closed metadata atomically; a crash cannot leave an empty .reap file.
-      try { linkSync(claim.file, reaper); reaperOwned = true; }
-      catch (err) {
-        if ((err as NodeJS.ErrnoException).code === "EEXIST") throw new CheckoutBusyError(root);
-        throw err;
-      }
-      if (!deadHolder(file)) throw new CheckoutBusyError(root);
-      unlinkSync(file);
-      try { create(); }
-      catch (err) {
-        if ((err as NodeJS.ErrnoException).code === "EEXIST") throw new CheckoutBusyError(root);
-        throw err;
-      }
-    } finally {
-      try { if (reaperOwned) unlinkSync(reaper); }
-      finally { claim.release(); }
     }
+    const release: CheckoutRelease = Object.assign(() => {
+      if (held.get(root) !== release) return;
+      // Do not remove a lock replaced by an external actor.
+      try {
+        if (JSON.parse(readFileSync(file, "utf8")).token === token) unlinkSync(file);
+      } catch {
+        // An externally removed/replaced lock must not turn task cleanup into an unhandled rejection.
+      } finally { held.delete(root); }
+    }, { checkoutRoot: root });
+    held.set(root, release);
+    return release;
+  } finally {
+    acquiring.delete(root);
   }
-  const release: CheckoutRelease = Object.assign(() => {
-    if (held.get(root) !== release) return;
-    // Do not remove a lock replaced by an external actor.
-    try {
-      if (JSON.parse(readFileSync(file, "utf8")).token === token) unlinkSync(file);
-    } catch {
-      // An externally removed/replaced lock must not turn task cleanup into an unhandled rejection.
-    } finally { held.delete(root); }
-  }, { checkoutRoot: root });
-  held.set(root, release);
-  return release;
 }
 
 export function ownsCheckoutLock(release: CheckoutRelease | undefined, checkoutRoot: string): boolean {

@@ -12,7 +12,7 @@ await mkdir(root, { recursive: true });
 const deadline = Date.now() + 600_000;
 let release: CheckoutRelease;
 while (true) {
-  try { release = acquire(root, { lockDirectory: path.join(root, "locks") }); break; }
+  try { release = await acquire(root, { lockDirectory: path.join(root, "locks") }); break; }
   catch (error) {
     if (!(error instanceof CheckoutBusyError) || Date.now() >= deadline) throw error;
     await new Promise(resolve => setTimeout(resolve, 25));
