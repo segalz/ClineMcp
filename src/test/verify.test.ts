@@ -36,10 +36,11 @@ test("timeout and abort stop verification without a passing result", async t => 
   assert.equal((await runVerification(node("process.exit(0)"), root, controller.signal)).passed, false);
 });
 
-test("verification kills the tree on combined output above 1 MiB; tails stay under 8 KiB", async t => {
+// Large output no longer kills the check (plan S14 C6): plan-s14.test.ts covers a 2 MiB passing check.
+test("a hanging check with large output stops on its timeout; tails stay under 8 KiB", async t => {
   const root = await fixture(t);
-  const result = await runVerification(node('process.stdout.write("o".repeat(600000)); process.stderr.write("e".repeat(600000)); setInterval(() => {}, 1000);'), root);
-  assert.equal(result.passed, false); assert.equal(result.killedForOutput, true); assert.equal(result.timedOut, false);
+  const result = await runVerification(node('process.stdout.write("o".repeat(600000)); process.stderr.write("e".repeat(600000)); setInterval(() => {}, 1000);', 2), root);
+  assert.equal(result.passed, false); assert.equal(result.killedForOutput, false); assert.equal(result.timedOut, true);
   assert.ok(Buffer.byteLength(result.stdoutTail) <= 8192); assert.ok(Buffer.byteLength(result.stderrTail) <= 8192);
 });
 

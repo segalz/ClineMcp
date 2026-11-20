@@ -343,10 +343,15 @@ export function redactSecrets(text: string): string {
   );
 
   // 7. Key-value forms for token, key, secret, password (e.g. token: ..., secret = ..., password: ...):
-  // Redacts whole value up to whitespace/quote/comma/semicolon (covers JWT a.b.c)
+  // Redacts whole value up to whitespace/quote/comma/semicolon (covers JWT a.b.c),
+  // while keeping TypeScript/JS type annotations like `key: string` or `token: unknown[]`.
+  const typeKeyword = /^(?:string|number|boolean|bigint|symbol|object|unknown|any|never|void|undefined|null|true|false)(?:\[\])?$/;
   result = result.replace(
-    /\b(token|key|secret|password)\s*([:=]|\bis\b)\s*(?:(Bearer|Basic)\s+(?:<redacted>|[^\s"',;]+)|<redacted>|(?:"[^"]*"|'[^']*')|[^\s"',;]+)/gi,
-    (match, keyName, sep, scheme) => {
+    /\b(token|key|secret|password)\s*([:=]|\bis\b)\s*(?:(Bearer|Basic)\s+(?:<redacted>|[^\s"',;]+)|(<redacted>|(?:"[^"]*"|'[^']*')|[^\s"',;]+))/gi,
+    (match, keyName, sep, scheme, value) => {
+      if (sep === ":" && !scheme && value && typeKeyword.test(value)) {
+        return match;
+      }
       const isIs = sep.toLowerCase() === "is";
       const separator = isIs ? " is " : (sep.includes("=") ? " = " : ": ");
       if (scheme) {

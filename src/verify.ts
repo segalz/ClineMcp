@@ -130,6 +130,37 @@ async function resolveCmdShim(file: string, args: string[], depth: number): Prom
   return viaNode ? { command: process.execPath, args: [target, ...args] } : { command: target, args };
 }
 
+const EMPTY_CHUNK = Buffer.alloc(0);
+interface RollingBuffer { chunks: Buffer[]; head: number; bytes: number; }
+
+function appendRolling(stream: RollingBuffer, chunk: Buffer): void {
+  if (!chunk.length) return;
+  if (chunk.length >= OUTPUT_LIMIT) {
+    stream.chunks = [chunk.length === OUTPUT_LIMIT ? chunk : Buffer.from(chunk.subarray(chunk.length - OUTPUT_LIMIT))];
+    stream.head = 0;
+    stream.bytes = OUTPUT_LIMIT;
+    return;
+  }
+  stream.chunks.push(chunk);
+  stream.bytes += chunk.length;
+  while (stream.bytes > OUTPUT_LIMIT && stream.head < stream.chunks.length) {
+    const excess = stream.bytes - OUTPUT_LIMIT;
+    const first = stream.chunks[stream.head];
+    if (first.length <= excess) {
+      stream.chunks[stream.head] = EMPTY_CHUNK;
+      stream.head++;
+      stream.bytes -= first.length;
+    } else {
+      stream.chunks[stream.head] = first.subarray(excess);
+      stream.bytes -= excess;
+    }
+  }
+  if (stream.head > 64 && stream.head * 2 >= stream.chunks.length) {
+    stream.chunks = stream.chunks.slice(stream.head);
+    stream.head = 0;
+  }
+}
+
 function tail(chunks: Buffer[]): string {
   const redacted = Buffer.from(redactSecrets(Buffer.concat(chunks).toString("utf8")), "utf8");
   let start = Math.max(0, redacted.length - TAIL_LIMIT);
@@ -159,8 +190,9 @@ export async function runVerification(spec: VerificationCommand, cwd: string, si
     });
     job?.assign(child);
     const pid = child.pid;
-    const stdout: Buffer[] = [], stderr: Buffer[] = [];
-    let bytes = 0, timedOut = false, killedForOutput = false, cancelled = false, done = false, stopped = false;
+    const stdout: RollingBuffer = { chunks: [], head: 0, bytes: 0 };
+    const stderr: RollingBuffer = { chunks: [], head: 0, bytes: 0 };
+    let timedOut = false, cancelled = false, done = false, stopped = false;
     let killDeadline: ReturnType<typeof setTimeout> | undefined, exitGrace: ReturnType<typeof setTimeout> | undefined;
     // The verify tree must be confirmed dead before the result returns: a restore can follow.
     let confirm: Promise<TreeKillResult> | undefined;
@@ -195,19 +227,16 @@ export async function runVerification(spec: VerificationCommand, cwd: string, si
     const finish = (exitCode: number | null, exitSignal: NodeJS.Signals | null) => {
       if (done) return;
       done = true; cleanup();
-      const settle = (kill?: TreeKillResult) => resolve({ passed: exitCode === 0 && !timedOut && !killedForOutput && !cancelled && !exitSignal && (!kill || kill.confirmed),
-        exitCode, signal: exitSignal ?? (cancelled ? "SIGKILL" : null), timedOut, killedForOutput,
-        durationMs: performance.now() - started, stdoutTail: tail(stdout), stderrTail: tail(stderr),
+      const settle = (kill?: TreeKillResult) => resolve({ passed: exitCode === 0 && !timedOut && !cancelled && !exitSignal && (!kill || kill.confirmed),
+        exitCode, signal: exitSignal ?? (cancelled ? "SIGKILL" : null), timedOut, killedForOutput: false,
+        durationMs: performance.now() - started, stdoutTail: tail(stdout.chunks.slice(stdout.head)), stderrTail: tail(stderr.chunks.slice(stderr.head)),
         ...(kill && !kill.confirmed ? { killConfirmed: false as const, stillAlive: kill.alive, ...(kill.unverified ? { killUnverified: true as const } : {}) } : {}) });
       if (confirm) void confirm.then(settle); else settle();
     };
-    const collect = (chunk: Buffer, chunks: Buffer[]) => {
-      if (done || killedForOutput) return;
-      // Keep a bounded redaction context before cutting the final 8 KiB tails.
-      const remaining = Math.max(0, OUTPUT_LIMIT + 1 - bytes);
-      chunks.push(chunk.subarray(0, remaining));
-      bytes += chunk.length;
-      if (bytes > OUTPUT_LIMIT) { killedForOutput = true; stop(); }
+    const collect = (chunk: Buffer, stream: RollingBuffer) => {
+      if (done) return;
+      // Keep a bounded 1 MiB rolling window per stream before redacting and cutting the final 8 KiB tail.
+      appendRolling(stream, chunk);
     };
     child.stdout.on("data", (chunk: Buffer) => collect(chunk, stdout));
     child.stderr.on("data", (chunk: Buffer) => collect(chunk, stderr));

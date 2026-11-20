@@ -114,15 +114,13 @@ test("snapshot storage cannot be inside the checkout, including through a juncti
   await assert.rejects(takeSnapshot(root, { snapshotBase: path.join(base, "alias", "snapshots") }), refused("snapshot_invalid"));
 });
 
-test("nested repositories, submodules and linked directories are typed refusals", async t => {
+// Tracked submodules and symlinks are accepted when untouched since plan S14 (plan-s14.test.ts).
+test("untracked nested repositories and linked directories are typed refusals", async t => {
   const { root, storage, base } = await fixture(t);
   await mkdir(path.join(root, "nested")); git(path.join(root, "nested"), "init", "--quiet");
   await writeFile(path.join(root, "nested", "file"), "nested");
   await assert.rejects(takeSnapshot(root, { snapshotBase: storage }), refused("snapshot_unsupported"));
   await rm(path.join(root, "nested"), { recursive: true });
-  git(root, "update-index", "--add", "--cacheinfo", `160000,${git(root, "rev-parse", "HEAD")},module`);
-  await assert.rejects(takeSnapshot(root, { snapshotBase: storage }), refused("snapshot_unsupported"));
-  git(root, "update-index", "--force-remove", "module");
   const outside = path.join(base, "outside"); await mkdir(outside); await writeFile(path.join(outside, "file"), "outside");
   await symlink(outside, path.join(root, "link"), process.platform === "win32" ? "junction" : "dir");
   await assert.rejects(takeSnapshot(root, { snapshotBase: storage }), refused("snapshot_unsupported"));
