@@ -176,10 +176,12 @@ server.registerTool(
     } catch (error) {
       if (error && typeof error === "object" && "verification" in error) {
         const failure = error as Error & { kind?: string; verification: unknown; evidence?: unknown; trace?: unknown; guard?: unknown; codeMapSource?: unknown;
-          usage?: unknown; cost?: unknown; durationMs?: number };
+          usage?: unknown; cost?: unknown; durationMs?: number; notes?: string[] };
         return await replyJson({ kind: failure.kind ?? "edit_failed", message: failure.message,
           verification: failure.verification, evidence: failure.evidence, trace: failure.trace, guard: failure.guard, codeMapSource: failure.codeMapSource ?? "none",
-          usage: failure.usage, cost: failure.cost, durationMs: failure.durationMs }, { isError: true });
+          usage: failure.usage, cost: failure.cost, durationMs: failure.durationMs,
+          // e.g. a hub that could not be stopped at the end of the edit (plan S16 review).
+          ...(failure.notes?.length ? { notes: failure.notes } : {}) }, { isError: true });
       }
       if (error instanceof ClineEditsError) {
         return await replyJson({

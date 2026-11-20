@@ -27,6 +27,8 @@ export interface GuardReport {
   filesTouched: string[];
   files?: string[];
   lastAssistantText?: string;
+  /** Tool calls that can start a process (anything but reading, searching, editing files and asking). Not serialized. */
+  processToolCalls?: number;
 }
 
 export type GuardVerdict = GuardReport & { kind: GuardVerdictKind };
@@ -192,6 +194,12 @@ const WRITE_EDIT_TOOL_NAMES = new Set([
   "save_file",
   "patch_file"
 ]);
+
+/** True unless the tool only reads, searches, edits files or asks: such a call can leave a process running (plan S16 review). */
+export function canStartProcess(toolName: string): boolean {
+  const name = toolName.toLowerCase().trim();
+  return !(isWriteEditTool(name) || /^(?:read|list|search|ask_|attempt_completion|plan_mode_respond)/.test(name));
+}
 
 export function isWriteEditTool(toolName: string): boolean {
   const name = toolName.toLowerCase().trim();
@@ -406,6 +414,7 @@ export function createGuard(options?: GuardOptions): Guard {
   }
 
   let totalToolCalls = 0;
+  let processToolCalls = 0;
   let incrementalTokens = 0;
   let cumulativeTokens = 0;
   let incrementalBudgetTokens = 0;
@@ -438,6 +447,7 @@ export function createGuard(options?: GuardOptions): Guard {
       filesTouched: data.filesTouched.map(p => redactSecrets(p)),
       ...(data.lastAssistantText !== undefined ? { lastAssistantText: redactSecrets(data.lastAssistantText).slice(-400) } : {})
     };
+    Object.defineProperty(report, "processToolCalls", { value: data.processToolCalls ?? 0, enumerable: false, configurable: true, writable: true });
     Object.defineProperty(report, "lastErrorTexts", {
       get() { return this.lastErrors; },
       enumerable: false,
@@ -481,7 +491,8 @@ export function createGuard(options?: GuardOptions): Guard {
       totalInputTokens: Math.max(incrementalTokens, cumulativeTokens),
       budgetInputTokens: Math.max(incrementalBudgetTokens, cumulativeBudgetTokens),
       filesTouched,
-      lastAssistantText
+      lastAssistantText,
+      processToolCalls
     }) as GuardVerdict;
     return trippedVerdict;
   }
@@ -557,6 +568,7 @@ export function createGuard(options?: GuardOptions): Guard {
       const signature = `${toolName.toLowerCase().trim()}:${target}`;
 
       totalToolCalls++;
+      if (canStartProcess(toolName)) processToolCalls++;
       if (totalToolCalls > maxToolCalls) {
         return trip("budget_exceeded", toolName, target, undefined, allErrors.slice(-3));
       }
@@ -602,6 +614,7 @@ export function createGuard(options?: GuardOptions): Guard {
         const { target, isPath } = extractTarget(toolName, inner.input);
         const signature = `${toolName.toLowerCase().trim()}:${target}`;
         totalToolCalls++;
+        if (canStartProcess(toolName)) processToolCalls++;
         if (totalToolCalls > maxToolCalls) {
           return trip("budget_exceeded", toolName, target, undefined, allErrors.slice(-3));
         }
@@ -678,7 +691,8 @@ export function createGuard(options?: GuardOptions): Guard {
       totalInputTokens: Math.max(incrementalTokens, cumulativeTokens),
       budgetInputTokens: Math.max(incrementalBudgetTokens, cumulativeBudgetTokens),
       filesTouched,
-      lastAssistantText
+      lastAssistantText,
+      processToolCalls
     });
   }
 

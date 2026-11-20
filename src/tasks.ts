@@ -794,7 +794,12 @@ export class TaskManager {
       task.question = lifecycle.question ?? (nextState === "input_required" ? {
         question: `Edit stopped: ${lifecycle.waitReason}. Retry with guidance, restore baseline, or keep unverified changes?`,
         options: ["retry", "restore", "keep"] } : undefined);
-      const warnings = [...(lifecycle.result?.warnings ?? []), ...(gitReport?.warnings ?? [])];
+      const warnings = [...(lifecycle.result?.warnings ?? []), ...lifecycle.hubWarnings, ...(gitReport?.warnings ?? [])];
+      if (nextError instanceof ClineRunError && lifecycle.hubWarnings.length) {
+        // The same error object can be published again (e.g. restore after a wait): never repeat a note.
+        const notes = (nextError.notes ??= []);
+        for (const note of lifecycle.hubWarnings) if (!notes.includes(note)) notes.push(note);
+      }
       if (lifecycle.createdFiles?.length) {
         warnings.push(`The edit created ${lifecycle.createdFiles.length} new file(s): ${lifecycle.createdFiles.slice(0, 20).join(", ")}${lifecycle.createdFiles.length > 20 ? ", ..." : ""}. Check each belongs to the task.`);
       }
@@ -857,7 +862,7 @@ export class TaskManager {
         question: parseQuestionFromText,
         fits: prompt => !isPromptTooLarge(prompt, task, getEffectivePreamble("edits", this.deps.runOptions?.promptPreamble ?? ""),
           this.deps.platform ?? process.platform, this.deps.runOptions?.deps),
-        run: async (prompt, signal, lock, guard, remainingSeconds, run) => {
+        run: async (prompt, signal, lock, guard, remainingSeconds, run, editHub) => {
           task.state = "running";
           task.waitReason = undefined;
           task.guardReport = undefined;
@@ -871,7 +876,7 @@ export class TaskManager {
           }
           task.recorder = undefined;
           task.codeMapSource = "none";
-          const options: Partial<ClineInvocationOptions> = { ...this.deps.runOptions, checkoutLock: lock, checkoutRoot: task.finalCheck!.root,
+          const options: Partial<ClineInvocationOptions> = { ...this.deps.runOptions, editHub, checkoutLock: lock, checkoutRoot: task.finalCheck!.root,
             onCodeMapSource: source => { task.codeMapSource = source; this.deps.runOptions?.onCodeMapSource?.(source); },
             trace: true, traceRunId: task.trace.runId, maxAttempts: 1, maxTimeoutSeconds: MAX_TASK_TIMEOUT_SECONDS,
             promptPreamble: (this.deps.runOptions?.promptPreamble ?? "") + TASK_QUESTION_PREAMBLE,

@@ -4,7 +4,7 @@ import { realpath } from "node:fs/promises";
 import { acquire, ownsCheckoutLock, type CheckoutRelease } from "./checkoutlock.js";
 import { takeSnapshot, restoreSnapshot, discardSnapshot, createdFiles, headAndIndexIdentity, type SnapshotHandle, type SnapshotOptions } from "./snapshot.js";
 import { resolveVerificationCommand, runVerification, VerificationError, type VerificationResult } from "./verify.js";
-import { ClineRunError, redactSecrets, guardOptionsSchema, type ClineResponse } from "./runner.js";
+import { ClineRunError, DedicatedHubSession, redactSecrets, guardOptionsSchema, type ClineResponse } from "./runner.js";
 import type { GuardOptions } from "./guard.js";
 
 /** Extra margin reserved alongside the final check's timeout so each run leaves time to verify. */
@@ -53,7 +53,7 @@ export interface FinalCheckInput {
 }
 export interface FinalCheckDeps {
   resolveRoot: (cwd: string, signal: AbortSignal) => Promise<string>;
-  run: (prompt: string, signal: AbortSignal, lock: CheckoutRelease, guard: GuardOptions, remainingSeconds: number, run: number) => Promise<ClineResponse>;
+  run: (prompt: string, signal: AbortSignal, lock: CheckoutRelease, guard: GuardOptions, remainingSeconds: number, run: number, hub: DedicatedHubSession) => Promise<ClineResponse>;
   fits: (prompt: string) => boolean;
   question: (text: string) => { question: string; options?: string[] } | undefined;
   snapshotOptions?: SnapshotOptions; lockDirectory?: string; checkoutLock?: CheckoutRelease;
@@ -116,6 +116,7 @@ export class FinalCheckLifecycle {
   phase: "snapshot" | "run" | "verify" | "restore" | "waiting" | "done" = "snapshot";
   waitReason?: EditWaitReason; question?: { question: string; options?: string[] }; error?: unknown;
   evidence: Record<string, unknown> = {}; result?: ClineResponse;
+  readonly hubWarnings: string[] = [];
   codeMapSource: NonNullable<ClineResponse["codeMapSource"]> = "none";
   usage: Record<string, unknown> = Object.create(null); cost = 0; durationMs = 0;
   totalToolCalls = 0; totalInputTokens = 0; launches = 0; activeMs = 0; automaticFixes = 0;
@@ -139,14 +140,14 @@ export class FinalCheckLifecycle {
       ...(this.question ? { question: this.question } : {}),
       ...(this.snapshot ? { snapshotDirectory: this.snapshot.directory } : {}) };
   }
-  private async unchanged(): Promise<boolean> {
+  private async unchanged(wait = this.wait.bind(this)): Promise<boolean> {
     if (!this.identity) return true;
     try {
       const current = await headAndIndexIdentity(this.root);
       if (current.head === this.identity.head && current.indexHash === this.identity.indexHash) return true;
       this.evidence = { ...this.evidence, before: this.identity, after: current };
     } catch (error) { this.evidence.identityError = redactSecrets(String(error)); }
-    this.wait("head_changed", new ClineRunError("edits_inspection_failed", "HEAD/index changed or could not be inspected; no reset or restoration performed."));
+    wait("head_changed", new ClineRunError("edits_inspection_failed", "HEAD/index changed or could not be inspected; no reset or restoration performed."));
     return false;
   }
   preview(guidance = ""): string {
@@ -156,6 +157,12 @@ export class FinalCheckLifecycle {
     return this.deps.fits(prompt + interruption) ? prompt + interruption : prompt;
   }
   async execute(signal: AbortSignal, guidance?: string): Promise<void> {
+    const hub = new DedicatedHubSession();
+    // Each execute reports only its own hub-stop failures (an earlier execute already reported its own).
+    this.hubWarnings.length = 0;
+    // Status can read phase while cleanup is pending. Publish the wait only after the hub has stopped.
+    let pendingWait: { reason: EditWaitReason; error?: unknown } | undefined;
+    const wait = (reason: EditWaitReason, error?: unknown) => { pendingWait = { reason, error }; };
     const now = this.deps.now ?? (() => performance.now());
     const started = now();
     const remaining = (this.input.timeoutSeconds ?? 600) * 1000 - this.activeMs;
@@ -187,7 +194,7 @@ export class FinalCheckLifecycle {
         try { await resolveVerify(spec.command, spec.args ?? [], this.workDir); }
         catch (error) {
           if (!(error instanceof VerificationError)) throw error;
-          this.wait("verify_failed", error); this.release(); return;
+          wait("verify_failed", error); this.release(); return;
         }
         check();
       }
@@ -204,14 +211,14 @@ export class FinalCheckLifecycle {
       const verifyReserveMs = "none" in this.input.verify ? 0 : (this.input.verify.timeoutSeconds ?? 60) * 1000 + VERIFY_RESERVE_MARGIN_MS;
       while (true) {
         check();
-        if (!await this.unchanged()) return;
+        if (!await this.unchanged(wait)) return;
         check();
         const calls = (this.input.guard?.maxToolCalls ?? 150) - this.totalToolCalls;
         const tokens = (this.input.guard?.maxInputTokens ?? 1_500_000) - this.budgetInputTokens;
-        if (calls <= 0 || tokens <= 0) { this.wait("guard", new ClineRunError("budget_exceeded", "Cumulative edit guard budget exhausted.")); return; }
+        if (calls <= 0 || tokens <= 0) { wait("guard", new ClineRunError("budget_exceeded", "Cumulative edit guard budget exhausted.")); return; }
         const remainingSeconds = Math.floor((remaining - (now() - started) - verifyReserveMs) / 1000);
         if (remainingSeconds < 1) {
-          this.wait("budget", new ClineRunError("budget_exceeded", "Not enough time left for a run and its final check."));
+          wait("budget", new ClineRunError("budget_exceeded", "Not enough time left for a run and its final check."));
           return;
         }
         this.phase = "run";
@@ -221,7 +228,7 @@ export class FinalCheckLifecycle {
         let response: ClineResponse | undefined, failure: unknown;
         try {
           response = await this.deps.run(prompt, controller.signal, this.lock!, { ...this.input.guard, maxToolCalls: calls, maxInputTokens: tokens },
-            remainingSeconds, this.launches);
+            remainingSeconds, this.launches, hub);
           this.result = response;
         } catch (error) { failure = error; }
         const metrics = (response ?? failure) as Partial<ClineResponse> | undefined;
@@ -233,21 +240,25 @@ export class FinalCheckLifecycle {
         if (typeof metrics?.cost === "number") this.cost += metrics.cost;
         this.durationMs += metrics?.durationMs ?? 0;
         check();
-        if (!await this.unchanged()) return;
+        if (!await this.unchanged(wait)) return;
         check();
         if (failure) {
           const reason: EditWaitReason = failure instanceof ClineRunError
             ? (["loop_detected", "budget_exceeded"].includes(failure.kind) ? "guard"
               : failure.kind === "timeout" ? "budget" : "cline_error")
             : "cline_error";
-          this.wait(reason, failure); return;
+          wait(reason, failure); return;
         }
         if (this.totalToolCalls > (this.input.guard?.maxToolCalls ?? 150) || this.budgetInputTokens > (this.input.guard?.maxInputTokens ?? 1_500_000)) {
-          this.wait("guard", new ClineRunError("budget_exceeded", "Cumulative edit guard budget exceeded.")); return;
+          wait("guard", new ClineRunError("budget_exceeded", "Cumulative edit guard budget exceeded.")); return;
         }
         this.question = this.deps.question(response!.text);
-        if (this.question) { this.wait("cline_question"); return; }
+        if (this.question) { wait("cline_question"); return; }
         if ("none" in this.input.verify) { await this.complete(); return; }
+        // A run that may have started a process (a command tool, or a run without a guard report) must not leave
+        // it running during the check: stop the hub and its job, which kills those processes, as before S16. The
+        // next fix run then gets a fresh hub; file-only runs keep theirs (plan S16 review).
+        if ((metrics?.guard?.processToolCalls ?? 1) > 0) { await hub.stop(); check(); }
         this.phase = "verify";
         const verifyStarted = now();
         let verified: VerificationResult & { error?: string };
@@ -266,11 +277,11 @@ export class FinalCheckLifecycle {
         this.verification.attempts.push({ ...verified, run: this.launches });
         this.verification.passed = verified.passed;
         check();
-        if (!await this.unchanged()) return;
+        if (!await this.unchanged(wait)) return;
         check();
         if (verified.passed) { await this.complete(); return; }
         if (verified.error || manual || this.automaticFixes >= (this.input.maxFixRuns ?? 2)) {
-          this.wait("verify_failed", verified.error ? new VerificationError("verification_launch_failed", verified.error) : undefined); return;
+          wait("verify_failed", verified.error ? new VerificationError("verification_launch_failed", verified.error) : undefined); return;
         }
         prompt = this.preview();
         this.automaticFixes++; repair = true;
@@ -281,10 +292,17 @@ export class FinalCheckLifecycle {
         this.evidence.processesStillAlive = error.processesStillAlive ?? [];
         if (error.killUnverified) this.evidence.killUnverified = true;
       }
-      if (signal.aborted) { this.cancelled = true; this.error = new ClineRunError("cancelled", "The edit lifecycle was cancelled."); await this.restore(); }
-      else this.wait(expired ? "budget" : "cline_error", error);
+      if (!signal.aborted) wait(expired ? "budget" : "cline_error", error);
     } finally {
-      clearTimeout(timer); signal.removeEventListener("abort", abort); this.activeMs += now() - started;
+      try {
+        await hub.stop();
+        this.hubWarnings.push(...hub.warnings);
+        if (signal.aborted && this.phase !== "done") {
+          this.cancelled = true; this.error = new ClineRunError("cancelled", "The edit lifecycle was cancelled."); await this.restore();
+        } else if (pendingWait) this.wait(pendingWait.reason, pendingWait.error);
+      } finally {
+        clearTimeout(timer); signal.removeEventListener("abort", abort); this.activeMs += now() - started;
+      }
     }
   }
   async restore(): Promise<boolean> {

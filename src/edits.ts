@@ -175,9 +175,9 @@ export async function applyClineEdits(
   const lifecycle: FinalCheckLifecycle = new FinalCheckLifecycle({ ...input, guard: options.guard ?? input.guard, verify, timeoutSeconds: input.timeoutSeconds ?? 180 }, {
     resolveRoot: editsCheckoutRoot, checkoutLock: options.checkoutLock, lockDirectory: options.checkoutLockDirectory,
     fits: prompt => editPromptFits({ ...input, cwd: lifecycle.workDir, prompt }, options), question: editQuestion,
-    run: (prompt, runSignal, lock, guard, remainingSeconds) => runEdits({ ...input, prompt, cwd: lifecycle.workDir,
+    run: (prompt, runSignal, lock, guard, remainingSeconds, _run, editHub) => runEdits({ ...input, prompt, cwd: lifecycle.workDir,
       timeoutSeconds: remainingSeconds, guard }, lifecycle.workDir, runSignal,
-      { ...options, checkoutLock: lock, checkoutRoot: lifecycle.root, guard, maxAttempts: 1 })
+      { ...options, checkoutLock: lock, checkoutRoot: lifecycle.root, guard, maxAttempts: 1, editHub })
   });
   try {
     await lifecycle.execute(signal ?? new AbortController().signal);
@@ -208,11 +208,14 @@ export async function applyClineEdits(
     const headBefore = lifecycle.identity!.head;
     // The edits passed and are kept: a failing report-only Git call must not turn that into an error.
     const { gitDiff, status, headAfter, warnings: gitWarnings } = await collectEditsGitReport(lifecycle.root, headBefore, "verified edits");
-    const warnings = [...(lifecycle.result!.warnings ?? []), ...gitWarnings];
+    const warnings = [...(lifecycle.result!.warnings ?? []), ...lifecycle.hubWarnings, ...gitWarnings];
     const created = lifecycle.createdFiles;
     if (created?.length) warnings.push(`The edit created ${created.length} new file(s): ${created.slice(0, 20).join(", ")}${created.length > 20 ? ", ..." : ""}. Check each belongs to the task.`);
     return { ...lifecycle.result!, ...(warnings.length ? { warnings } : {}), ...(created?.length ? { createdFiles: created } : {}), usage: lifecycle.usage, cost: lifecycle.cost, durationMs: lifecycle.durationMs,
       gitDiff, status, headBefore, headAfter: headAfter ?? headBefore, commitWasReverted: false, verification: lifecycle.verification };
+  } catch (error) {
+    if (error instanceof ClineRunError && lifecycle.hubWarnings.length) (error.notes ??= []).push(...lifecycle.hubWarnings);
+    throw error;
   } finally { lifecycle.release(); }
 }
 

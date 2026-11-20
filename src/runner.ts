@@ -236,15 +236,18 @@ export interface ClineDependencies {
   statusPath?: string | null;
   /** Base folder for per-run traces (default %TEMP%/cline-tasks). */
   traceBase?: string;
-  /** Test seam: replaces the per-run hub factory (it also runs with a fake spawn/entry then). */
+  /** Test seams for the hub and its Windows job, including with a fake spawn. */
   startHub?: (options: ClineInvocationOptions) => Promise<DedicatedHub | undefined>;
+  createWindowsJob?: typeof createWindowsJob;
 }
 
 export interface ClineInvocationOptions {
   /** Internal: environment that points this run at its own Cline hub (set by runCline). */
   hubEnv?: Record<string, string>;
   /** Internal: starts this run's hub on first use and returns its environment (set by runCline). */
-  hubProvider?: () => Promise<Record<string, string> | undefined>;
+  hubProvider?: (cwd?: string) => Promise<Record<string, string> | undefined>;
+  /** Internal: owns the hub and its job across the runs of one edit execution. */
+  editHub?: DedicatedHubSession;
   /** Internal: called once Cline was actually launched with the hub environment (set by runCline). */
   onLaunched?: () => void;
   /** Map preparation is part of the run's existing total deadline. */
@@ -667,7 +670,7 @@ async function freeLoopbackPort(): Promise<number | undefined> {
 
 export const DEDICATED_HUB_BASE = path.join(os.tmpdir(), "cline-mcp-hubs");
 
-export interface DedicatedHub { env: Record<string, string>; stop: () => Promise<void> }
+export interface DedicatedHub { env: Record<string, string>; stop: () => Promise<void>; isListening?: () => Promise<boolean> }
 
 export interface HubStopDeps {
   /** True while something accepts connections on the hub's loopback port. */
@@ -714,8 +717,8 @@ export async function stopDedicatedHub(port: number, deps: HubStopDeps): Promise
  * Cline 3.x runs sessions through a hub daemon and resolves a model's RELATIVE tool paths against the
  * hub's own cwd, not the session's --cwd. The shared hub sits wherever it was first started (the user's
  * home, or an old worktree), so `src/x.py` was read from, and could be written to, the wrong folder.
- * Each bridge run therefore gets its own hub (own discovery record and port): Cline starts it on demand in
- * the run's --cwd, and the bridge stops it when the run ends, so it never outlives the run or locks a worktree.
+ * Cline starts a dedicated hub on demand in the run's --cwd. Only automatic repairs in that same
+ * edit execution can reuse its discovery record and port.
  */
 async function dedicatedHub(options: ClineInvocationOptions): Promise<DedicatedHub | undefined> {
   if (options.hubEnv || options.deps?.spawn || options.deps?.entryPath) return undefined;
@@ -743,12 +746,48 @@ async function dedicatedHub(options: ClineInvocationOptions): Promise<DedicatedH
       }
     }
   });
-  return { env, stop };
+  return { env, stop, isListening: () => loopbackPortListening(port) };
 }
 
 interface RunJobs {
   current?: WindowsJob;
   stopped?: boolean;
+}
+
+/** Owns a hub and the kill-on-close job inherited by its daemon. Runs in a session are sequential. */
+export class DedicatedHubSession {
+  readonly jobs: RunJobs = {};
+  readonly warnings: string[] = [];
+  private hub?: DedicatedHub;
+  private cwd?: string;
+  launched = false;
+
+  async environment(cwd: string, options: ClineInvocationOptions): Promise<Record<string, string> | undefined> {
+    if (this.hub) {
+      if (cwd === this.cwd && (!this.hub.isListening || await this.hub.isListening())) return this.hub.env;
+      await this.stop();
+    }
+    this.cwd = cwd;
+    this.hub = await (options.deps?.startHub ?? dedicatedHub)(options);
+    return this.hub?.env;
+  }
+
+  async stop(): Promise<void> {
+    const job = this.jobs.current;
+    try {
+      if (this.jobs.stopped) await job?.close();
+      // Only the launched CLI can have started the daemon.
+      if (this.launched) await this.hub?.stop();
+    } catch (error) {
+      this.warnings.push(redactSecrets(`Failed to stop the dedicated Cline hub: ${error instanceof Error ? error.message : String(error)}`));
+    } finally {
+      await job?.close();
+      this.jobs.current = undefined;
+      this.jobs.stopped = false;
+      this.hub = undefined;
+      this.launched = false;
+    }
+  }
 }
 
 export async function runCline(
@@ -758,41 +797,25 @@ export async function runCline(
 ): Promise<ClineResponse> {
   // The hub starts only when Cline is about to launch (plan S6, B6): a call refused before launch (quota
   // lock, bad cwd, cancel) starts and stops nothing.
-  const startHub = options.deps?.startHub ?? dedicatedHub;
-  let started: DedicatedHub | undefined;
+  const hub = options.editHub ?? new DedicatedHubSession();
+  // Internal CLI attempts share their original environment; only the next run probes the hub.
   let hubEnv: Promise<Record<string, string> | undefined> | undefined;
-  const hubProvider = () => hubEnv ??= startHub(options).then(hub => {
-    started = hub;
-    return hub?.env;
-  });
-  // Cline starts its hub on demand: if Cline never launched, no hub exists and stopping it would only cost time.
-  let launched = false;
+  const hubProvider = (cwd?: string) => hubEnv ??= hub.environment(cwd ?? process.cwd(), options);
+  const invocation = options.hubEnv ? options : { ...options, hubProvider, onLaunched: () => { hub.launched = true; } };
+  if (options.editHub) return runClineInner(input, signal, invocation, hub.jobs);
   let result: ClineResponse | undefined;
   let runError: unknown;
-  let hubStopNote: string | undefined;
-  const jobs: RunJobs = {};
-  async function stopHubAndJob() {
-    try {
-      if (jobs.stopped) await jobs.current?.close();
-      if (launched) await started?.stop();
-    } catch (error) {
-      hubStopNote = redactSecrets(`Failed to stop the dedicated Cline hub: ${error instanceof Error ? error.message : String(error)}`);
-    } finally {
-      await jobs.current?.close();
-    }
-  }
   try {
-    const invocation = options.hubEnv ? options : { ...options, hubProvider, onLaunched: () => { launched = true; } };
-    result = await runClineInner(input, signal, invocation, jobs);
+    result = await runClineInner(input, signal, invocation, hub.jobs);
     return result;
   } catch (error) {
     runError = error;
     throw error;
   } finally {
-    await stopHubAndJob();
-    if (hubStopNote) {
-      if (result) (result.warnings ??= []).push(hubStopNote);
-      else if (runError instanceof ClineRunError) (runError.notes ??= []).push(hubStopNote);
+    await hub.stop();
+    if (hub.warnings.length) {
+      if (result) (result.warnings ??= []).push(...hub.warnings);
+      else if (runError instanceof ClineRunError) (runError.notes ??= []).push(...hub.warnings);
     }
   }
 }
@@ -1079,7 +1102,7 @@ async function runClineCore(input: AskClineInput, signal: AbortSignal | undefine
         remainingLaunchBudgetMs();
         let hubEnv: Record<string, string> | undefined;
         try {
-          hubEnv = options.hubEnv ?? await options.hubProvider?.();
+          hubEnv = options.hubEnv ?? await options.hubProvider?.(cwd);
         } catch (error) {
           throw new ClineRunError("launch_failed",
             redactSecrets(`Failed to start the dedicated Cline hub: ${error instanceof Error ? error.message : String(error)}`),
@@ -1088,10 +1111,10 @@ async function runClineCore(input: AskClineInput, signal: AbortSignal | undefine
         const spawnFn = deps.spawn ?? spawn;
         // A hub launched by this CLI inherits its job, even when it detaches. Its job spans retries.
         const ownsHub = !!hubEnv && !options.hubEnv;
-        const useJob = !deps.spawn && platform === "win32";
+        const useJob = platform === "win32" && (!deps.spawn || !!deps.createWindowsJob);
         const prepareStarted = performance.now();
         if (useJob && !jobs.current?.alive) {
-          jobs.current = await createWindowsJob(Math.min(attemptTimerMs, remainingLaunchBudgetMs()), signal);
+          jobs.current = await (deps.createWindowsJob ?? createWindowsJob)(Math.min(attemptTimerMs, remainingLaunchBudgetMs()), signal);
         }
         const job = jobs.current;
         const setupMs = useJob ? performance.now() - prepareStarted : 0;
