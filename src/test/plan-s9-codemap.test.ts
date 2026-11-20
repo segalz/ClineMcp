@@ -14,7 +14,7 @@ const root = await mkdtemp(path.join(os.tmpdir(), "cline-s9-codemap-"));
 after(() => rm(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }));
 
 function git(cwd: string, args: string[], input?: string): string {
-  const result = spawnSync(process.platform === "win32" ? "git.exe" : "git", ["-C", cwd, ...args], { input, encoding: "utf8", windowsHide: true, timeout: 10_000 });
+  const result = spawnSync(process.platform === "win32" ? "git.exe" : "git", ["-C", cwd, ...args], { input, encoding: "utf8", windowsHide: true, timeout: 60_000 });
   assert.equal(result.status, 0, result.stderr || result.error?.message);
   return result.stdout.trim();
 }

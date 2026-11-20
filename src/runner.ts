@@ -310,7 +310,7 @@ export function redactSecrets(text: string): string {
   if (!text) return "";
   let result = text;
 
-  const typeKeyword = /^(?:string|number|boolean|bigint|symbol|object|unknown|any|never|void|undefined|null|true|false)(?:\[\])?$/;
+  const typeKeyword = /^(?:string|number|boolean|bigint|symbol|object|unknown|any|never|void|undefined|null|true|false)(?:\[\])?[),;}>\]]*$/;
 
   // Quoted keys in JSON and configuration snippets. A nested object or array is left alone (its own keys are
   // checked separately), and an exact type keyword (`"apiKey": string`) is a type annotation, not a value.
@@ -623,6 +623,30 @@ export const MISSING_SELECTION_MESSAGE =
   "provider and model are required. The bridge never runs on Cline's saved default model, which can go stale silently. " +
   "Pass provider \"cline\" and a model id; call cline_list_models for the free models the installed Cline offers now.";
 
+/** Refuses before launching (or creating a worktree) while a cached daily-quota lock is active. */
+export async function enforceQuotaLock(
+  provider: string | undefined,
+  model: string | undefined,
+  options: Partial<ClineInvocationOptions> = {}
+): Promise<void> {
+  if (options.respectQuotaLock === false) return;
+  const statusPath = resolveStatusPath(options.deps?.statusPath);
+  if (!statusPath) return;
+  const wallNow = options.deps?.wallNow ?? Date.now;
+  const lock = activeQuotaLock(
+    await readStatusEntry(statusPath, provider, model).catch(() => undefined),
+    wallNow()
+  );
+  if (lock) {
+    throw new ClineRunError(
+      "quota_exhausted",
+      `Daily free quota for ${lock.provider}/${lock.model} is exhausted until ${lock.reset_at ?? lock.expires_at} ` +
+        `(recorded ${lock.checked_at}); Cline was not launched.`,
+      { attempts: 0, providerState: "quota_exhausted", resetAt: lock.reset_at ?? lock.expires_at, extractedMessage: lock.reason }
+    );
+  }
+}
+
 /** Fails before any I/O when the caller did not choose both provider and model. */
 export function requireSelection(input: { provider?: string; model?: string }): void {
   if (!input.provider || !input.model) throw new ClineRunError("launch_failed", MISSING_SELECTION_MESSAGE, { attempts: 0 });
@@ -878,20 +902,7 @@ async function runClineCore(input: AskClineInput, signal: AbortSignal | undefine
       const statusPath = options.recordStatus === false && options.respectQuotaLock === false
         ? undefined
         : resolveStatusPath(deps.statusPath);
-      if (statusPath && options.respectQuotaLock !== false) {
-        const lock = activeQuotaLock(
-          await readStatusEntry(statusPath, effectiveInput.provider, effectiveInput.model).catch(() => undefined),
-          wallNow()
-        );
-        if (lock) {
-          throw new ClineRunError(
-            "quota_exhausted",
-            `Daily free quota for ${lock.provider}/${lock.model} is exhausted until ${lock.reset_at ?? lock.expires_at} ` +
-              `(recorded ${lock.checked_at}); Cline was not launched.`,
-            { attempts: 0, providerState: "quota_exhausted", resetAt: lock.reset_at ?? lock.expires_at, extractedMessage: lock.reason }
-          );
-        }
-      }
+      await enforceQuotaLock(effectiveInput.provider, effectiveInput.model, options);
 
       const recordPath = options.recordStatus === false ? undefined : statusPath;
       const statusStarted = nowFn();

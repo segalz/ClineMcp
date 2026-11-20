@@ -167,7 +167,7 @@ server.registerTool(
         gitDiff: result.gitDiff,
         status: result.status,
         headBefore: result.headBefore,
-        headAfter: result.headAfter,
+        ...(result.headAfter !== undefined ? { headAfter: result.headAfter } : {}),
         commitWasReverted: result.commitWasReverted,
         verification: result.verification,
         ...(result.warnings && result.warnings.length > 0 ? { warnings: result.warnings } : {}),

@@ -33,7 +33,7 @@ export interface ClineEditsResponse extends ClineResponse {
   gitDiff: string;
   status: string;
   headBefore: string;
-  headAfter: string;
+  headAfter?: string;
   commitWasReverted: boolean;
   verification: FinalVerification;
   /** New files the edit created (kept). Check each belongs to the task. */
@@ -179,7 +179,7 @@ export async function collectEditsGitReport(
   const gitDiff = truncateGitDiff((await report(["diff", "--binary", "--no-ext-diff", "HEAD"], "diff")) ?? "");
   const status = (await report(["--no-optional-locks", "status", "--short"], "status", { trim: "end" })) ?? "";
   const currentHead = await report(["rev-parse", "HEAD"], "rev-parse");
-  const headAfter = currentHead || headBefore;
+  const headAfter = currentHead || undefined;
   return {
     gitDiff,
     status,
@@ -235,7 +235,7 @@ export async function applyClineEdits(
     const created = lifecycle.createdFiles;
     if (created?.length) warnings.push(`The edit created ${created.length} new file(s): ${created.slice(0, 20).join(", ")}${created.length > 20 ? ", ..." : ""}. Check each belongs to the task.`);
     return { ...lifecycle.result!, ...(warnings.length ? { warnings } : {}), ...(created?.length ? { createdFiles: created } : {}), usage: lifecycle.usage, cost: lifecycle.cost, durationMs: lifecycle.durationMs,
-      gitDiff, status, headBefore, headAfter: headAfter ?? headBefore, commitWasReverted: false, verification: lifecycle.verification };
+      gitDiff, status, headBefore, ...(headAfter !== undefined ? { headAfter } : {}), commitWasReverted: false, verification: lifecycle.verification };
   } catch (error) {
     if (error instanceof ClineRunError && lifecycle.hubWarnings.length) (error.notes ??= []).push(...lifecycle.hubWarnings);
     throw error;

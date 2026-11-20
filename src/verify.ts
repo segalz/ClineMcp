@@ -1,5 +1,5 @@
 import { spawn } from "node:child_process";
-import { access, readFile } from "node:fs/promises";
+import { access, constants as fsConstants, readFile, stat } from "node:fs/promises";
 import path from "node:path";
 import { defaultKillTree, redactSecrets } from "./runner.js";
 import { confirmTreeDead, type TreeKillResult } from "./proctree.js";
@@ -36,19 +36,19 @@ export async function resolveVerificationCommand(command: string, args: string[]
   const hasDirectory = command.includes("/") || command.includes("\\");
   const bare = !hasDirectory && !path.extname(command);
   if (process.platform !== "win32") {
-    // POSIX spawns resolve through PATH; only check that the program exists so a missing one is refused up front.
-    const found = hasDirectory ? await exists(path.resolve(cwd, command))
-      : (await Promise.all(pathDirectories().map(dir => exists(path.join(dir, command))))).some(Boolean);
+    // POSIX spawns resolve through PATH; check that the target is a runnable file so directories or non-executables are refused up front.
+    const found = hasDirectory ? await isRunnablePosix(path.resolve(cwd, command))
+      : (await Promise.all(pathDirectories().map(dir => isRunnablePosix(path.join(dir, command))))).some(Boolean);
     if (!found) throw new VerificationError("verification_launch_failed", "Verification executable was not found on PATH.");
     return { command, args };
   }
   const npm = /^(npm|npx)(?:\.cmd)?$/i.exec(path.basename(command));
-  if (npm) {
+  if (npm && (!hasDirectory || await isFile(path.resolve(cwd, command)) || (!path.extname(command) && await isFile(path.resolve(cwd, command + ".cmd"))))) {
     const script = npm[1].toLowerCase() + "-cli.js";
     const candidates = [path.join(path.dirname(process.execPath), "node_modules", "npm", "bin", script),
       ...(process.env.APPDATA ? [path.join(process.env.APPDATA, "npm", "node_modules", "npm", "bin", script)] : [])];
     for (const candidate of candidates) {
-      if (await exists(candidate)) return { command: process.execPath, args: [candidate, ...args] };
+      if (await isFile(candidate)) return { command: process.execPath, args: [candidate, ...args] };
     }
     throw new VerificationError("verification_refused", "Could not resolve the npm installation's CLI script.");
   }
@@ -59,25 +59,38 @@ export async function resolveVerificationCommand(command: string, args: string[]
     if (local) return resolveCmdShim(local, args, 0);
   }
   // Resolve names ourselves so PATHEXT cannot silently run a batch file. As on Windows, the first PATH folder
-  // that has the name wins; a global npm/corepack .cmd shim (pnpm, yarn) there is parsed, never run by cmd.exe.
+  // that has the name wins; a global npm/corepack .cmd shim (pnpm, yarn) or explicit extensionless shim path
+  // (e.g. node_modules/.bin/vitest) is parsed, never run by cmd.exe.
+  const ext = path.extname(command);
+  const isDirectExe = /^\.(exe|com)$/i.test(ext);
   for (const directory of hasDirectory ? [""] : pathDirectories()) {
-    for (const extension of path.extname(command) ? [""] : [".exe", ".com"]) {
+    for (const extension of isDirectExe ? [""] : [".exe", ".com"]) {
       const candidate = path.resolve(cwd, directory, command + extension);
-      if (await exists(candidate)) return { command: candidate, args };
+      if (await isFile(candidate)) return { command: candidate, args };
     }
-    const shim = bare ? path.resolve(cwd, directory, command + ".cmd") : undefined;
-    if (shim && await exists(shim)) return resolveCmdShim(shim, args, 0);
+    const shim = !ext ? path.resolve(cwd, directory, command + ".cmd") : undefined;
+    if (shim && await isFile(shim)) return resolveCmdShim(shim, args, 0);
+  }
+  if (hasDirectory) {
+    const info = await stat(path.resolve(cwd, command)).catch(() => undefined);
+    if (info?.isDirectory()) throw new VerificationError("verification_refused", "Verification command refers to a directory, not an executable.");
+    if (info?.isFile() && !isDirectExe) throw new VerificationError("verification_refused", "Verification command is not a runnable Windows executable.");
   }
   throw new VerificationError("verification_launch_failed", "Verification executable was not found on PATH.");
 }
 
 const exists = (file: string) => access(file).then(() => true, () => false);
+const isFile = (file: string) => stat(file).then(info => info.isFile(), () => false);
+const isRunnablePosix = (file: string) => stat(file).then(
+  info => info.isFile() ? access(file, fsConstants.X_OK).then(() => true, () => false) : false,
+  () => false
+);
 const pathDirectories = () => (process.env.PATH ?? "").split(path.delimiter).map(dir => dir.replace(/^"|"$/g, "")).filter(Boolean);
 
 async function findOnPath(fileName: string, first?: string): Promise<string | undefined> {
   for (const directory of [...(first ? [first] : []), ...pathDirectories()]) {
     const candidate = path.resolve(directory, fileName);
-    if (await exists(candidate)) return candidate;
+    if (await isFile(candidate)) return candidate;
   }
   return undefined;
 }
@@ -86,7 +99,7 @@ async function findOnPath(fileName: string, first?: string): Promise<string | un
 async function nearestBinShim(name: string, cwd: string): Promise<string | undefined> {
   for (let dir = path.resolve(cwd); ; dir = path.dirname(dir)) {
     const candidate = path.join(dir, "node_modules", ".bin", name + ".cmd");
-    if (await exists(candidate)) return candidate;
+    if (await isFile(candidate)) return candidate;
     if (path.dirname(dir) === dir || await exists(path.join(dir, ".git"))) return undefined;
   }
 }
@@ -126,7 +139,7 @@ async function resolveCmdShim(file: string, args: string[], depth: number): Prom
   const relative = viaNode?.[1] ?? exe?.[1];
   if (!relative) throw refuse("not an npm shim");
   const target = path.resolve(path.dirname(file), relative);
-  if (!await exists(target)) throw refuse(`its target ${target} does not exist`);
+  if (!await isFile(target)) throw refuse(`its target ${target} does not exist`);
   return viaNode ? { command: process.execPath, args: [target, ...args] } : { command: target, args };
 }
 

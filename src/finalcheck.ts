@@ -100,7 +100,7 @@ export async function subfolderOf(root: string, directory: string): Promise<stri
   const [realRoot, realDirectory] = await Promise.all([realpath(root).catch(() => path.resolve(root)),
     realpath(directory).catch(() => path.resolve(directory))]);
   const inside = path.relative(realRoot, realDirectory);
-  if (inside.startsWith("..") || path.isAbsolute(inside)) return undefined;
+  if (inside === ".." || inside.startsWith(".." + path.sep) || path.isAbsolute(inside)) return undefined;
   return inside ? path.join(root, inside) : root;
 }
 

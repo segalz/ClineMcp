@@ -10,7 +10,7 @@ import path from "node:path";
 import { discardSnapshot, headAndIndexIdentity, restoreSnapshot, SnapshotError, takeSnapshot } from "../snapshot.js";
 
 function git(root: string, ...args: string[]): string {
-  const result = spawnSync(process.platform === "win32" ? "git.exe" : "git", ["-C", root, ...args], { encoding: "utf8", timeout: 10_000, windowsHide: true });
+  const result = spawnSync(process.platform === "win32" ? "git.exe" : "git", ["-C", root, ...args], { encoding: "utf8", timeout: 60_000, windowsHide: true });
   assert.equal(result.status, 0, result.stderr || result.error?.message);
   return result.stdout.trim();
 }

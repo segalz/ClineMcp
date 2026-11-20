@@ -1,6 +1,6 @@
 import { spawn } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
-import { lstat, mkdir, readdir, readFile, readlink, realpath, rename, rm, rmdir, writeFile } from "node:fs/promises";
+import { lstat, mkdir, open, readdir, readFile, readlink, realpath, rename, rm, rmdir, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { defaultKillTree } from "./runner.js";
@@ -134,7 +134,25 @@ async function safeAncestors(root: string, file: string): Promise<boolean> {
   return true;
 }
 
-const MAX_SYMLINK_PLACEHOLDER_BYTES = 1024 * 1024;
+const HASH_CHUNK_BYTES = 64 * 1024;
+
+async function hashFile(file: string, signal?: AbortSignal): Promise<string> {
+  if (signal?.aborted) throw signal.reason ?? new DOMException("The operation was aborted.", "AbortError");
+  const handle = await open(file, "r");
+  try {
+    const digest = createHash("sha256");
+    const buffer = Buffer.allocUnsafe(HASH_CHUNK_BYTES);
+    while (true) {
+      if (signal?.aborted) throw signal.reason ?? new DOMException("The operation was aborted.", "AbortError");
+      const { bytesRead } = await handle.read(buffer, 0, buffer.length, null);
+      if (bytesRead === 0) break;
+      digest.update(buffer.subarray(0, bytesRead));
+    }
+    return digest.digest("hex");
+  } finally {
+    await handle.close();
+  }
+}
 
 async function specialState(root: string, file: string, kind: "symlink" | "submodule", signal?: AbortSignal, checkBaseline = false): Promise<string> {
   const absolute = relativePath(root, file);
@@ -153,8 +171,7 @@ async function specialState(root: string, file: string, kind: "symlink" | "submo
       return `link:${target}`;
     }
     if (stat.isFile()) {
-      if (stat.size > MAX_SYMLINK_PLACEHOLDER_BYTES) return `file-large:${stat.size}`;
-      return `file:${hash(await readFile(absolute, { signal }))}`;
+      return `file:${await hashFile(absolute, signal)}`;
     }
     return "other";
   }

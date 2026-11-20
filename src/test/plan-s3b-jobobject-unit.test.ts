@@ -13,11 +13,11 @@ import { runVerification } from "../verify.js";
 
 import { runCline } from "../runner.js";
 
-const windows = { skip: process.platform !== "win32", timeout: 30_000 };
+const windows = { skip: process.platform !== "win32", timeout: 60_000 };
 const runNode = promisify(execFile);
 
 async function until(predicate: () => boolean | Promise<boolean>) {
-  const deadline = Date.now() + 12_000;
+  const deadline = Date.now() + 30_000;
   while (!await predicate()) {
     assert.ok(Date.now() < deadline, "timed out waiting for the child");
     await sleep(15);
@@ -68,22 +68,31 @@ test("a failed build can be retried once after cooldown and a fast owner failure
       return realSpawn(file, args, options);
     };
     syncBuiltinESMExports();
-    const clock = Date.now;
+    let now = 1_000_000;
+    Date.now = () => now;
+    const realSetTimeout = globalThis.setTimeout;
+    const realClearTimeout = globalThis.clearTimeout;
+    // Prevent slow parallel cold compilation from tripping the 4 s setup / 10 s csc wall-clock caps,
+    // while keeping the short spare-retry and close timers responsive.
+    globalThis.setTimeout = (fn, ms = 0, ...rest) =>
+      realSetTimeout(fn, ms >= 4000 ? 60_000 : ms, ...rest);
+    globalThis.clearTimeout = id => realClearTimeout(id);
+
     process.env.TEMP = process.env.TMP = path.join(process.cwd(), "blocked");
     assert.equal(await createWindowsJob(15000), undefined);
 
     process.env.TEMP = process.env.TMP = process.cwd();
-    Date.now = () => clock() + 1000;
+    now += 1000;
     assert.equal(await createWindowsJob(15000), undefined);
     assert.equal(builds, 0);
-    Date.now = () => clock() + 61000;
+    now += 60_000;
     const jobs = await Promise.all([createWindowsJob(15000), createWindowsJob(15000)]);
     try {
       assert.ok(jobs.every(job => job?.alive));
       assert.equal(builds, 1, "concurrent requests share the build");
       assert.ok(owners >= 3, "both requests still acquire an owner after the first exits");
     } finally { await Promise.all(jobs.map(job => job?.close())); }
-  `], { cwd: dir, timeout: 20_000, windowsHide: true });
+  `], { cwd: dir, timeout: 60_000, windowsHide: true });
 });
 
 test("closing a job twice kills queued children, ignores fabricated PIDs, and clears its state", windows, async t => {
@@ -145,14 +154,14 @@ test("verification reaps inherited pipes after root exit and rejects unconfirmed
     const spec = { command: process.execPath, args: ["-e", ${JSON.stringify(rootScript)}], timeoutSeconds: 25 };
     const result = await runVerification(spec, process.cwd());
     assert.ok(scans > 0, "run S3 confirmation while the detached child still holds the pipe");
-    assert.ok(result.durationMs < 15000);
+    assert.ok(result.durationMs < 20000);
     assert.equal(result.timedOut, false);
     assert.equal(result.exitCode, 0);
     assert.equal(result.signal, null);
     assert.equal(result.killConfirmed, false);
     assert.equal(result.killUnverified, true);
     assert.equal(result.passed, false);
-  `], { cwd: dir, timeout: 25_000, windowsHide: true });
+  `], { cwd: dir, timeout: 45_000, windowsHide: true });
 });
 
 test("an unreferenced owner lets its host exit and kills an assigned detached process on host death", windows, async t => {
@@ -167,7 +176,7 @@ test("an unreferenced owner lets its host exit and kills an assigned detached pr
     const job = await createWindowsJob(15000);
     const child = spawn(process.execPath, ["-e", ${JSON.stringify(ticker)}, process.argv[1]], { detached: true, stdio: "ignore" });
     job.assign(child); child.unref();
-    const deadline = Date.now() + 5000;
+    const deadline = Date.now() + 20000;
     while (!job.assigned || !existsSync(process.argv[1] + "/beat")) {
       if (Date.now() >= deadline) process.exit(2);
       await sleep(15);

@@ -74,10 +74,9 @@ test("S10 review: keep after HEAD moved reports the new HEAD as headAfter", asyn
   await f.manager.send(task.taskId, "", "keep");
   await f.wait(task.taskId, ["done", "failed"]);
   const result = await f.manager.result(task.taskId) as any;
-  if (result.result?.headAfter !== undefined) {
-    assert.equal(result.result.headBefore, before);
-    assert.equal(result.result.headAfter, after);
-  }
+  assert.equal(result.state, "done");
+  assert.equal(result.result?.headBefore, before);
+  assert.equal(result.result?.headAfter, after);
 });
 
 // --- B10: Cline timeout at the end of the budget -------------------------------------

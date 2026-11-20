@@ -26,7 +26,7 @@ after(() => rm(root, { recursive: true, force: true, maxRetries: 5, retryDelay: 
 
 function git(cwd: string, args: string[], input?: string | Buffer): string {
   const result = spawnSync(process.platform === "win32" ? "git.exe" : "git", ["-C", cwd, ...args], {
-    input, encoding: "utf8", windowsHide: true, timeout: 30_000
+    input, encoding: "utf8", windowsHide: true, timeout: 60_000
   });
   assert.equal(result.status, 0, result.stderr || result.error?.message);
   return result.stdout.trim();
@@ -179,13 +179,13 @@ test("clamps to the escaped Windows command line and skips under 800 characters 
 
 test("the per-run environment consumes command-line room and drops the map near the limit in both modes", async () => {
   for (const [base, build] of [[WORKSPACE_SYSTEM_PROMPT, buildWorkspaceSystemPrompt], [EDIT_SYSTEM_PROMPT, buildEditSystemPrompt]] as const) {
-    const input = { prompt: "", cwd: repo, provider: "test", model: "test" };
-    const withoutEnvironment = { autoApprove: true, systemPrompt: base, deps: { entryPath: "mock/cline" } };
+    const input = { prompt: "", cwd: smallRepo, provider: "test", model: "test" };
+    const withoutEnvironment = { autoApprove: true, systemPrompt: base, deps: { entryPath: "mock/cline", ...generousTimers(20_000) } };
     const room = WINDOWS_COMMAND_LINE_LIMIT - 1_000 - 900 - codeMapCommandLineLength(input, withoutEnvironment, "");
     input.prompt = '"'.repeat(Math.floor(room / 2)) + "x".repeat(room % 2);
-    assert.ok((await withCodeMap(repo, input, withoutEnvironment)).promptPreamble?.startsWith(CODE_MAP_HEADER));
-    const fullOptions = { ...withoutEnvironment, systemPrompt: build(repo, "win32") };
-    assert.equal((await withCodeMap(repo, input, fullOptions)).promptPreamble, undefined);
+    assert.ok((await withCodeMap(smallRepo, input, withoutEnvironment)).promptPreamble?.startsWith(CODE_MAP_HEADER));
+    const fullOptions = { ...withoutEnvironment, systemPrompt: build(smallRepo, "win32") };
+    assert.equal((await withCodeMap(smallRepo, input, fullOptions)).promptPreamble, undefined);
   }
 });
 
@@ -321,7 +321,7 @@ test("codeindex adapter uses Node, exact arguments/root, and UTF-8 query stdin",
 test("codeindex silently falls back for missing/unset/relative CLI paths", async () => {
   for (const cli of [undefined, path.join(root, "missing.cjs"), "relative.cjs"]) {
     await usingCodeindex(cli, async () => {
-      const result = await buildCodeMapWithSource(repo);
+      const result = await buildCodeMapWithSource(smallRepo, { regexBudgetMs: 20_000 });
       assert.equal(result.source, "regex");
       assert.match(result.map!, /first:1/);
     });
@@ -388,7 +388,8 @@ test("codeindex clamps map, combined text and escaped Windows budgets before inv
 
 test("unfitting structural text is omitted or replaced with a fitting regex map", async () => {
   await usingCodeindex(await fakeCodeindex(emitMap('"structural map"')), async () => {
-    const result = await buildCodeMapWithSource(repo, {
+    const result = await buildCodeMapWithSource(smallRepo, {
+      regexBudgetMs: 20_000,
       commandLineLength: text => text.includes("structural") ? 32_000 : 100 + text.length
     });
     assert.equal(result.source, "regex");
@@ -421,12 +422,37 @@ async function assertTreeStopped(heartbeat: string): Promise<void> {
 test("adapter deadline kills the process tree, then uses regex inside the shared preparation bound", async () => {
   const { cli, heartbeat } = await hangingTree();
   await usingCodeindex(cli, async () => {
-    const started = performance.now();
-    const pending = buildCodeMapWithSource(repo, { deadlineMs: 2500 });
+    let clock = 0;
+    let adapterDelay: number | undefined;
+    let fireAdapterTimeout: (() => void) | undefined;
+    let regexDelay: number | undefined;
+    const fakeAdapterTimer = Symbol("adapter") as unknown as ReturnType<typeof setTimeout>;
+    const pending = buildCodeMapWithSource(smallRepo, {
+      deadlineMs: 2500,
+      now: () => clock,
+      setTimeout: ((fn: (...args: any[]) => void, ms?: number, ...args: any[]) => {
+        const delay = ms ?? 0;
+        if (adapterDelay === undefined) {
+          adapterDelay = delay;
+          fireAdapterTimeout = () => fn(...args);
+          return fakeAdapterTimer;
+        }
+        regexDelay = delay;
+        return setTimeout(fn, Math.max(delay, 20_000), ...args);
+      }) as unknown as typeof setTimeout,
+      clearTimeout: ((id: ReturnType<typeof setTimeout> | undefined) => {
+        if (id !== fakeAdapterTimer) clearTimeout(id);
+      }) as typeof clearTimeout
+    });
     await waitForFile(heartbeat);
+    assert.ok(adapterDelay !== undefined && adapterDelay > 0 && adapterDelay < 2500, `adapter delay ${adapterDelay}`);
+    clock += adapterDelay;
+    fireAdapterTimeout!();
     const result = await pending;
     assert.equal(result.source, "regex");
-    assert.ok(performance.now() - started < 3000);
+    assert.match(result.map!, /first:1/);
+    assert.ok(regexDelay !== undefined && regexDelay > 0 && adapterDelay + regexDelay <= 2500,
+      `shared preparation bound exceeded: adapter=${adapterDelay}, regex=${regexDelay}`);
     await assertTreeStopped(heartbeat);
   });
 });

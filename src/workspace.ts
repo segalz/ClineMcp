@@ -9,6 +9,7 @@ import { subfolderOf } from "./finalcheck.js";
 import { listClineProcesses, type ProcessInfo } from "./procs.js";
 import {
   defaultKillTree,
+  enforceQuotaLock,
   killTreeAndWait,
   ClineRunError,
 
@@ -130,21 +131,30 @@ let activeWorktreeRuns = 0;
 export const LEFTOVER_MIN_AGE_MS = 60_000;
 
 /** Yield directories children-first, only after checking the entire worktree for files. */
-async function* emptyWorktreeFolders(base: string, minAgeMs = LEFTOVER_MIN_AGE_MS) {
+async function* emptyWorktreeFolders(base: string, minAgeMs = LEFTOVER_MIN_AGE_MS, nowMs = Date.now()) {
   const entries = await readdir(base, { withFileTypes: true }).catch(() => []);
   for (const entry of entries) {
     if (!entry.isDirectory() || !entry.name.startsWith("review-")) continue;
     const modified = await stat(path.join(base, entry.name)).then(info => info.mtimeMs, () => undefined);
-    if (modified === undefined || (minAgeMs > 0 && Date.now() - modified < minAgeMs)) continue;
+    if (modified === undefined || (minAgeMs > 0 && nowMs - modified < minAgeMs)) continue;
     const folders: string[] = [];
     if (await folderIsEmptyOrGone(path.join(base, entry.name), folders) && folders.length) yield folders;
   }
 }
 
 /** True when an emptied `review-*` worktree folder is left behind: the sign of a hub still holding it. */
-export async function hasEmptyWorktreeFolder(base = WORKTREE_BASE, minAgeMs = LEFTOVER_MIN_AGE_MS): Promise<boolean> {
-  const first = await emptyWorktreeFolders(base, minAgeMs).next();
+export async function hasEmptyWorktreeFolder(base = WORKTREE_BASE, minAgeMs = LEFTOVER_MIN_AGE_MS, nowMs = Date.now()): Promise<boolean> {
+  const first = await emptyWorktreeFolders(base, minAgeMs, nowMs).next();
   return !first.done;
+}
+
+async function folderIsOldEnoughOrGone(folder: string, minAgeMs: number, nowMs: number): Promise<boolean> {
+  try {
+    const info = await stat(folder);
+    return !(minAgeMs > 0 && nowMs - info.mtimeMs < minAgeMs);
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code === "ENOENT";
+  }
 }
 
 async function folderIsEmptyOrGone(folder: string, folders?: string[]): Promise<boolean> {
@@ -160,6 +170,57 @@ async function folderIsEmptyOrGone(folder: string, folders?: string[]): Promise<
   }
 }
 
+export interface LeftoverHubCleanupDeps {
+  base?: string;
+  minAgeMs?: number;
+  now?: () => number;
+  isSoleRun?: () => boolean;
+  listProcesses?: typeof listClineProcesses;
+  killTree?: (pid: number) => Promise<unknown>;
+}
+
+/**
+ * Stop leftover hub daemons whose own worktree folder is old enough and already empty, then sweep empty
+ * leftover `review-*` folders. Applies `minAgeMs` to each hub's own cwd folder as well as to the trigger.
+ */
+export async function cleanupLeftoverHubs(deps: LeftoverHubCleanupDeps = {}): Promise<void> {
+  const worktreeBase = deps.base ?? WORKTREE_BASE;
+  const minAgeMs = deps.minAgeMs ?? LEFTOVER_MIN_AGE_MS;
+  const now = deps.now ?? Date.now;
+  const isSoleRun = deps.isSoleRun ?? (() => true);
+  if (!isSoleRun()) return;
+  const normalizedBase = `${normalizePathForMatch(path.resolve(worktreeBase))}/`;
+  // The ~1 s process scan runs only when an emptied worktree folder is left behind (plan S6, B6): that is
+  // the sign of a hub still holding it. Each run's own hub is stopped by runCline itself.
+  if (!await hasEmptyWorktreeFolder(worktreeBase, minAgeMs, now()) || !isSoleRun()) return;
+  for (const { pid, commandLine } of await (deps.listProcesses ?? listClineProcesses)()) {
+    const cwd = hubDaemonCwd(commandLine);
+    if (!cwd) continue;
+    const resolvedCwd = path.resolve(cwd);
+    const normalizedCwd = normalizePathForMatch(resolvedCwd);
+    if (!normalizedCwd.startsWith(normalizedBase)) continue;
+    const topSegment = normalizedCwd.slice(normalizedBase.length).split("/")[0];
+    const worktreeRoot = path.join(worktreeBase, topSegment);
+    const nowMs = now();
+    // Apply the age rule to the hub's own folder (and its review-* root when nested) so a fresh worktree
+    // being set up by another bridge process is never killed when an unrelated old folder triggers cleanup.
+    if (!await folderIsOldEnoughOrGone(resolvedCwd, minAgeMs, nowMs)) continue;
+    if (normalizePathForMatch(path.resolve(worktreeRoot)) !== normalizedCwd &&
+        !await folderIsOldEnoughOrGone(worktreeRoot, minAgeMs, nowMs)) continue;
+    // Wait for the kill: the sweep below cannot remove a folder the hub still holds.
+    if (!await folderIsEmptyOrGone(resolvedCwd)) continue;
+    if (!isSoleRun()) return;
+    await (deps.killTree ?? killTreeAndWait)(pid);
+  }
+  for await (const folders of emptyWorktreeFolders(worktreeBase, minAgeMs, now())) {
+    for (const folder of folders) {
+      if (!isSoleRun()) return;
+      // rmdir also checks at removal time: a file created since the sweep must survive.
+      await rmdir(folder).catch(() => {});
+    }
+  }
+}
+
 /**
  * Each bridge run uses its own hub (runCline's dedicatedHub), stopped when the run ends. Older bridge
  * versions let the shared hub settle inside a worktree, where it keeps the folder busy on Windows.
@@ -168,27 +229,9 @@ async function folderIsEmptyOrGone(folder: string, folders?: string[]): Promise<
  */
 async function ensureNeutralHub(options: Partial<ClineInvocationOptions>): Promise<void> {
   if (process.platform !== "win32" || options.deps?.spawn || options.deps?.entryPath || activeWorktreeRuns !== 1) return;
-  const base = `${normalizePathForMatch(WORKTREE_BASE)}/`;
   // The hub is shared by every Cline run on the machine, so a leftover one is stopped only while
   // this bridge has no other worktree run in flight, and only when its folder is already empty.
-  // The ~1 s process scan runs only when an emptied worktree folder is left behind (plan S6, B6): that is
-  // the sign of a hub still holding it. Each run's own hub is stopped by runCline itself.
-  if (!await hasEmptyWorktreeFolder() || activeWorktreeRuns !== 1) return;
-  for (const { pid, commandLine } of await listClineProcesses()) {
-    const cwd = hubDaemonCwd(commandLine);
-    // Wait for the kill: the sweep below cannot remove a folder the hub still holds.
-    if (cwd && normalizePathForMatch(cwd).startsWith(base) && await folderIsEmptyOrGone(cwd)) {
-      if (activeWorktreeRuns !== 1) return;
-      await killTreeAndWait(pid);
-    }
-  }
-  for await (const folders of emptyWorktreeFolders(WORKTREE_BASE)) {
-    for (const folder of folders) {
-      if (activeWorktreeRuns !== 1) return;
-      // rmdir also checks at removal time: a file created since the sweep must survive.
-      await rmdir(folder).catch(() => {});
-    }
-  }
+  await cleanupLeftoverHubs({ isSoleRun: () => activeWorktreeRuns === 1 });
 }
 
 async function removeWorktreeFolder(repositoryRoot: string, worktreePath: string): Promise<void> {
@@ -226,6 +269,10 @@ export async function askClineWorkspace(
 
 async function runWorkspace(input: AskClineWorkspaceInput, signal: AbortSignal | undefined,
   options: Partial<ClineInvocationOptions>): Promise<ClineResponse> {
+  if (signal?.aborted) throw new ClineRunError("cancelled", "The Cline request was cancelled.", { attempts: 0 });
+  const provider = options.provider ?? input.provider;
+  const model = options.model ?? input.model;
+  if (provider && model) await enforceQuotaLock(provider, model, options);
   const requestedCwd = path.resolve(input.cwd);
   let repositoryRoot: string;
   let commit: string;

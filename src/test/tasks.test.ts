@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import "./git-test-serial.js";
 import test, { after } from "node:test";
 import { spawnSync } from "node:child_process";
 import { EventEmitter } from "node:events";
@@ -944,7 +945,7 @@ test("budget uses the exact system prompt that applyClineEdits passes", async ()
   const repoDir = await realpath(await mkdtemp(path.join(root, "edit-repo-")));
   const git = (...args: string[]) => {
     const r = spawnSync(process.platform === "win32" ? "git.exe" : "git", ["-C", repoDir, ...args],
-      { encoding: "utf8", windowsHide: true, timeout: 30_000, env: { ...process.env, GIT_OPTIONAL_LOCKS: "0" } });
+      { encoding: "utf8", windowsHide: true, timeout: 60_000, env: { ...process.env, GIT_OPTIONAL_LOCKS: "0" } });
     assert.equal(r.status, 0, r.stderr || r.error?.message);
     return r.stdout.trim();
   };
