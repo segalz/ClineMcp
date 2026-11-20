@@ -15,6 +15,7 @@ import {
   parseClineJsonl,
   parseUsableResult,
   extractLastJsonlError,
+  lastTerminalErrorMessage,
   type ClineFinalResult
 } from "./parser.js";
 import {
@@ -309,21 +310,22 @@ export function redactSecrets(text: string): string {
   if (!text) return "";
   let result = text;
 
-  // 1. JSON-style double-quoted keys:
-  result = result.replace(
-    /"(apiKey|api_key|x-api-key|api-key|accessToken|refreshToken|token|secret|password|key|authorization|proxy-authorization|cookie|set-cookie)"(\s*:\s*)"[^"]*"/gi,
-    '"$1"$2"<redacted>"'
-  );
+  const typeKeyword = /^(?:string|number|boolean|bigint|symbol|object|unknown|any|never|void|undefined|null|true|false)(?:\[\])?$/;
 
-  // 2. JSON-style single-quoted keys:
+  // Quoted keys in JSON and configuration snippets. A nested object or array is left alone (its own keys are
+  // checked separately), and an exact type keyword (`"apiKey": string`) is a type annotation, not a value.
   result = result.replace(
-    /'(apiKey|api_key|x-api-key|api-key|accessToken|refreshToken|token|secret|password|key|authorization|proxy-authorization|cookie|set-cookie)'(\s*:\s*)'[^']*'/gi,
-    "'$1'$2'<redacted>'"
+    /((["'])(?:api[_-]?key|x-api-key|(?:access|refresh|auth)[_-]?token|client[_-]?secret|token|secret|password|key|authorization|proxy-authorization|cookie|set-cookie)\2\s*[:=]\s*)(?:(Bearer|Basic)\s+)?("(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|[^\s"',;}\]{[][^\s"',;}\]]*)/gi,
+    (match, prefix, _keyQuote, scheme: string | undefined, value: string) => {
+      if (!scheme && (typeKeyword.test(value) || value === "<redacted>")) return match;
+      const quote = /^["']/.test(value) ? value[0] : "";
+      return prefix + (scheme ? `${scheme} ` : "") + quote + "<redacted>" + quote;
+    }
   );
 
   // 3. Environment variable assignments (e.g. KEY=val, NVIDIA_KEY=val, MY_TOKEN=val):
   result = result.replace(
-    /\b([A-Za-z0-9_]*(?:API_KEY|TOKEN|SECRET|PASSWORD|_KEY|KEY)[A-Za-z0-9_]*\s*=\s*)(?:"[^"]*"|'[^']*'|\S+)/gi,
+    /\b([A-Za-z0-9_]*(?:API_KEY|TOKEN|SECRET|PASSWORD|_KEY|KEY)[A-Za-z0-9_]*\s*=\s*)(?:"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|\S+)/gi,
     "$1<redacted>"
   );
 
@@ -348,13 +350,14 @@ export function redactSecrets(text: string): string {
   // 7. Key-value forms for token, key, secret, password (e.g. token: ..., secret = ..., password: ...):
   // Redacts whole value up to whitespace/quote/comma/semicolon (covers JWT a.b.c),
   // while keeping TypeScript/JS type annotations like `key: string` or `token: unknown[]`.
-  const typeKeyword = /^(?:string|number|boolean|bigint|symbol|object|unknown|any|never|void|undefined|null|true|false)(?:\[\])?$/;
   result = result.replace(
-    /\b(token|key|secret|password)\s*([:=]|\bis\b)\s*(?:(Bearer|Basic)\s+(?:<redacted>|[^\s"',;]+)|(<redacted>|(?:"[^"]*"|'[^']*')|[^\s"',;]+))/gi,
+    /\b(api_?key|(?:access|refresh|auth)[_-]?token|client[_-]?secret|token|key|secret|password)\s*([:=]|\bis\b)\s*(?:(Bearer|Basic)\s+(?:<redacted>|[^\s"',;]+)|(<redacted>|(?:"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*')|[^\s"',;]+))/gi,
     (match, keyName, sep, scheme, value) => {
       if (sep === ":" && !scheme && value && typeKeyword.test(value)) {
         return match;
       }
+      // Already redacted by an earlier rule (e.g. `AUTH_TOKEN=<redacted>`): keep the text exactly as it is.
+      if (!scheme && value === "<redacted>") return match;
       const isIs = sep.toLowerCase() === "is";
       const separator = isIs ? " is " : (sep.includes("=") ? " = " : ": ");
       if (scheme) {
@@ -516,31 +519,6 @@ export function extractPlainStderrError(stderr: string): string | undefined {
   return undefined;
 }
 
-/** The text of the LAST terminal run error (plan S15: an earlier error, e.g. an old quota line, never decides the run). */
-function extractRunResultErrorText(stdout: string): string | undefined {
-  let last: string | undefined;
-  for (const rawLine of stdout.split(/\r?\n/)) {
-    const line = rawLine.trim();
-    if (!line) continue;
-    try {
-      const parsed = JSON.parse(line);
-      if (parsed && typeof parsed === "object") {
-        if (["run_result", "run-finished", "run_completed"].includes(String(parsed.type))) {
-          // Wrapped forms carry the reason and text in `result` / `run_result` / `run.resultSummary`.
-          const wrapped = [parsed.result, parsed.run_result, parsed.run?.resultSummary]
-            .find(value => value && typeof value === "object" && !Array.isArray(value));
-          const source = parsed.type === "run_result" ? parsed : wrapped ?? parsed;
-          if (String(parsed.finishReason ?? source.finishReason ?? "") === "error") {
-            const text = source.text ?? source.outputText ?? source.finalText ?? parsed.text;
-            if (typeof text === "string") last = text;
-          }
-        }
-      }
-    } catch {}
-  }
-  return last;
-}
-
 export function hasMadeToolCallsOrModifications(stdout: string): boolean {
   for (const rawLine of stdout.split(/\r?\n/)) {
     const line = rawLine.trim();
@@ -566,11 +544,6 @@ export function hasMadeToolCallsOrModifications(stdout: string): boolean {
     }
   }
   return false;
-}
-
-function isToolEvent(event?: { type?: unknown; contentType?: unknown }): boolean {
-  return typeof event?.type === "string" &&
-    (event.type.toLowerCase().includes("tool") || (event.type === "content_start" && event.contentType === "tool"));
 }
 
 async function validateCwd(cwd: string | undefined, accessFn?: typeof access): Promise<string | undefined> {
@@ -832,6 +805,7 @@ async function runClineInner(
     const last = reports.at(-1) ?? existing ?? { window: options.guard?.window ?? input.guard?.window ?? 10,
       lastErrors: [], totalToolCalls: 0, totalInputTokens: 0, budgetInputTokens: 0, filesTouched: [] };
     return Object.assign(last, {
+      ...(reports.length ? { processToolCalls: reports.reduce((sum, report) => sum + (report.processToolCalls ?? 0), 0) } : {}),
       totalToolCalls: reports.length ? reports.reduce((sum, report) => sum + report.totalToolCalls, 0) : last.totalToolCalls,
       totalInputTokens: reports.length ? reports.reduce((sum, report) => sum + report.totalInputTokens, 0) : last.totalInputTokens,
       budgetInputTokens: reports.length ? reports.reduce((sum, report) => sum + (report.budgetInputTokens ?? report.totalInputTokens), 0)
@@ -1062,24 +1036,32 @@ async function runClineCore(input: AskClineInput, signal: AbortSignal | undefine
         // Per-attempt line splitting for the live trace; fragments never join across attempts.
         const thisAttempt = attempt;
         recorder?.attemptStarted(thisAttempt);
-        const guard = createGuard(options.guard ?? effectiveInput.guard);
+        const attemptGuard = { ...effectiveInput.guard, maxToolCalls: effectiveInput.guard?.maxToolCalls ?? 150,
+          maxInputTokens: effectiveInput.guard?.maxInputTokens ?? 1_500_000 };
+        for (const previous of guards) {
+          const report = previous.snapshot();
+          attemptGuard.maxToolCalls -= report.totalToolCalls;
+          attemptGuard.maxInputTokens -= report.budgetInputTokens ?? report.totalInputTokens;
+        }
+        if (guards.length && (attemptGuard.maxToolCalls <= 0 || attemptGuard.maxInputTokens <= 0)) {
+          throw new ClineRunError("budget_exceeded", "No guard budget remains for another attempt.", { attempts: attempt - 1 });
+        }
+        const guard = createGuard(attemptGuard);
         guards.push(guard);
         // Never repeat an attempt whose model already ran tools (plan S6, B1): its work may be half done.
-        let toolActivity = false;
-        const canRetry = options.canRetry ?? (() => !toolActivity && guard.snapshot().totalToolCalls === 0);
         const guardState: { verdict: GuardVerdict | null } = { verdict: null };
+        let trippedOnResult = false;
         let terminateChild!: (reason: "timeout" | "cancelled" | "guard") => void;
         const splitter = new LineSplitter(
           line => {
             recorder?.line(line, thisAttempt);
-            if (guardState.verdict) return;
             try {
               const parsed = JSON.parse(line.trim());
               if (parsed && typeof parsed === "object") {
-                toolActivity ||= isToolEvent(parsed) || isToolEvent(parsed.event);
                 const verdict = guard.observe(parsed);
                 if (verdict) {
                   guardState.verdict = verdict;
+                  trippedOnResult = verdict.kind === "budget_exceeded" && !!parseUsableResult(line, 0);
                   recorder?.line(JSON.stringify({
                     attempt: thisAttempt,
                     type: "guard_trip",
@@ -1092,7 +1074,7 @@ async function runClineCore(input: AskClineInput, signal: AbortSignal | undefine
             } catch {}
           },
           () => {
-            toolActivity = true;
+            guard.oversizedLine();
             recorder?.oversizedLine(thisAttempt);
           }
         );
@@ -1392,7 +1374,7 @@ async function runClineCore(input: AskClineInput, signal: AbortSignal | undefine
           throw new ClineRunError(
             "launch_failed",
             `Unable to launch the local Cline CLI${errCode}: ${exitInfo.error.message || String(exitInfo.error)}`,
-            { exitCode: null, attempts: attempt }
+            { exitCode: null, attempts: attempt, processesStillAlive: exitInfo.processesStillAlive, killUnverified: exitInfo.killUnverified }
           );
         }
 
@@ -1408,14 +1390,17 @@ async function runClineCore(input: AskClineInput, signal: AbortSignal | undefine
         const aliveSentence = processesStillAlive
           ? ` Process tree kill was not confirmed; PIDs still alive: ${processesStillAlive.join(", ")}.`
           : (exitInfo.killUnverified ? " The process list could not be read, so the stopped run's child processes are not confirmed dead." : "");
+        const killEvidence = { processesStillAlive, killUnverified: exitInfo.killUnverified };
+        const canRetry = (output: { stdout: string; stderr: string; attempt: number }) => !aliveSentence &&
+          (options.canRetry ? options.canRetry(output) : !guard.toolActivity && guard.snapshot().totalToolCalls === 0);
 
         if (guardState.verdict) {
           const verdict = guardState.verdict;
-          const summary = buildGuardTripMessage(verdict, options.guard ?? effectiveInput.guard) + aliveSentence;
+          const summary = buildGuardTripMessage(verdict, attemptGuard) + aliveSentence;
           // The final run_result carries cumulative token counts, so the guard can trip on the very
           // event that holds the finished answer. A completed answer is kept, with the trip as a warning.
-          const finished = verdict.kind === "budget_exceeded" ? parseUsableResult(stdout, effectiveCode) : null;
-          if (finished) {
+          const finished = trippedOnResult ? parseUsableResult(stdout, effectiveCode) : null;
+          if (finished && !(options.editHub && aliveSentence)) {
             return {
               ...finished,
               warnings: [...(finished.warnings ?? []), `guard: ${summary}`],
@@ -1448,6 +1433,9 @@ async function runClineCore(input: AskClineInput, signal: AbortSignal | undefine
         // 1. Usable completed result check FIRST
         const usableResult = parseUsableResult(stdout, effectiveCode);
         if (usableResult) {
+          if (options.editHub && aliveSentence) {
+            throw new ClineRunError("edits_inspection_failed", aliveSentence.trim(), { exitCode: code, attempts: attempt, ...killEvidence });
+          }
           // A finished run whose leftover processes could not be confirmed dead keeps its answer, with a warning.
           const aliveWarnings = aliveSentence ? [aliveSentence.trim()] : [];
           if (code !== 0) {
@@ -1474,7 +1462,11 @@ async function runClineCore(input: AskClineInput, signal: AbortSignal | undefine
         }
 
         // A provider may print a quota error and then hang; never retry that scope.
-        const earlyQuotaText = [extractLastJsonlError(stdout, stderr), extractRunResultErrorText(stdout), stderr].filter(Boolean).join("\n");
+        const rawExtracted = extractLastJsonlError(stdout, stderr);
+        // stdout's last terminal error decides the run (an older quota line never does); without one, every
+        // diagnostic counts, stderr included, as before S18.
+        const terminalError = lastTerminalErrorMessage(stdout);
+        const earlyQuotaText = terminalError ?? [rawExtracted, stderr].filter(Boolean).join("\n");
         if (isDailyQuotaText(earlyQuotaText)) {
           const quota = classifyErrorText(earlyQuotaText, wallNow());
           throw new ClineRunError("quota_exhausted", `Cline daily free quota exhausted. Not retried.${aliveSentence}`, {
@@ -1525,6 +1517,7 @@ async function runClineCore(input: AskClineInput, signal: AbortSignal | undefine
 
         // 3. Check for MODULE_NOT_FOUND in stderr (auto-update), routed through canRetry
         if (
+          // The CLI itself crashed: only its stderr can say so, never the model's own error text (plan S18 review).
           stderr.includes("MODULE_NOT_FOUND") ||
           stderr.includes("Cannot find module")
         ) {
@@ -1553,23 +1546,20 @@ async function runClineCore(input: AskClineInput, signal: AbortSignal | undefine
               exitCode: code,
               stderrTail,
               stdoutTail,
-              attempts: attempt
+              attempts: attempt, ...killEvidence
             }
           );
         }
 
         // 4. Extract errors and classify transient/non-transient BEFORE code === 0 check
-        const rawExtracted = extractLastJsonlError(stdout, stderr);
         const extractedError = rawExtracted ? redactSecrets(rawExtracted) : undefined;
-        const rawRunResultError = extractRunResultErrorText(stdout);
-        const runResultErrorText = rawRunResultError ? redactSecrets(rawRunResultError) : undefined;
         const rawPlainStderrError = extractPlainStderrError(stderr);
         const plainStderrError = rawPlainStderrError ? redactSecrets(rawPlainStderrError) : undefined;
 
         const transient = isTransientError({
           code,
-          stderr,
-          runResultErrorText,
+          // Older stderr diagnostics count unless stdout's last terminal error decides the run.
+          stderr: terminalError === undefined ? stderr : undefined,
           extractedError,
           timedOut: false
         });
@@ -1595,30 +1585,29 @@ async function runClineCore(input: AskClineInput, signal: AbortSignal | undefine
             continue;
           }
           const exitMsg = code !== null ? ` (exit code ${code})` : exitInfo.signal ? ` (signal ${exitInfo.signal})` : "";
-          const effectiveDetail = extractedError || runResultErrorText || plainStderrError || "Service temporarily unavailable";
+          const effectiveDetail = extractedError || plainStderrError || "Service temporarily unavailable";
           const summary = `Cline failed with transient provider error${exitMsg}: ${effectiveDetail}.`;
-          const msg = buildErrorTextWithTails(summary, stderrTail, stdoutTail);
-          throw new ClineRunError("transient_provider_error", msg, {
+          throw new ClineRunError("transient_provider_error", summary, {
             exitCode: code,
             stderrTail,
             stdoutTail,
             attempts: attempt,
-            extractedMessage: effectiveDetail
+            extractedMessage: effectiveDetail, ...killEvidence
           });
         }
 
         // 5. If not transient, but run_result or stderr had an error message (even with code === 0):
-        if (runResultErrorText || extractedError || (plainStderrError && /error/i.test(plainStderrError))) {
-          const errorDetail = extractedError || runResultErrorText || plainStderrError;
+        if (extractedError || (plainStderrError && /error/i.test(plainStderrError))) {
+          const errorDetail = extractedError || plainStderrError;
           const exitMsg = code !== null && code !== 0 ? ` (exit code ${code})` : exitInfo.signal ? ` (signal ${exitInfo.signal})` : "";
           const summary = `Cline failed${exitMsg}: ${errorDetail}.`;
-          const msg = buildErrorTextWithTails(summary, stderrTail, stdoutTail);
-          throw new ClineRunError("non_zero_exit", msg, {
+          // Keep tails in their diagnostic fields: provider status classifies the error message.
+          throw new ClineRunError("non_zero_exit", summary, {
             exitCode: code,
             stderrTail,
             stdoutTail,
             attempts: attempt,
-            extractedMessage: errorDetail
+            extractedMessage: errorDetail, ...killEvidence
           });
         }
 
@@ -1629,13 +1618,13 @@ async function runClineCore(input: AskClineInput, signal: AbortSignal | undefine
           } catch (error) {
             if (error instanceof JsonlParseError) {
               const kind = error.message.includes("malformed") ? "malformed_json" : "missing_final_result";
-              throw new ClineRunError(kind, error.message, { exitCode: 0, stderrTail, stdoutTail, attempts: attempt });
+              throw new ClineRunError(kind, error.message, { exitCode: 0, stderrTail, stdoutTail, attempts: attempt, ...killEvidence });
             }
             throw new ClineRunError("missing_final_result", "Cline did not return a usable final result.", {
               exitCode: 0,
               stderrTail,
               stdoutTail,
-              attempts: attempt
+              attempts: attempt, ...killEvidence
             });
           }
         }
@@ -1653,7 +1642,7 @@ async function runClineCore(input: AskClineInput, signal: AbortSignal | undefine
           stderrTail,
           stdoutTail,
           attempts: attempt,
-          extractedMessage: extractedError
+          extractedMessage: extractedError, ...killEvidence
         });
       }
 

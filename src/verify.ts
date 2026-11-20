@@ -169,14 +169,15 @@ function tail(chunks: Buffer[]): string {
   return redacted.subarray(start).toString("utf8");
 }
 
-export async function runVerification(spec: VerificationCommand, cwd: string, signal?: AbortSignal): Promise<VerificationResult> {
+export async function runVerification(spec: VerificationCommand, cwd: string, signal?: AbortSignal,
+  deps: { createWindowsJob?: typeof createWindowsJob; confirmTreeDead?: typeof confirmTreeDead } = {}): Promise<VerificationResult> {
   const timeout = spec.timeoutSeconds ?? 60;
   if (!Number.isInteger(timeout) || timeout < 1 || timeout > 300) throw new VerificationError("verification_refused", "Verification timeout must be 1-300 seconds.");
   const started = performance.now();
   const executable = await resolveVerificationCommand(spec.command, spec.args, cwd);
   const prepareStarted = performance.now();
   const useJob = process.platform === "win32";
-  const job = useJob ? await createWindowsJob(timeout * 1000, signal) : undefined;
+  const job = useJob ? await (deps.createWindowsJob ?? createWindowsJob)(timeout * 1000, signal) : undefined;
   const remainingMs = Math.max(0, timeout * 1000 - (useJob ? performance.now() - prepareStarted : 0));
   if (signal?.aborted) {
     await job?.close();
@@ -196,9 +197,13 @@ export async function runVerification(spec: VerificationCommand, cwd: string, si
     let killDeadline: ReturnType<typeof setTimeout> | undefined, exitGrace: ReturnType<typeof setTimeout> | undefined;
     // The verify tree must be confirmed dead before the result returns: a restore can follow.
     let confirm: Promise<TreeKillResult> | undefined;
+    let jobWasAssigned = false;
+    // Set when the root exited but something kept its pipes open: a likely survivor, so an unreadable process
+    // table must fail the check (S3b). Pipes that closed normally are not such evidence (plan S18 review).
+    let pipesHeldOpen = false;
     let exitedAt: number | undefined;
     const rootAlive = () => exitedAt === undefined && child.exitCode === null && child.signalCode === null;
-    const confirmKill = (pid: number) => confirmTreeDead(pid, {
+    const confirmKill = (pid: number) => (deps.confirmTreeDead ?? confirmTreeDead)(pid, {
       killRoot: () => defaultKillTree(pid), isRootAlive: rootAlive, rootStartedMs, rootExitedMs: () => exitedAt
     }).catch(() => ({ confirmed: false, alive: [pid], unverified: true }));
     const destroyPipes = () => { child.stdout.destroy(); child.stderr.destroy(); };
@@ -227,10 +232,14 @@ export async function runVerification(spec: VerificationCommand, cwd: string, si
     const finish = (exitCode: number | null, exitSignal: NodeJS.Signals | null) => {
       if (done) return;
       done = true; cleanup();
-      const settle = (kill?: TreeKillResult) => resolve({ passed: exitCode === 0 && !timedOut && !cancelled && !exitSignal && (!kill || kill.confirmed),
+      // A check that ended by itself fails the tree check only on a real survivor: an unreadable process table alone
+      // must not turn a passing check into a failure (plan S18 review). A stopped check needs a confirmed kill.
+      const ended = !stopped && !timedOut && !cancelled;
+      const unsafe = (kill?: TreeKillResult): kill is TreeKillResult => !!kill && !kill.confirmed && (!ended || pipesHeldOpen || kill.alive.length > 0);
+      const settle = (kill?: TreeKillResult) => resolve({ passed: exitCode === 0 && !timedOut && !cancelled && !exitSignal && !unsafe(kill),
         exitCode, signal: exitSignal ?? (cancelled ? "SIGKILL" : null), timedOut, killedForOutput: false,
         durationMs: performance.now() - started, stdoutTail: tail(stdout.chunks.slice(stdout.head)), stderrTail: tail(stderr.chunks.slice(stderr.head)),
-        ...(kill && !kill.confirmed ? { killConfirmed: false as const, stillAlive: kill.alive, ...(kill.unverified ? { killUnverified: true as const } : {}) } : {}) });
+        ...(unsafe(kill) ? { killConfirmed: false as const, stillAlive: kill.alive, ...(kill.unverified ? { killUnverified: true as const } : {}) } : {}) });
       if (confirm) void confirm.then(settle); else settle();
     };
     const collect = (chunk: Buffer, stream: RollingBuffer) => {
@@ -248,17 +257,22 @@ export async function runVerification(spec: VerificationCommand, cwd: string, si
     });
     child.once("exit", (code, sig) => {
       exitedAt = Date.now();
+      // Closing the job clears `assigned`; remember it first so `close` does not run a needless tree check.
+      if (job?.assigned) jobWasAssigned = true;
       void job?.close();
       if (done || stopped || !pid) return;
       clearTimeout(timer);
       // A child outside the job can keep the pipes open after the root exits.
       exitGrace = setTimeout(() => {
+        pipesHeldOpen = true;
         confirm = confirmKill(pid);
         finish(code, sig);
         destroyPipes();
       }, EXIT_GRACE_MS);
     });
     child.once("close", (code, sig) => {
+      // Closed pipes do not prove all descendants exited. Without an assigned job, await the tree check.
+      if (!done && !confirm && !jobWasAssigned && !job?.assigned && pid) confirm = confirmKill(pid);
       if (stopped) finish(null, "SIGKILL");
       else finish(code, sig);
     });

@@ -46,7 +46,7 @@ function modelFrom(value: JsonObject): string | undefined {
 
 type TerminalEvent =
   | { kind: "result"; completed: boolean; result: ClineFinalResult }
-  | { kind: "error" }
+  | { kind: "error"; message?: string }
   | undefined;
 
 /**
@@ -60,7 +60,7 @@ function terminalEvent(event: JsonObject): TerminalEvent {
       ? event
       : object(event.result) ?? object(event.run_result) ?? (eventRun ? object(eventRun.resultSummary) : undefined);
     const finishReason = String(event.finishReason ?? result?.finishReason ?? "");
-    if (finishReason === "error") return { kind: "error" };
+    if (finishReason === "error") return { kind: "error", message: terminalErrorText(result ?? event, event) };
     if (!result) return undefined;
     const text = textFrom(result);
     if (!text) return undefined;
@@ -75,7 +75,7 @@ function terminalEvent(event: JsonObject): TerminalEvent {
   if (event.type === "agent_event") {
     const inner = object(event.event);
     if (!inner || inner.type !== "done") return undefined;
-    if (inner.reason === "error") return { kind: "error" };
+    if (inner.reason === "error") return { kind: "error", message: terminalErrorText(inner, event) };
     if (inner.reason !== "completed") return undefined;
     const text = textFrom(inner) ?? (typeof inner.text === "string" ? inner.text : undefined);
     if (!text) return undefined;
@@ -88,6 +88,35 @@ function terminalEvent(event: JsonObject): TerminalEvent {
     } };
   }
   return undefined;
+}
+
+/** The message of a terminal error, or undefined when it carries none (then earlier diagnostics must still count). */
+function terminalErrorText(result: JsonObject, event: JsonObject): string | undefined {
+  for (const source of [result, event]) {
+    const error = object(source.error);
+    for (const candidate of [textFrom(source), source.error, source.message, error?.message]) {
+      if (typeof candidate === "string" && candidate.trim()) return candidate.trim();
+    }
+  }
+  return undefined;
+}
+
+/**
+ * The message of stdout's LAST terminal event when that event is an error with a message. This decides the run:
+ * an earlier quota line or older stderr diagnostics never override it (plan S15/S18, C7).
+ */
+export function lastTerminalErrorMessage(stdout: string): string | undefined {
+  let last: TerminalEvent;
+  for (const rawLine of stdout.split(/\r?\n/)) {
+    const line = rawLine.trim();
+    if (!line) continue;
+    let event: JsonObject | undefined;
+    try { event = object(JSON.parse(line)); } catch { continue; }
+    if (!event) continue;
+    const terminal = terminalEvent(event);
+    if (terminal) last = terminal;
+  }
+  return last?.kind === "error" ? last.message : undefined;
 }
 
 /**
@@ -115,9 +144,12 @@ export function parseUsableResult(stdout: string, exitCode: number): ClineFinalR
 }
 
 /**
- * Extracts the last JSONL error message from stderr or stdout.
+ * Extracts the error that decides a failed run. stdout's last terminal error (with a message) wins; otherwise
+ * the most recent diagnostic, stderr first (provider and CLI errors), then stdout (as before S18).
  */
 export function extractLastJsonlError(stdout: string, stderr: string): string | undefined {
+  const terminalMessage = lastTerminalErrorMessage(stdout);
+  if (terminalMessage) return terminalMessage;
   const sources = [stderr, stdout];
   for (const src of sources) {
     if (!src) continue;
@@ -127,11 +159,11 @@ export function extractLastJsonlError(stdout: string, stderr: string): string | 
       try {
         const parsed = JSON.parse(line);
         if (!parsed || typeof parsed !== "object") continue;
+        const terminal = terminalEvent(parsed);
+        // A terminal error without a message must not hide an earlier, informative one: keep looking.
+        if (terminal?.kind === "error" && terminal.message) return terminal.message;
         if (parsed.type === "error" && typeof parsed.message === "string") {
           return parsed.message.trim();
-        }
-        if (parsed.type === "run_result" && parsed.finishReason === "error" && typeof parsed.text === "string") {
-          return parsed.text.trim();
         }
         if (parsed.event && typeof parsed.event === "object") {
           if (parsed.event.type === "error" && typeof parsed.event.message === "string") {

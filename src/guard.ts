@@ -34,12 +34,25 @@ export interface GuardReport {
 export type GuardVerdict = GuardReport & { kind: GuardVerdictKind };
 
 export interface Guard {
+  readonly toolActivity: boolean;
+  oversizedLine(): void;
   observe(event: Record<string, any>): GuardVerdict | null;
   snapshot(): GuardReport;
 }
 
 function isObject(val: unknown): val is Record<string, any> {
   return val !== null && typeof val === "object" && !Array.isArray(val);
+}
+
+/** A tool call being made: `content_start` of a tool block, or a `tool_call` / `tool_use` event. */
+function isToolInvocation(event: Record<string, any>): boolean {
+  return (event.type === "content_start" && event.contentType === "tool") ||
+    /^tool_(?:call|use)(?:_start)?$/i.test(String(event.type));
+}
+
+function isToolEvent(event: unknown): event is Record<string, any> {
+  return isObject(event) && typeof event.type === "string" &&
+    (event.type.toLowerCase().includes("tool") || (event.type === "content_start" && event.contentType === "tool"));
 }
 
 export function normalizePath(p: string): string {
@@ -415,6 +428,7 @@ export function createGuard(options?: GuardOptions): Guard {
 
   let totalToolCalls = 0;
   let processToolCalls = 0;
+  let toolActivity = false;
   let incrementalTokens = 0;
   let cumulativeTokens = 0;
   let incrementalBudgetTokens = 0;
@@ -498,8 +512,18 @@ export function createGuard(options?: GuardOptions): Guard {
   }
 
   function observe(event: Record<string, any>): GuardVerdict | null {
-    if (trippedVerdict !== null) return null;
     if (!event || typeof event !== "object") return null;
+    const tool = isToolEvent(event.event) ? event.event : isToolEvent(event) ? event : undefined;
+    if (tool) {
+      toolActivity = true;
+      // Only an invocation can start a process. Results, outputs and tool catalogs (`tool_result`, `tools_loaded`)
+      // must not count, or the reused hub would be stopped after every file-only run (plan S18 review).
+      if (isToolInvocation(tool)) {
+        const name = typeof tool.toolName === "string" ? tool.toolName : tool.name;
+        if (canStartProcess(typeof name === "string" ? name : "tool")) processToolCalls++;
+      }
+    }
+    if (trippedVerdict !== null) return null;
 
     // 0. Capture assistant text excerpt (only assistant text blocks and terminal done/run_result)
     const inner = (event.type === "agent_event" && isObject(event.event)) ? event.event : event;
@@ -568,7 +592,6 @@ export function createGuard(options?: GuardOptions): Guard {
       const signature = `${toolName.toLowerCase().trim()}:${target}`;
 
       totalToolCalls++;
-      if (canStartProcess(toolName)) processToolCalls++;
       if (totalToolCalls > maxToolCalls) {
         return trip("budget_exceeded", toolName, target, undefined, allErrors.slice(-3));
       }
@@ -678,7 +701,7 @@ export function createGuard(options?: GuardOptions): Guard {
 
   function snapshot(): GuardReport {
     if (trippedVerdict !== null) {
-      return buildReport(trippedVerdict);
+      return buildReport({ ...trippedVerdict, processToolCalls });
     }
     return buildReport({
       kind: undefined,
@@ -696,7 +719,8 @@ export function createGuard(options?: GuardOptions): Guard {
     });
   }
 
-  return { observe, snapshot };
+  return { observe, snapshot, get toolActivity() { return toolActivity; },
+    oversizedLine() { toolActivity = true; processToolCalls++; } };
 }
 
 export function buildGuardTripMessage(verdict: GuardVerdict, options?: GuardOptions): string {

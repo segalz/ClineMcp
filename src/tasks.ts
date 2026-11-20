@@ -791,7 +791,9 @@ export class TaskManager {
       lifecycle.evidence.cleanupError = redactSecrets(String(error));
     }).finally(() => {
       task.waitReason = lifecycle.waitReason; task.evidence = lifecycle.evidence;
-      task.question = lifecycle.question ?? (nextState === "input_required" ? {
+      task.question = lifecycle.question ?? (nextState === "input_required" ? lifecycle.killUnconfirmed ? {
+        question: "A surviving process may still change files. Restore the baseline or keep unverified changes?",
+        options: ["restore", "keep"] } : {
         question: `Edit stopped: ${lifecycle.waitReason}. Retry with guidance, restore baseline, or keep unverified changes?`,
         options: ["retry", "restore", "keep"] } : undefined);
       const warnings = [...(lifecycle.result?.warnings ?? []), ...lifecycle.hubWarnings, ...(gitReport?.warnings ?? [])];
@@ -915,6 +917,10 @@ export class TaskManager {
     if (task.finalCheck) {
       if (!["retry", "restore", "keep"].includes(action) || typeof message !== "string" || message.length > 20_000)
         throw new ClineRunError("launch_failed", "Expected retry, restore or keep, and guidance up to 20000 characters.");
+      if (action === "retry" && task.finalCheck.killUnconfirmed) {
+        throw new ClineRunError("launch_failed", "A process from the stopped edit or check may still be running and change files, " +
+          "so no further run is started. Use restore or keep.", { attempts: 0 });
+      }
       if (action === "retry" && this.running().length >= MAX_RUNNING_TASKS) throw new ClineRunError("task_limit", "At most two tasks run at once.");
       this.launchFinalCheck(task, action as EditAction, message); this.holdCall(task); return this.view(task);
     }

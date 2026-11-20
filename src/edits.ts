@@ -58,6 +58,29 @@ export class ClineEditsError extends ClineRunError {
   }
 }
 
+/** Diagnostic fields shared by failed apply_cline_edits replies. */
+export function editFailurePayload(error: unknown): Record<string, unknown> {
+  if (error && typeof error === "object" && "verification" in error) {
+    const failure = error as Partial<ClineRunError> & { verification: unknown; evidence?: unknown;
+      usage?: unknown; cost?: unknown; durationMs?: number };
+    return { kind: failure.kind ?? "edit_failed", message: failure.message, verification: failure.verification,
+      evidence: failure.evidence, trace: failure.trace, guard: failure.guard, codeMapSource: failure.codeMapSource ?? "none",
+      usage: failure.usage, cost: failure.cost, durationMs: failure.durationMs, ...(failure.notes?.length ? { notes: failure.notes } : {}) };
+  }
+  if (error instanceof ClineRunError) {
+    return { kind: error.kind, message: error.message, exitCode: error.exitCode ?? undefined, attempts: error.attempts,
+      stderrTail: error.stderrTail || undefined, stdoutTail: error.stdoutTail || undefined, trace: error.trace,
+      guard: error.guard, codeMapSource: error.codeMapSource ?? "none", ...(error.notes?.length ? { notes: error.notes } : {}),
+      ...(error instanceof ClineEditsError ? error.evidence : {
+        resetAt: error.resetAt, retryAfterSeconds: error.retryAfterSeconds,
+        ...(error.processesStillAlive?.length ? { processesStillAlive: error.processesStillAlive } : {}),
+        ...(error.killUnverified ? { killUnverified: true } : {}) }) };
+  }
+  const details = error as { trace?: unknown; guard?: unknown } | undefined;
+  return { kind: "unexpected", message: error instanceof Error ? error.message : "The Cline editing request failed unexpectedly.",
+    trace: details?.trace, guard: details?.guard };
+}
+
 const MAX_DIFF_CHARACTERS = 48_000;
 export const EDIT_SYSTEM_PROMPT = [
   "You are implementing a software-development task directly in the current Git checkout.",

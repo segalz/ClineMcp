@@ -2,7 +2,7 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
 import { askCline, ClineRunError, formatErrorAsText, guardOptionsSchema } from "./runner.js";
-import { applyClineEdits, ClineEditsError } from "./edits.js";
+import { applyClineEdits, editFailurePayload } from "./edits.js";
 import { askClineWorkspace } from "./workspace.js";
 import { clinePing } from "./ping.js";
 import { listFreeModels, writeCatalogSnapshot } from "./models.js";
@@ -174,53 +174,7 @@ server.registerTool(
         ...(result.trace ? { trace: result.trace } : {})
       });
     } catch (error) {
-      if (error && typeof error === "object" && "verification" in error) {
-        const failure = error as Error & { kind?: string; verification: unknown; evidence?: unknown; trace?: unknown; guard?: unknown; codeMapSource?: unknown;
-          usage?: unknown; cost?: unknown; durationMs?: number; notes?: string[] };
-        return await replyJson({ kind: failure.kind ?? "edit_failed", message: failure.message,
-          verification: failure.verification, evidence: failure.evidence, trace: failure.trace, guard: failure.guard, codeMapSource: failure.codeMapSource ?? "none",
-          usage: failure.usage, cost: failure.cost, durationMs: failure.durationMs,
-          // e.g. a hub that could not be stopped at the end of the edit (plan S16 review).
-          ...(failure.notes?.length ? { notes: failure.notes } : {}) }, { isError: true });
-      }
-      if (error instanceof ClineEditsError) {
-        return await replyJson({
-          kind: error.kind,
-          message: error.message,
-          ...(error.exitCode !== undefined && error.exitCode !== null ? { exitCode: error.exitCode } : {}),
-          ...(error.attempts !== undefined ? { attempts: error.attempts } : {}),
-          ...(error.stderrTail ? { stderrTail: error.stderrTail } : {}),
-          ...(error.stdoutTail ? { stdoutTail: error.stdoutTail } : {}),
-          ...(error.trace ? { trace: error.trace } : {}),
-          ...(error.guard ? { guard: error.guard } : {}),
-          codeMapSource: error.codeMapSource ?? "none",
-          ...error.evidence
-        }, { isError: true });
-      }
-      if (error instanceof ClineRunError) {
-        return await replyJson({
-          kind: error.kind,
-          message: error.message,
-          ...(error.exitCode !== undefined && error.exitCode !== null ? { exitCode: error.exitCode } : {}),
-          ...(error.attempts !== undefined ? { attempts: error.attempts } : {}),
-          ...(error.resetAt ? { resetAt: error.resetAt } : {}),
-          ...(error.retryAfterSeconds !== undefined ? { retryAfterSeconds: error.retryAfterSeconds } : {}),
-          ...(error.stderrTail ? { stderrTail: error.stderrTail } : {}),
-          ...(error.stdoutTail ? { stdoutTail: error.stdoutTail } : {}),
-          ...(error.trace ? { trace: error.trace } : {}),
-          ...(error.guard ? { guard: error.guard } : {}),
-          ...(error.processesStillAlive?.length ? { processesStillAlive: error.processesStillAlive } : {}),
-          ...(error.killUnverified ? { killUnverified: true } : {}),
-          codeMapSource: error.codeMapSource ?? "none",
-          ...(error.notes?.length ? { notes: error.notes } : {})
-        }, { isError: true });
-      }
-      return await replyJson({
-        kind: "unexpected",
-        message: error instanceof Error ? error.message : "The Cline editing request failed unexpectedly.",
-        ...((error as { trace?: unknown } | undefined)?.trace ? { trace: (error as { trace: unknown }).trace } : {}),
-        ...((error as { guard?: unknown } | undefined)?.guard ? { guard: (error as { guard: unknown }).guard } : {})
-      }, { isError: true });
+      return await replyJson(editFailurePayload(error), { isError: true });
     }
   })
 );

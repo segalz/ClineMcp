@@ -125,6 +125,13 @@ export class FinalCheckLifecycle {
   /** New, non-ignored files present when the edit finished (absent when there are none). */
   createdFiles?: string[];
   private releaseOwnLock = false;
+  get killUnconfirmed(): boolean { return this.evidence.processesStillAlive !== undefined; }
+  private recordUnconfirmedKill(pids: number[] = [], unverified?: boolean): void {
+    this.evidence.processesStillAlive = pids;
+    if (unverified) this.evidence.killUnverified = true;
+    this.evidence.warning = "A surviving process may still change files, including after restoration.";
+    if (this.snapshot) this.evidence.snapshotDirectory = this.snapshot.directory;
+  }
   constructor(readonly input: FinalCheckInput, readonly deps: FinalCheckDeps) {
     if (Buffer.byteLength(JSON.stringify(input), "utf8") > 64 * 1024) throw new ClineRunError("launch_failed", "Input exceeds 64 KiB.");
     input.verify = verificationSchema.parse(input.verify);
@@ -157,6 +164,7 @@ export class FinalCheckLifecycle {
     return this.deps.fits(prompt + interruption) ? prompt + interruption : prompt;
   }
   async execute(signal: AbortSignal, guidance?: string): Promise<void> {
+    if (this.killUnconfirmed) return;
     const hub = new DedicatedHubSession();
     // Each execute reports only its own hub-stop failures (an earlier execute already reported its own).
     this.hubWarnings.length = 0;
@@ -230,7 +238,12 @@ export class FinalCheckLifecycle {
           response = await this.deps.run(prompt, controller.signal, this.lock!, { ...this.input.guard, maxToolCalls: calls, maxInputTokens: tokens },
             remainingSeconds, this.launches, hub);
           this.result = response;
-        } catch (error) { failure = error; }
+        } catch (error) {
+          failure = error;
+          if (error instanceof ClineRunError && (error.processesStillAlive?.length || error.killUnverified)) {
+            this.recordUnconfirmedKill(error.processesStillAlive, error.killUnverified);
+          }
+        }
         const metrics = (response ?? failure) as Partial<ClineResponse> | undefined;
         this.codeMapSource = metrics?.codeMapSource ?? "none";
         this.totalToolCalls += metrics?.guard?.totalToolCalls ?? 0;
@@ -270,8 +283,8 @@ export class FinalCheckLifecycle {
             durationMs: now() - verifyStarted, stdoutTail: "", stderrTail: message, error: message };
         }
         if (verified.killConfirmed === false) {
-          this.evidence.processesStillAlive = verified.stillAlive ?? [];
-          if (verified.killUnverified) this.evidence.killUnverified = true;
+          this.recordUnconfirmedKill(verified.stillAlive, verified.killUnverified);
+          verified.passed = false;
         }
         verified.stdoutTail = redactSecrets(verified.stdoutTail); verified.stderrTail = redactSecrets(verified.stderrTail);
         this.verification.attempts.push({ ...verified, run: this.launches });
@@ -280,18 +293,13 @@ export class FinalCheckLifecycle {
         if (!await this.unchanged(wait)) return;
         check();
         if (verified.passed) { await this.complete(); return; }
-        if (verified.error || manual || this.automaticFixes >= (this.input.maxFixRuns ?? 2)) {
+        if (this.killUnconfirmed || verified.error || manual || this.automaticFixes >= (this.input.maxFixRuns ?? 2)) {
           wait("verify_failed", verified.error ? new VerificationError("verification_launch_failed", verified.error) : undefined); return;
         }
         prompt = this.preview();
         this.automaticFixes++; repair = true;
       }
     } catch (error) {
-      // A stopped run whose processes could not be confirmed dead: keep that visible even when cancelled.
-      if (error instanceof ClineRunError && (error.processesStillAlive?.length || error.killUnverified)) {
-        this.evidence.processesStillAlive = error.processesStillAlive ?? [];
-        if (error.killUnverified) this.evidence.killUnverified = true;
-      }
       if (!signal.aborted) wait(expired ? "budget" : "cline_error", error);
     } finally {
       try {
@@ -330,7 +338,9 @@ export class FinalCheckLifecycle {
     this.phase = "done"; this.waitReason = undefined; this.question = undefined;
     // Verified edits must never be restored because the recovery folder could not be deleted.
     const snapshot = this.snapshot;
-    this.snapshot = undefined; delete this.evidence.snapshotDirectory;
+    this.snapshot = undefined;
+    if (this.killUnconfirmed) return;
+    delete this.evidence.snapshotDirectory;
     if (snapshot) {
       // Report every new file the edit left behind (a stray debug script, too); a report failure changes nothing.
       try { const created = await createdFiles(snapshot); if (created.length) this.createdFiles = created; }

@@ -174,6 +174,8 @@ Setup failures before a lock is acquired can instead finish as `failed`. While w
 - `restore`: restore the original baseline and finish. Refusal/incomplete restoration stays visible with recovery evidence.
 - `keep`: finish with current edits explicitly unverified. Identity refusal retains the recovery snapshot.
 
+If the bridge cannot confirm that an edit or check process tree stopped, it blocks automatic repairs and manual retries. You can still restore or keep the edits. The bridge retains the recovery snapshot at `evidence.snapshotDirectory` and reports any known surviving PIDs. A surviving process may change files even after a successful restore.
+
 Cancellation aborts active work, attempts restoration, then releases the lock and publishes `cancelled`; identity refusal or incomplete restoration retains recovery evidence. Once completion has committed, cancellation waits for settlement. Ask/workspace cancellation has no edit snapshot and waits up to 5 seconds for an active run to settle.
 
 ### Snapshot and checkout lock
