@@ -33,7 +33,8 @@ export async function resolveVerificationCommand(command: string, args: string[]
   if (!command || command.includes("\0") || args.some(arg => typeof arg !== "string" || arg.includes("\0"))) {
     throw new VerificationError("verification_refused", "Verification requires a command and literal string arguments.");
   }
-  const hasDirectory = command.includes("/") || command.includes("\\");
+  // A drive-relative path (`C:npm`) names a location too; it must never fall back to the installed tool.
+  const hasDirectory = command.includes("/") || command.includes("\\") || /^[A-Za-z]:/.test(command);
   const bare = !hasDirectory && !path.extname(command);
   if (process.platform !== "win32") {
     // POSIX spawns resolve through PATH; check that the target is a runnable file so directories or non-executables are refused up front.

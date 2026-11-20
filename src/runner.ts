@@ -319,7 +319,7 @@ export function redactSecrets(text: string): string {
   // Quoted keys in JSON and configuration snippets. A nested object or array is left alone (its own keys are
   // checked separately), and an exact type keyword (`"apiKey": string`) is a type annotation, not a value.
   result = result.replace(
-    /((["'])(?:api[_-]?key|x-api-key|(?:access|refresh|auth)[_-]?token|client[_-]?secret|token|secret|password|key|authorization|proxy-authorization|cookie|set-cookie)\2\s*[:=]\s*)(?:(Bearer|Basic)\s+)?("(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|[^\s"',;}\]{[][^\s"',;}\]]*)/gi,
+    /((["'])(?:api[_-]?key|x-api-key|(?:access|refresh|auth)[_-]?token|client[_-]?secret|token|secret|password|key|authorization|proxy-authorization|cookie|set-cookie)\2\s*[:=]\s*)(?:(Bearer|Basic)[ \t]+)?("(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|[^\s"',;}\]{[][^\s"',;}\]]*)/gi,
     (match, prefix, _keyQuote, scheme: string | undefined, value: string) => {
       if (!scheme && (typeKeyword.test(value) || value === "<redacted>")) return match;
       const quote = /^["']/.test(value) ? value[0] : "";
@@ -336,7 +336,7 @@ export function redactSecrets(text: string): string {
   // 4. Header-style Authorization and Proxy-Authorization:
   // Authorization: Basic ..., Authorization: Bearer ..., Authorization: <scheme> <value>, or Authorization: <value>
   result = result.replace(
-    /\b((?:Proxy-)?Authorization\s*:\s*)(?:([A-Za-z0-9_-]+)\s+)?(?:"[^"]*"|'[^']*'|[^\s"',;]+)/gi,
+    /\b((?:Proxy-)?Authorization\s*:\s*)(?:([A-Za-z0-9_-]+)[ \t]+)?(?:"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|[^\s"',;]+)/gi,
     (match, prefix, scheme) => {
       return scheme ? `${prefix}${scheme} <redacted>` : `${prefix}<redacted>`;
     }
@@ -347,7 +347,7 @@ export function redactSecrets(text: string): string {
 
   // 6. Headers / key-value forms for x-api-key, api-key:
   result = result.replace(
-    /\b(x-api-key|api-key)\s*[:=]\s*(?:(?:Bearer|Basic)[ \t]+)?(?:"[^"]*"|'[^']*'|\S+)/gi,
+    /\b(x-api-key|api-key)\s*[:=]\s*(?:(?:Bearer|Basic)[ \t]+)?(?:"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|\S+)/gi,
     "$1: <redacted>"
   );
 
@@ -517,6 +517,8 @@ function plainStderrDiagnostics(stderr: string): string[] {
     }
     if (
       /error/i.test(line) ||
+      // A bare leading status (`429 status code (no body)`) is a provider diagnostic too (plan S20, Gate 6).
+      /^429\b/.test(line) ||
       /(?:status|code|http)\D{0,5}(?:429|5\d\d)\b/i.test(line) ||
       /\b(overloaded|rate\s*limit|too\s*many\s*requests|temporarily\s*unavailable|temporarily\s*overloaded|econnreset|etimedout)\b/i.test(line) ||
       /\b(upstream\s*error|provider\s*error)\b/i.test(line)
@@ -717,7 +719,10 @@ export async function stopDedicatedHub(port: number, deps: HubStopDeps): Promise
     if (stopped !== false && !await isListening(port)) return;
     if (process.platform === "win32") {
       const listProcesses = deps.listProcesses ?? listClineProcesses;
-      for (const pid of hubDaemonPidsOnPort(port, await listProcesses())) {
+      const processes = await listProcesses();
+      // The stop failed and the process list cannot be read: the daemon is not confirmed dead (plan S20, Gate 6).
+      if (!processes) return { confirmed: false, alive, unverified: true };
+      for (const pid of hubDaemonPidsOnPort(port, processes)) {
         const confirmed = await (deps.killTree ?? killTreeAndWait)(pid).catch(() => false);
         if (confirmed !== true) alive.push(pid);
       }
@@ -1634,7 +1639,7 @@ async function runClineCore(input: AskClineInput, signal: AbortSignal | undefine
             stderrTail,
             stdoutTail,
             attempts: attempt,
-            extractedMessage: diagnostic || effectiveDetail, diagnostics: plainDiagnostics, ...killEvidence
+            extractedMessage: diagnostic || effectiveDetail, diagnostics: [...plainDiagnostics, ...(extractedError ? [extractedError] : [])], ...killEvidence
           });
         }
 
@@ -1649,7 +1654,7 @@ async function runClineCore(input: AskClineInput, signal: AbortSignal | undefine
             stderrTail,
             stdoutTail,
             attempts: attempt,
-            extractedMessage: diagnostic, diagnostics: plainDiagnostics, ...killEvidence
+            extractedMessage: diagnostic, diagnostics: [...plainDiagnostics, ...(extractedError ? [extractedError] : [])], ...killEvidence
           });
         }
 
@@ -1684,7 +1689,7 @@ async function runClineCore(input: AskClineInput, signal: AbortSignal | undefine
           stderrTail,
           stdoutTail,
           attempts: attempt,
-          extractedMessage: diagnostic, diagnostics: plainDiagnostics, ...killEvidence
+          extractedMessage: diagnostic, diagnostics: [...plainDiagnostics, ...(extractedError ? [extractedError] : [])], ...killEvidence
         });
       }
 

@@ -193,7 +193,7 @@ export async function cleanupLeftoverHubs(deps: LeftoverHubCleanupDeps = {}): Pr
   // The ~1 s process scan runs only when an emptied worktree folder is left behind (plan S6, B6): that is
   // the sign of a hub still holding it. Each run's own hub is stopped by runCline itself.
   if (!await hasEmptyWorktreeFolder(worktreeBase, minAgeMs, now()) || !isSoleRun()) return;
-  for (const { pid, commandLine } of await (deps.listProcesses ?? listClineProcesses)()) {
+  for (const { pid, commandLine } of await (deps.listProcesses ?? listClineProcesses)() ?? []) {
     const cwd = hubDaemonCwd(commandLine);
     if (!cwd) continue;
     const resolvedCwd = path.resolve(cwd);

@@ -5,8 +5,8 @@ export interface ProcessInfo {
   commandLine: string;
 }
 
-/** Lists cline.exe processes with their command lines (Windows only; empty elsewhere or on error). */
-export async function listClineProcesses(): Promise<ProcessInfo[]> {
+/** Lists cline.exe processes with their command lines (Windows only; empty elsewhere). Undefined when the list could not be read. */
+export async function listClineProcesses(): Promise<ProcessInfo[] | undefined> {
   if (process.platform !== "win32") return [];
   const script = "Get-CimInstance Win32_Process -Filter \"Name='cline.exe'\" | "
     + "ForEach-Object { [string]$_.ProcessId + [char]9 + $_.CommandLine }";
@@ -15,12 +15,13 @@ export async function listClineProcesses(): Promise<ProcessInfo[]> {
     const child = spawn("powershell.exe", ["-NoProfile", "-NonInteractive", "-Command", script], {
       windowsHide: true, stdio: ["ignore", "pipe", "ignore"]
     });
-    const timer = setTimeout(() => { try { child.kill(); } catch { /* gone */ } resolve([]); }, 15_000);
+    const timer = setTimeout(() => { try { child.kill(); } catch { /* gone */ } resolve(undefined); }, 15_000);
     timer.unref?.();
     child.stdout.on("data", (chunk: Buffer) => { stdout += chunk.toString("utf8"); });
-    child.on("error", () => { clearTimeout(timer); resolve([]); });
-    child.on("close", () => {
+    child.on("error", () => { clearTimeout(timer); resolve(undefined); });
+    child.on("close", (code) => {
       clearTimeout(timer);
+      if (code !== 0) { resolve(undefined); return; }
       resolve(stdout.split(/\r?\n/).flatMap((line) => {
         const tab = line.indexOf("\t");
         const pid = Number(line.slice(0, tab));

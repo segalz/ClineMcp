@@ -79,3 +79,30 @@ test("S20 review: a quoted value after a Bearer scheme is redacted and the schem
   }
   assert.ok(redactSecrets("token: Bearer\nnext = public").includes("next = public"));
 });
+
+// ---- Argon re-audit (Gate 6) ----
+
+test("Gate 6: a leading-429 JSONL error is still a rate limit when stderr has other diagnostics", async () => {
+  const quiet = await failure(child([{ type: "error", message: "429 Provider returned error" }], "Error closing the stream\n"));
+  assert.equal(classifyRunError(quiet, Date.now())?.state, "rate_limited", `${quiet.kind}: ${quiet.message}`);
+  const bare = await failure(child([{ type: "tool_result", error: "ENOENT" }], "429 status code (no body)\n"));
+  assert.equal(classifyRunError(bare, Date.now())?.state, "rate_limited", `${bare.kind}: ${bare.message}`);
+});
+
+test("Gate 6: a scheme never crosses a line in the JSON-key and Authorization rules; escaped quotes are respected", () => {
+  assert.ok(redactSecrets('"token": Bearer\nnext = public').includes("next = public"));
+  assert.ok(redactSecrets("Authorization: Bearer\nnext = public").includes("next = public"));
+  assert.ok(!redactSecrets(String.raw`x-api-key: "a\"b-secret"`).includes("b-secret"));
+});
+
+test("Gate 6: a drive-relative npm path is not replaced by the installed npm", { skip: process.platform !== "win32" ? "Windows" : false }, async () => {
+  const { resolveVerificationCommand, VerificationError } = await import("../verify.js");
+  await assert.rejects(resolveVerificationCommand("Q:npm", ["test"], os.tmpdir()), VerificationError);
+});
+
+test("Gate 6: a failed hub stop with an unreadable process list is not confirmed", async () => {
+  const { stopDedicatedHub } = await import("../runner.js");
+  const result = await stopDedicatedHub(4321, { hubStarted: async () => true, runHubStop: async () => false,
+    isListening: async () => false, listProcesses: async () => undefined } as any);
+  assert.equal((result as any)?.confirmed, false, JSON.stringify(result));
+});
