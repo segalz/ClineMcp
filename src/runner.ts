@@ -1,6 +1,6 @@
 import { ChildProcess, spawn } from "node:child_process";
 import { hubDaemonPidsOnPort, listClineProcesses } from "./procs.js";
-import { confirmTreeDead } from "./proctree.js";
+import { confirmTreeDead, type TreeKillResult } from "./proctree.js";
 import { createWindowsJob, type WindowsJob } from "./jobobject.js";
 import { randomUUID } from "node:crypto";
 import { access, mkdir, rm } from "node:fs/promises";
@@ -124,6 +124,8 @@ export interface ClineRunErrorDetails {
   stdoutTail?: string;
   attempts?: number;
   extractedMessage?: string;
+  /** Separate plain-stderr diagnostics, each classified on its own (never split into lines). */
+  diagnostics?: string[];
   providerState?: ProviderState;
   resetAt?: string;
   retryAfterSeconds?: number;
@@ -140,6 +142,7 @@ export class ClineRunError extends Error {
   public readonly stdoutTail?: string;
   public readonly attempts?: number;
   public readonly extractedMessage?: string;
+  public readonly diagnostics?: string[];
   public readonly providerState?: ProviderState;
   public readonly resetAt?: string;
   public readonly retryAfterSeconds?: number;
@@ -164,6 +167,7 @@ export class ClineRunError extends Error {
       this.stdoutTail = details.stdoutTail;
       this.attempts = details.attempts;
       this.extractedMessage = details.extractedMessage ? redactSecrets(details.extractedMessage) : undefined;
+      this.diagnostics = details.diagnostics?.length ? details.diagnostics.map(redactSecrets) : undefined;
       this.providerState = details.providerState;
       this.resetAt = details.resetAt;
       this.retryAfterSeconds = details.retryAfterSeconds;
@@ -325,7 +329,7 @@ export function redactSecrets(text: string): string {
 
   // 3. Environment variable assignments (e.g. KEY=val, NVIDIA_KEY=val, MY_TOKEN=val):
   result = result.replace(
-    /\b([A-Za-z0-9_]*(?:API_KEY|TOKEN|SECRET|PASSWORD|_KEY|KEY)[A-Za-z0-9_]*\s*=\s*)(?:"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|\S+)/gi,
+    /\b([A-Za-z0-9_]*(?:API_KEY|TOKEN|SECRET|PASSWORD|_KEY|KEY)[A-Za-z0-9_]*\s*=\s*(?:(?:Bearer|Basic)[ \t]+)?)(?:"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|\S+)/gi,
     "$1<redacted>"
   );
 
@@ -343,7 +347,7 @@ export function redactSecrets(text: string): string {
 
   // 6. Headers / key-value forms for x-api-key, api-key:
   result = result.replace(
-    /\b(x-api-key|api-key)\s*[:=]\s*(?:"[^"]*"|'[^']*'|\S+)/gi,
+    /\b(x-api-key|api-key)\s*[:=]\s*(?:(?:Bearer|Basic)[ \t]+)?(?:"[^"]*"|'[^']*'|\S+)/gi,
     "$1: <redacted>"
   );
 
@@ -351,7 +355,8 @@ export function redactSecrets(text: string): string {
   // Redacts whole value up to whitespace/quote/comma/semicolon (covers JWT a.b.c),
   // while keeping TypeScript/JS type annotations like `key: string` or `token: unknown[]`.
   result = result.replace(
-    /\b(api_?key|(?:access|refresh|auth)[_-]?token|client[_-]?secret|token|key|secret|password)\s*([:=]|\bis\b)\s*(?:(Bearer|Basic)\s+(?:<redacted>|[^\s"',;]+)|(<redacted>|(?:"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*')|[^\s"',;]+))/gi,
+    // A scheme and its value stay on one line, and a quoted value after the scheme is hidden too (plan S20 review).
+    /\b(api_?key|(?:access|refresh|auth)[_-]?token|client[_-]?secret|token|key|secret|password)\s*([:=]|\bis\b)\s*(?:(Bearer|Basic)[ \t]+(?:<redacted>|"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|[^\s"',;]+)|(<redacted>|(?:"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*')|[^\s"',;]+))/gi,
     (match, keyName, sep, scheme, value) => {
       if (sep === ":" && !scheme && value && typeKeyword.test(value)) {
         return match;
@@ -503,20 +508,27 @@ export function isTransientError(info: {
   return patterns.some((pattern) => pattern.test(combined));
 }
 
-export function extractPlainStderrError(stderr: string): string | undefined {
-  const lines = stderr.split(/\r?\n/).map((l) => l.trim()).filter(Boolean);
-  for (let i = lines.length - 1; i >= 0; i--) {
-    const line = lines[i];
+function plainStderrDiagnostics(stderr: string): string[] {
+  const diagnostics: string[] = [];
+  for (const rawLine of stderr.split(/\r?\n/)) {
+    const line = rawLine.trim();
+    if (line.startsWith("{") || line.startsWith("[")) {
+      try { JSON.parse(line); continue; } catch { /* plain diagnostic */ }
+    }
     if (
       /error/i.test(line) ||
       /(?:status|code|http)\D{0,5}(?:429|5\d\d)\b/i.test(line) ||
       /\b(overloaded|rate\s*limit|too\s*many\s*requests|temporarily\s*unavailable|temporarily\s*overloaded|econnreset|etimedout)\b/i.test(line) ||
       /\b(upstream\s*error|provider\s*error)\b/i.test(line)
     ) {
-      return line;
+      diagnostics.push(line);
     }
   }
-  return undefined;
+  return diagnostics;
+}
+
+export function extractPlainStderrError(stderr: string): string | undefined {
+  return plainStderrDiagnostics(stderr).at(-1);
 }
 
 export function hasMadeToolCallsOrModifications(stdout: string): boolean {
@@ -667,7 +679,7 @@ async function freeLoopbackPort(): Promise<number | undefined> {
 
 export const DEDICATED_HUB_BASE = path.join(os.tmpdir(), "cline-mcp-hubs");
 
-export interface DedicatedHub { env: Record<string, string>; stop: () => Promise<void>; isListening?: () => Promise<boolean> }
+export interface DedicatedHub { env: Record<string, string>; stop: () => Promise<TreeKillResult | void>; isListening?: () => Promise<boolean> }
 
 export interface HubStopDeps {
   /** True while something accepts connections on the hub's loopback port. */
@@ -692,19 +704,27 @@ export function loopbackPortListening(port: number, timeoutMs = 1_500): Promise<
 }
 
 /** Stop a detected hub and fall back to a Windows process scan if the stop fails or the port stays open. */
-export async function stopDedicatedHub(port: number, deps: HubStopDeps): Promise<void> {
+export async function stopDedicatedHub(port: number, deps: HubStopDeps): Promise<TreeKillResult | void> {
   const isListening = deps.isListening ?? loopbackPortListening;
   const hubDetected = async () => (await deps.hubStarted?.()) || isListening(port);
+  const alive: number[] = [];
   try {
     if (!await hubDetected()) {
       await new Promise(resolve => setTimeout(resolve, 300));
       if (!await hubDetected()) return;
     }
-    const stopped = await deps.runHubStop?.();
-    if (process.platform === "win32" && (stopped === false || await isListening(port))) {
+    const stopped = await deps.runHubStop?.().catch(() => false);
+    if (stopped !== false && !await isListening(port)) return;
+    if (process.platform === "win32") {
       const listProcesses = deps.listProcesses ?? listClineProcesses;
-      for (const pid of hubDaemonPidsOnPort(port, await listProcesses())) await (deps.killTree ?? killTreeAndWait)(pid);
+      for (const pid of hubDaemonPidsOnPort(port, await listProcesses())) {
+        const confirmed = await (deps.killTree ?? killTreeAndWait)(pid).catch(() => false);
+        if (confirmed !== true) alive.push(pid);
+      }
     }
+    if (await isListening(port) || alive.length) return { confirmed: false, alive, unverified: true };
+  } catch {
+    return { confirmed: false, alive, unverified: true };
   } finally {
     await deps.removeFiles?.();
   }
@@ -755,6 +775,7 @@ interface RunJobs {
 export class DedicatedHubSession {
   readonly jobs: RunJobs = {};
   readonly warnings: string[] = [];
+  unconfirmedStop?: ClineRunError;
   private hub?: DedicatedHub;
   private cwd?: string;
   launched = false;
@@ -764,6 +785,7 @@ export class DedicatedHubSession {
       if (cwd === this.cwd && (!this.hub.isListening || await this.hub.isListening())) return this.hub.env;
       await this.stop();
     }
+    if (this.unconfirmedStop) throw this.unconfirmedStop;
     this.cwd = cwd;
     this.hub = await (options.deps?.startHub ?? dedicatedHub)(options);
     return this.hub?.env;
@@ -774,7 +796,13 @@ export class DedicatedHubSession {
     try {
       if (this.jobs.stopped) await job?.close();
       // Only the launched CLI can have started the daemon.
-      if (this.launched) await this.hub?.stop();
+      const result = this.launched ? await this.hub?.stop() : undefined;
+      if (result && !result.confirmed) {
+        const message = "The dedicated Cline hub could not be confirmed stopped.";
+        this.unconfirmedStop = new ClineRunError("edits_inspection_failed", message,
+          { processesStillAlive: result.alive, killUnverified: true });
+        this.warnings.push(message);
+      }
     } catch (error) {
       this.warnings.push(redactSecrets(`Failed to stop the dedicated Cline hub: ${error instanceof Error ? error.message : String(error)}`));
     } finally {
@@ -1097,6 +1125,7 @@ async function runClineCore(input: AskClineInput, signal: AbortSignal | undefine
         try {
           hubEnv = options.hubEnv ?? await options.hubProvider?.(cwd);
         } catch (error) {
+          if (error instanceof ClineRunError) throw error;
           throw new ClineRunError("launch_failed",
             redactSecrets(`Failed to start the dedicated Cline hub: ${error instanceof Error ? error.message : String(error)}`),
             { attempts: attempt - 1 });
@@ -1564,8 +1593,10 @@ async function runClineCore(input: AskClineInput, signal: AbortSignal | undefine
 
         // 4. Extract errors and classify transient/non-transient BEFORE code === 0 check
         const extractedError = rawExtracted ? redactSecrets(rawExtracted) : undefined;
-        const rawPlainStderrError = extractPlainStderrError(stderr);
+        const plainDiagnostics = terminalError === undefined ? plainStderrDiagnostics(stderr) : [];
+        const rawPlainStderrError = plainDiagnostics.at(-1);
         const plainStderrError = rawPlainStderrError ? redactSecrets(rawPlainStderrError) : undefined;
+        const diagnostic = [...plainDiagnostics, extractedError].filter(Boolean).join("\n");
 
         const transient = isTransientError({
           code,
@@ -1603,7 +1634,7 @@ async function runClineCore(input: AskClineInput, signal: AbortSignal | undefine
             stderrTail,
             stdoutTail,
             attempts: attempt,
-            extractedMessage: effectiveDetail, ...killEvidence
+            extractedMessage: diagnostic || effectiveDetail, diagnostics: plainDiagnostics, ...killEvidence
           });
         }
 
@@ -1618,7 +1649,7 @@ async function runClineCore(input: AskClineInput, signal: AbortSignal | undefine
             stderrTail,
             stdoutTail,
             attempts: attempt,
-            extractedMessage: errorDetail, ...killEvidence
+            extractedMessage: diagnostic, diagnostics: plainDiagnostics, ...killEvidence
           });
         }
 
@@ -1653,7 +1684,7 @@ async function runClineCore(input: AskClineInput, signal: AbortSignal | undefine
           stderrTail,
           stdoutTail,
           attempts: attempt,
-          extractedMessage: extractedError, ...killEvidence
+          extractedMessage: diagnostic, diagnostics: plainDiagnostics, ...killEvidence
         });
       }
 

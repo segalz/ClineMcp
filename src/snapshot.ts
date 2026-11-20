@@ -135,20 +135,28 @@ async function safeAncestors(root: string, file: string): Promise<boolean> {
 }
 
 const HASH_CHUNK_BYTES = 64 * 1024;
+const MAX_FILE_BYTES = 64 * 1024 * 1024;
 
-async function hashFile(file: string, signal?: AbortSignal): Promise<string> {
-  if (signal?.aborted) throw signal.reason ?? new DOMException("The operation was aborted.", "AbortError");
+async function placeholderState(file: string, size: number, signal?: AbortSignal): Promise<string> {
+  signal?.throwIfAborted();
+  if (size > MAX_FILE_BYTES) return `file-size:${size}`;
   const handle = await open(file, "r");
   try {
     const digest = createHash("sha256");
     const buffer = Buffer.allocUnsafe(HASH_CHUNK_BYTES);
-    while (true) {
-      if (signal?.aborted) throw signal.reason ?? new DOMException("The operation was aborted.", "AbortError");
-      const { bytesRead } = await handle.read(buffer, 0, buffer.length, null);
-      if (bytesRead === 0) break;
+    let total = 0;
+    while (total < MAX_FILE_BYTES) {
+      signal?.throwIfAborted();
+      const { bytesRead } = await handle.read(buffer, 0, Math.min(buffer.length, MAX_FILE_BYTES - total), null);
+      signal?.throwIfAborted();
+      if (bytesRead === 0) return `file:${digest.digest("hex")}`;
       digest.update(buffer.subarray(0, bytesRead));
+      total += bytesRead;
     }
-    return digest.digest("hex");
+    // A growing placeholder can reach the cap after its initial stat.
+    const current = await handle.stat();
+    signal?.throwIfAborted();
+    return current.size > MAX_FILE_BYTES ? `file-size:${current.size}` : `file:${digest.digest("hex")}`;
   } finally {
     await handle.close();
   }
@@ -171,7 +179,7 @@ async function specialState(root: string, file: string, kind: "symlink" | "submo
       return `link:${target}`;
     }
     if (stat.isFile()) {
-      return `file:${await hashFile(absolute, signal)}`;
+      return placeholderState(absolute, stat.size, signal);
     }
     return "other";
   }
@@ -263,7 +271,7 @@ function limit(value: number | undefined, maximum: number): number {
 export async function takeSnapshot(checkoutRoot: string, opts: SnapshotOptions = {}): Promise<SnapshotHandle> {
   const root = await checkout(checkoutRoot);
   const maxFiles = limit(opts.maxFiles, 20_000);
-  const maxFile = limit(opts.maxFileBytes, 64 * 1024 * 1024);
+  const maxFile = limit(opts.maxFileBytes, MAX_FILE_BYTES);
   const maxTotal = limit(opts.maxTotalBytes, 512 * 1024 * 1024);
   const envSnapshotDir = process.env.CLINE_MCP_SNAPSHOT_DIR?.trim();
   const base = path.resolve(opts.snapshotBase ?? (envSnapshotDir || path.join(os.tmpdir(), "cline-mcp-snapshots")));

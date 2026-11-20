@@ -1,4 +1,4 @@
-import { access, mkdir, readdir, rm, rmdir, stat } from "node:fs/promises";
+import { mkdir, readdir, realpath, rm, rmdir, stat } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { randomUUID } from "node:crypto";
@@ -314,10 +314,11 @@ async function runWorkspace(input: AskClineWorkspaceInput, signal: AbortSignal |
   // exist at HEAD, so that run starts at the worktree root and says so.
   const inRepository = await subfolderOf(repositoryRoot, requestedCwd);
   const relative = inRepository === undefined ? "" : path.relative(repositoryRoot, inRepository);
-  const wantsSubfolder = relative !== "";
-  const subfolder = wantsSubfolder ? path.join(worktreePath, relative) : undefined;
-  const runCwd = subfolder && await access(subfolder).then(() => true, () => false) ? subfolder : worktreePath;
-  const cwdNote = wantsSubfolder && runCwd === worktreePath
+  const subfolder = relative ? await realpath(path.join(worktreePath, relative)).catch(() => undefined) : undefined;
+  const directory = subfolder && await stat(subfolder).then(info => info.isDirectory(), () => false)
+    ? await subfolderOf(worktreePath, subfolder) : undefined;
+  const runCwd = directory ?? worktreePath;
+  const cwdNote = relative && !directory
     ? `The folder ${relative} does not exist at HEAD; Cline ran at the repository root of the snapshot.` : undefined;
 
   let result: ClineResponse | undefined;

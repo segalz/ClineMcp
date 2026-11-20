@@ -162,22 +162,11 @@ export function extractLastJsonlError(stdout: string, stderr: string): string | 
         const terminal = terminalEvent(parsed);
         // A terminal error without a message must not hide an earlier, informative one: keep looking.
         if (terminal?.kind === "error" && terminal.message) return terminal.message;
-        if (parsed.type === "error" && typeof parsed.message === "string") {
-          return parsed.message.trim();
-        }
-        if (parsed.event && typeof parsed.event === "object") {
-          if (parsed.event.type === "error" && typeof parsed.event.message === "string") {
-            return parsed.event.message.trim();
-          }
-          if (parsed.event.reason === "error" && typeof parsed.event.text === "string") {
-            return parsed.event.text.trim();
-          }
-        }
-        if (typeof parsed.error === "string") {
-          return parsed.error.trim();
-        }
-        if (parsed.error && typeof parsed.error === "object" && typeof parsed.error.message === "string") {
-          return parsed.error.message.trim();
+        const messages = [parsed.type === "error" && parsed.message,
+          parsed.event?.type === "error" && parsed.event.message,
+          parsed.event?.reason === "error" && parsed.event.text, parsed.error, parsed.error?.message];
+        for (const message of messages) {
+          if (typeof message === "string" && message.trim()) return message.trim();
         }
       } catch {
         // Non-JSON line, continue

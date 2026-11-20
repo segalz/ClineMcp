@@ -81,7 +81,7 @@ function httpStatusPattern(code: string): RegExp {
 const RATE_LIMIT_PATTERNS = [
   httpStatusPattern("429"),
   // A leading 429 is a status (`429 Provider returned error`), unless it counts things (`429 files could not be indexed`).
-  /^\s*429\b(?!\s+(?:files?|items?|lines?|records?|rows?|entries|tests?|objects?|bytes?|chars?|characters?|paths?|modules?|packages?|matches|results?|commits?)\b)/i,
+  /^\s*429\b(?!\s+(?:files?|items?|lines?|records?|rows?|entries|tests?|objects?|bytes?|chars?|characters?|paths?|modules?|packages?|matches|results?|commits?|warnings?)\b)/i,
   /\brate[\s-]*limit/i,
   /\btoo\s+many\s+requests\b/i
 ];
@@ -171,6 +171,7 @@ interface RunErrorLike {
   kind?: string;
   message?: string;
   extractedMessage?: string;
+  diagnostics?: string[];
   resetAt?: string;
   retryAfterSeconds?: number;
 }
@@ -189,7 +190,9 @@ export function classifyRunError(error: unknown, nowMs: number): (Classification
   }
   if (err.kind && UNREACHABLE_KINDS.has(err.kind)) return { state: "unreachable", reason };
   if (err.kind && TEXT_CLASSIFIED_KINDS.has(err.kind)) {
-    const messages = [err.extractedMessage, err.message].filter((message): message is string => !!message);
+    // Each stderr diagnostic is its own message; a multi-line error is never split, so an inner line such as
+    // `429 | const x` cannot pass for a leading HTTP status (plan S20 review).
+    const messages = [...(err.diagnostics ?? []), err.extractedMessage, err.message].filter((message): message is string => !!message);
     const classification = classifyErrorMessages(messages, nowMs);
     if (err.kind === "non_zero_exit" && classification.state === "unreachable" &&
         !messages.some(message => PROVIDER_FAILURE_PATTERNS.some(pattern => pattern.test(message)))) return undefined;

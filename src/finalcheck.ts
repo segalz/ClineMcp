@@ -127,7 +127,8 @@ export class FinalCheckLifecycle {
   private releaseOwnLock = false;
   get killUnconfirmed(): boolean { return this.evidence.processesStillAlive !== undefined; }
   private recordUnconfirmedKill(pids: number[] = [], unverified?: boolean): void {
-    this.evidence.processesStillAlive = pids;
+    const previous = this.evidence.processesStillAlive as number[] | undefined;
+    this.evidence.processesStillAlive = [...new Set([...(previous ?? []), ...pids])];
     if (unverified) this.evidence.killUnverified = true;
     this.evidence.warning = "A surviving process may still change files, including after restoration.";
     if (this.snapshot) this.evidence.snapshotDirectory = this.snapshot.directory;
@@ -183,6 +184,11 @@ export class FinalCheckLifecycle {
     const check = () => {
       if (signal.aborted) throw new ClineRunError("cancelled", "The edit lifecycle was cancelled.");
       if (expired || controller.signal.aborted) throw new ClineRunError("budget_exceeded", "Overall active-time budget exhausted.");
+    };
+    const stopHub = async () => {
+      await hub.stop();
+      if (hub.unconfirmedStop) throw hub.unconfirmedStop;
+      check();
     };
     try {
       check();
@@ -253,6 +259,7 @@ export class FinalCheckLifecycle {
         if (typeof metrics?.cost === "number") this.cost += metrics.cost;
         this.durationMs += metrics?.durationMs ?? 0;
         check();
+        if (response && "none" in this.input.verify) await stopHub();
         if (!await this.unchanged(wait)) return;
         check();
         if (failure) {
@@ -271,7 +278,7 @@ export class FinalCheckLifecycle {
         // A run that may have started a process (a command tool, or a run without a guard report) must not leave
         // it running during the check: stop the hub and its job, which kills those processes, as before S16. The
         // next fix run then gets a fresh hub; file-only runs keep theirs (plan S16 review).
-        if ((metrics?.guard?.processToolCalls ?? 1) > 0) { await hub.stop(); check(); }
+        if ((metrics?.guard?.processToolCalls ?? 1) > 0) await stopHub();
         this.phase = "verify";
         const verifyStarted = now();
         let verified: VerificationResult & { error?: string };
@@ -290,6 +297,7 @@ export class FinalCheckLifecycle {
         this.verification.attempts.push({ ...verified, run: this.launches });
         this.verification.passed = verified.passed;
         check();
+        if (verified.passed) await stopHub();
         if (!await this.unchanged(wait)) return;
         check();
         if (verified.passed) { await this.complete(); return; }
@@ -305,6 +313,11 @@ export class FinalCheckLifecycle {
       try {
         await hub.stop();
         this.hubWarnings.push(...hub.warnings);
+        if (hub.unconfirmedStop) {
+          this.recordUnconfirmedKill(hub.unconfirmedStop.processesStillAlive, true);
+          this.question = undefined;
+          if (!pendingWait?.error) wait("cline_error", hub.unconfirmedStop);
+        }
         if (signal.aborted && this.phase !== "done") {
           this.cancelled = true; this.error = new ClineRunError("cancelled", "The edit lifecycle was cancelled."); await this.restore();
         } else if (pendingWait) this.wait(pendingWait.reason, pendingWait.error);

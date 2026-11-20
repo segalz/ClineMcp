@@ -174,11 +174,13 @@ Setup failures before a lock is acquired can instead finish as `failed`. While w
 - `restore`: restore the original baseline and finish. Refusal/incomplete restoration stays visible with recovery evidence.
 - `keep`: finish with current edits explicitly unverified. Identity refusal retains the recovery snapshot.
 
-If the bridge cannot confirm that an edit or check process tree stopped, it blocks automatic repairs and manual retries. You can still restore or keep the edits. The bridge retains the recovery snapshot at `evidence.snapshotDirectory` and reports any known surviving PIDs. A surviving process may change files even after a successful restore.
+If the bridge cannot confirm that the dedicated hub, edit process tree, or check process tree stopped, it blocks automatic repairs and manual retries. You can still restore or keep the edits. The bridge retains the recovery snapshot at `evidence.snapshotDirectory` and reports any known surviving PIDs. A surviving process may change files even after a successful restore.
 
-Cancellation aborts active work, attempts restoration, then releases the lock and publishes `cancelled`; identity refusal or incomplete restoration retains recovery evidence. Once completion has committed, cancellation waits for settlement. Ask/workspace cancellation has no edit snapshot and waits up to 5 seconds for an active run to settle.
+A verified edit reaches its commit point when the check passes and a subsequent read confirms that HEAD and the index still match the baseline. A cancellation before that point aborts active work and attempts to restore the baseline, even if the check has already passed. The bridge then releases the lock and publishes `cancelled`, retaining recovery evidence if restoration was refused or incomplete. A cancellation after the commit point waits for settlement. Ask/workspace cancellation waits up to 5 seconds for an active run to settle.
 
 ### Snapshot and checkout lock
+
+For a tracked symlink checked out as a regular placeholder file, the snapshot hashes up to 64 MiB. Above that size it records and compares the byte count, so a same-size change can go undetected.
 
 The single snapshot survives initial work, fixes, manual retries and question resumes. It copies tracked and untracked non-ignored working-tree bytes outside the checkout, normally under the OS temp directory's `cline-mcp-snapshots` (or under `CLINE_MCP_SNAPSHOT_DIR` when that is set). It preserves dirty/binary files and tracked deletions. Existing staging is preserved through unchanged index identity; the index is not backed up or restored.
 

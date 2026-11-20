@@ -9,6 +9,7 @@ import path from "node:path";
 import test from "node:test";
 import { setTimeout as sleep } from "node:timers/promises";
 import { createWindowsJob } from "../jobobject.js";
+import { confirmTreeDead } from "../proctree.js";
 import { runVerification } from "../verify.js";
 
 import { runCline } from "../runner.js";
@@ -125,43 +126,25 @@ const ticker = `const fs = require("node:fs");
 test("verification reaps inherited pipes after root exit and rejects unconfirmed cleanup", windows, async t => {
   const dir = await mkdtemp(path.join(os.tmpdir(), "verify-pipes-"));
   t.after(() => rm(dir, { recursive: true, force: true }));
-  await writeFile(path.join(dir, "blocked"), "");
-  const moduleUrl = new URL("../verify.js", import.meta.url).href;
+  // The descendant holds the pipe until the verifier closes its end, including if the test host exits.
+  const holdPipes = `process.stdout.on("error", () => process.exit()); setInterval(() => process.stdout.write("."), 50);`;
   const rootScript = `
     const { spawn } = require("node:child_process");
-    spawn(process.execPath, ["-e", ${JSON.stringify(ticker)}, process.cwd()],
+    spawn(process.execPath, ["-e", ${JSON.stringify(holdPipes)}],
       { cwd: require("node:path").dirname(process.cwd()), detached: true, stdio: ["ignore", "inherit", "inherit"] }).unref();
   `;
-  await runNode(process.execPath, ["--input-type=module", "-e", `
-    import assert from "node:assert/strict";
-    import childProcess from "node:child_process";
-    import { syncBuiltinESMExports } from "node:module";
-    import path from "node:path";
-    import { runVerification } from ${JSON.stringify(moduleUrl)};
-
-    // Disable assignment and simulate a Windows process table that cannot be read.
-    process.env.TEMP = process.env.TMP = path.join(process.cwd(), "blocked");
-    const realSpawn = childProcess.spawn;
-    let scans = 0;
-    childProcess.spawn = (file, args, options) => {
-      if (file === "powershell.exe") {
-        scans++;
-        return realSpawn(process.execPath, ["-e", "process.exit(1)"], options);
-      }
-      return realSpawn(file, args, options);
-    };
-    syncBuiltinESMExports();
-    const spec = { command: process.execPath, args: ["-e", ${JSON.stringify(rootScript)}], timeoutSeconds: 25 };
-    const result = await runVerification(spec, process.cwd());
-    assert.ok(scans > 0, "run S3 confirmation while the detached child still holds the pipe");
-    assert.ok(result.durationMs < 20000);
-    assert.equal(result.timedOut, false);
-    assert.equal(result.exitCode, 0);
-    assert.equal(result.signal, null);
-    assert.equal(result.killConfirmed, false);
-    assert.equal(result.killUnverified, true);
-    assert.equal(result.passed, false);
-  `], { cwd: dir, timeout: 45_000, windowsHide: true });
+  let scans = 0;
+  const result = await runVerification({ command: process.execPath, args: ["-e", rootScript] }, dir, undefined, {
+    createWindowsJob: async () => undefined,
+    confirmTreeDead: (pid, options) => confirmTreeDead(pid, { ...options, listTable: async () => { scans++; return null; } })
+  });
+  assert.ok(scans > 0);
+  assert.equal(result.timedOut, false);
+  assert.equal(result.exitCode, 0);
+  assert.equal(result.signal, null);
+  assert.equal(result.killConfirmed, false);
+  assert.equal(result.killUnverified, true);
+  assert.equal(result.passed, false);
 });
 
 test("an unreferenced owner lets its host exit and kills an assigned detached process on host death", windows, async t => {

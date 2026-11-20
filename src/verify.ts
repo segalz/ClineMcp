@@ -264,9 +264,9 @@ export async function runVerification(spec: VerificationCommand, cwd: string, si
     child.stderr.on("data", (chunk: Buffer) => collect(chunk, stderr));
     child.once("error", () => {
       if (done) return;
+      if (stopped) { finish(null, "SIGKILL"); destroyPipes(); return; }
       done = true; cleanup();
-      const fail = () => reject(new VerificationError("verification_launch_failed", "Could not launch verification executable."));
-      if (confirm) void confirm.then(fail); else fail();
+      reject(new VerificationError("verification_launch_failed", "Could not launch verification executable."));
     });
     child.once("exit", (code, sig) => {
       exitedAt = Date.now();
