@@ -760,6 +760,11 @@ export class TaskManager {
     task.state = action ? "resuming" : "running";
     task.controller = new AbortController();
     task.question = undefined; task.reportedQuestion = undefined; task.endedAt = undefined;
+    if (!action || action === "retry") {
+      task.waitReason = undefined;
+      task.guardReport = undefined;
+      task.guardReportSummary = undefined;
+    }
     const started = this.wallNow();
     let nextState: TaskState = "failed";
     let nextError: unknown;
@@ -853,6 +858,10 @@ export class TaskManager {
         fits: prompt => !isPromptTooLarge(prompt, task, getEffectivePreamble("edits", this.deps.runOptions?.promptPreamble ?? ""),
           this.deps.platform ?? process.platform, this.deps.runOptions?.deps),
         run: async (prompt, signal, lock, guard, remainingSeconds, run) => {
+          task.state = "running";
+          task.waitReason = undefined;
+          task.guardReport = undefined;
+          task.guardReportSummary = undefined;
           task.cwd = task.finalCheck!.workDir;
           if (run > 1) {
             task.run = run;

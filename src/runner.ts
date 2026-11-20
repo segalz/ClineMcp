@@ -513,7 +513,9 @@ export function extractPlainStderrError(stderr: string): string | undefined {
   return undefined;
 }
 
+/** The text of the LAST terminal run error (plan S15: an earlier error, e.g. an old quota line, never decides the run). */
 function extractRunResultErrorText(stdout: string): string | undefined {
+  let last: string | undefined;
   for (const rawLine of stdout.split(/\r?\n/)) {
     const line = rawLine.trim();
     if (!line) continue;
@@ -521,15 +523,19 @@ function extractRunResultErrorText(stdout: string): string | undefined {
       const parsed = JSON.parse(line);
       if (parsed && typeof parsed === "object") {
         if (["run_result", "run-finished", "run_completed"].includes(String(parsed.type))) {
-          if (String(parsed.finishReason ?? "") === "error") {
-            const text = parsed.text ?? parsed.outputText ?? parsed.finalText;
-            if (typeof text === "string") return text;
+          // Wrapped forms carry the reason and text in `result` / `run_result` / `run.resultSummary`.
+          const wrapped = [parsed.result, parsed.run_result, parsed.run?.resultSummary]
+            .find(value => value && typeof value === "object" && !Array.isArray(value));
+          const source = parsed.type === "run_result" ? parsed : wrapped ?? parsed;
+          if (String(parsed.finishReason ?? source.finishReason ?? "") === "error") {
+            const text = source.text ?? source.outputText ?? source.finalText ?? parsed.text;
+            if (typeof text === "string") last = text;
           }
         }
       }
     } catch {}
   }
-  return undefined;
+  return last;
 }
 
 export function hasMadeToolCallsOrModifications(stdout: string): boolean {

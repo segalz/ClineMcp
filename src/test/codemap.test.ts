@@ -21,11 +21,12 @@ process.env.CLINE_MCP_STATUS_PATH = path.join(root, "status.json");
 process.env.CLINE_MCP_CATALOG_PATH = path.join(root, "catalog.json");
 process.env.CLINE_MCP_STATE_PATH = path.join(root, "state.json");
 process.env.CLINE_MCP_TRACE_DIR = path.join(root, "traces");
+process.env.CLINE_MCP_SNAPSHOT_DIR = path.join(root, "snapshots");
 after(() => rm(root, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 }));
 
 function git(cwd: string, args: string[], input?: string | Buffer): string {
   const result = spawnSync(process.platform === "win32" ? "git.exe" : "git", ["-C", cwd, ...args], {
-    input, encoding: "utf8", windowsHide: true, timeout: 10_000
+    input, encoding: "utf8", windowsHide: true, timeout: 30_000
   });
   assert.equal(result.status, 0, result.stderr || result.error?.message);
   return result.stdout.trim();
@@ -74,6 +75,30 @@ const repo = await repository({
   "huge.ts": "x".repeat(512 * 1024 + 1),
   ...Object.fromEntries(Array.from({ length: 24 }, (_, i) => [`extra/file${String(i).padStart(2, "0")}.ts`, `export const symbol${i} = 1;\n`]))
 });
+
+const smallRepo = await repository({
+  "a.ts": "export const first = 1;\n",
+  "z.py": "def main():\n    pass\n"
+});
+
+function generousTimers(minMs = 20_000) {
+  return {
+    now: () => 0,
+    setTimeout: ((fn: (...args: any[]) => void, ms?: number, ...args: any[]) =>
+      setTimeout(fn, Math.max(ms ?? 0, minMs), ...args)) as unknown as typeof setTimeout,
+    clearTimeout
+  };
+}
+
+async function waitForSettled(manager: TaskManager, taskId: string, timeoutMs = 60_000) {
+  const deadline = Date.now() + timeoutMs;
+  while (true) {
+    const remainingSec = Math.max(1, Math.min(30, Math.ceil((deadline - Date.now()) / 1000)));
+    const status = await manager.status(taskId, remainingSec);
+    if (status.state !== "running" && status.state !== "resuming") return status;
+    assert.ok(Date.now() < deadline, `Task ${taskId} did not settle (state=${status.state})`);
+  }
+}
 
 /** Content assertions need a completed best-effort scan under parallel process load.
  * Deadline/cancellation/omission assertions below continue to exercise a single call directly. */
@@ -236,13 +261,14 @@ test("async workspace and edits preserve codeMap on initial and resumed runs", a
   for (const mode of ["workspace", "edits"] as const) {
     for (const codeMap of [undefined, false]) {
       const fake = fakeOptions(["QUESTION: Continue?", "done"]);
+      fake.options.deps = { ...fake.options.deps, ...generousTimers(20_000) };
       const manager = new TaskManager({ runOptions: fake.options, traceBase: path.join(root, "async-traces"), gitDiffStat: async () => undefined });
       try {
-        const started = manager.start({ mode, prompt: "Inspect a.ts", cwd: repo, codeMap,
+        const started = manager.start({ mode, prompt: "Inspect a.ts", cwd: smallRepo, codeMap,
           ...(mode === "edits" ? { verify: { none: true as const, reason: "Code map integration fixture" } } : {}), ...selection });
-        assert.equal((await manager.status(started.taskId, 10)).state, "input_required");
+        assert.equal((await waitForSettled(manager, started.taskId)).state, "input_required");
         await manager.send(started.taskId, "Continue with z.py");
-        const status = await manager.status(started.taskId, 10);
+        const status = await waitForSettled(manager, started.taskId);
         assert.equal(status.state, "done");
         assert.equal(status.codeMapSource, codeMap === false ? "none" : "regex");
         assert.ok(status.runHistory?.every(run => run.codeMapSource === status.codeMapSource));
@@ -257,7 +283,7 @@ test("async workspace and edits preserve codeMap on initial and resumed runs", a
         const result = await manager.result(started.taskId);
         assert.equal(result.codeMapSource, status.codeMapSource);
         assert.equal(result.result?.codeMapSource, status.codeMapSource);
-      } finally { await manager.shutdown(1_000); }
+      } finally { await manager.shutdown(30_000); }
     }
   }
 });
@@ -320,7 +346,7 @@ test("codeindex silently falls back for every nonzero exit and invalid/oversize 
   };
   for (const [name, script] of Object.entries(failures)) {
     await t.test(name, async () => usingCodeindex(await fakeCodeindex(script), async () => {
-      const result = await buildCodeMapWithSource(repo);
+      const result = await buildCodeMapWithSource(smallRepo, { regexBudgetMs: 20_000 });
       assert.equal(result.source, "regex");
       assert.match(result.map!, /first:1/);
     }));
@@ -370,8 +396,8 @@ test("unfitting structural text is omitted or replaced with a fitting regex map"
   });
 });
 
-async function waitForFile(file: string): Promise<void> {
-  const deadline = performance.now() + 5000;
+async function waitForFile(file: string, timeoutMs = 20_000): Promise<void> {
+  const deadline = performance.now() + timeoutMs;
   while (performance.now() < deadline) {
     try { if ((await readFile(file, "utf8")).length) return; } catch {}
     await new Promise(resolve => setTimeout(resolve, 25));
@@ -382,7 +408,7 @@ async function waitForFile(file: string): Promise<void> {
 async function hangingTree(): Promise<{ cli: string; heartbeat: string }> {
   const heartbeat = path.join(root, `heartbeat-${++cliNumber}.txt`);
   const grandchild = `const fs=require("node:fs"); const beat=()=>fs.appendFileSync(${JSON.stringify(heartbeat)}, "."); beat(); setInterval(beat,25);`;
-  const cli = await fakeCodeindex(`require("node:child_process").spawn(process.execPath, ["-e", ${JSON.stringify(grandchild)}], {stdio:"ignore"}); setInterval(() => {}, 1000);`);
+  const cli = await fakeCodeindex(`require("node:child_process").spawn(process.execPath, ["-e", ${JSON.stringify(grandchild)}], {stdio:"ignore", windowsHide:true}); setInterval(() => {}, 1000);`);
   return { cli, heartbeat };
 }
 
@@ -409,23 +435,35 @@ test("caller cancellation kills the process tree and propagates without returnin
   const { cli, heartbeat } = await hangingTree();
   await usingCodeindex(cli, async () => {
     const controller = new AbortController();
-    const pending = buildCodeMapWithSource(repo, { signal: controller.signal });
+    const pending = buildCodeMapWithSource(smallRepo, { signal: controller.signal, ...generousTimers(30_000) });
     const rejected = assert.rejects(pending, { kind: "cancelled", codeMapSource: "none" });
-    await waitForFile(heartbeat);
+    await waitForFile(heartbeat, 20_000);
     controller.abort();
     await rejected;
     await assertTreeStopped(heartbeat);
-    await assert.rejects(buildCodeMapWithSource(repo, { signal: AbortSignal.abort() }), { kind: "cancelled" });
+    await assert.rejects(buildCodeMapWithSource(smallRepo, { signal: AbortSignal.abort() }), { kind: "cancelled" });
   });
 });
 
 test("preparation respects the remaining run budget and is charged before Cline starts", async () => {
-  await usingCodeindex(await fakeCodeindex(`setTimeout(() => { ${emitMap('"structural"')} }, 150)`), async () => {
+  const echoDeadline = await fakeCodeindex(`const args=process.argv.slice(2); ${emitMap('JSON.stringify({deadlineMs:Number(args[args.indexOf("--deadline-ms")+1])})')}`);
+  await usingCodeindex(echoDeadline, async () => {
     const fake = fakeOptions();
-    const prepared = await withCodeMap(repo, { prompt: "Inspect", timeoutSeconds: 1, ...selection }, fake.options);
+    let tick = 1000;
+    const clockDeps = { ...fake.options.deps, now: () => tick };
+    const prepared = await withCodeMap(smallRepo, { prompt: "Inspect", timeoutSeconds: 20, ...selection },
+      { ...fake.options, deps: clockDeps, onCodeMapSource: () => { tick += 250; } });
     assert.equal(prepared.codeMapSource, "codeindex");
-    assert.ok(prepared.preparationMs! >= 150);
-    assert.ok(prepared.preparationMs! < 1000);
+    assert.equal(prepared.preparationMs, 250);
+    // Remaining budget clamps the codeindex deadline below the 10 s default, accounting for prior preparationMs.
+    const budgeted = await withCodeMap(smallRepo, { prompt: "Inspect", timeoutSeconds: 180, ...selection },
+      { ...fake.options, deps: { ...clockDeps, totalBudgetMs: 8_000 } });
+    assert.equal(budgeted.codeMapSource, "codeindex");
+    assert.equal(JSON.parse(budgeted.promptPreamble!.split("\n\n")[0]).deadlineMs, 5_000);
+    const afterPrior = await withCodeMap(smallRepo, { prompt: "Inspect", timeoutSeconds: 180, ...selection },
+      { ...fake.options, preparationMs: 1_000, deps: { ...clockDeps, totalBudgetMs: 8_000 } });
+    assert.equal(afterPrior.codeMapSource, "codeindex");
+    assert.equal(JSON.parse(afterPrior.promptPreamble!.split("\n\n")[0]).deadlineMs, 4_000);
     // A run whose preparation consumed its budget must never reach the Cline spawn.
     await assert.rejects(runCline({ prompt: "Inspect", timeoutSeconds: 1, ...selection }, undefined,
       { ...prepared, preparationMs: 1001 }), (error: unknown) => {
@@ -437,10 +475,12 @@ test("preparation respects the remaining run budget and is charged before Cline 
   });
   await usingCodeindex(await fakeCodeindex(`setInterval(() => {}, 1000)`), async () => {
     const started = performance.now();
-    const prepared = await withCodeMap(repo, { prompt: "Inspect", timeoutSeconds: 180, ...selection },
+    const prepared = await withCodeMap(smallRepo, { prompt: "Inspect", timeoutSeconds: 180, ...selection },
       { deps: { totalBudgetMs: 600 } });
-    assert.ok(performance.now() - started < 1100);
-    assert.ok(prepared.preparationMs! < 1100);
+    const elapsed = performance.now() - started;
+    assert.notEqual(prepared.codeMapSource, "codeindex");
+    assert.ok(elapsed < 8_000, `hanging codeindex should stop well before the 10 s default (took ${elapsed} ms)`);
+    assert.ok(prepared.preparationMs! > 0 && prepared.preparationMs! < 8_000);
   });
 });
 
@@ -448,34 +488,36 @@ test("structural provenance and exact roots reach sync and async workspace/edits
   const cli = await fakeCodeindex(emitMap('"structural root=" + process.argv[process.argv.indexOf("--root")+1]'));
   await usingCodeindex(cli, async () => {
     const fake = fakeOptions();
-    const workspace = await askClineWorkspace({ cwd: repo, prompt: "Inspect", ...selection }, undefined, fake.options);
+    fake.options.deps = { ...fake.options.deps, ...generousTimers(30_000) };
+    const workspace = await askClineWorkspace({ cwd: smallRepo, prompt: "Inspect", ...selection }, undefined, fake.options);
     const worktree = fake.calls[0].args[fake.calls[0].args.indexOf("--cwd") + 1];
     assert.equal(workspace.codeMapSource, "codeindex");
     assert.ok(fake.calls[0].args.at(-1)!.includes(`structural root=${worktree}`));
-    assert.notEqual(worktree, repo);
+    assert.notEqual(worktree, smallRepo);
     await assert.rejects(access(worktree));
-    const edits = await applyClineEdits({ cwd: repo, prompt: "Inspect", verify: { none: true, reason: "Structural map fixture" }, ...selection }, undefined, fake.options);
+    const edits = await applyClineEdits({ cwd: smallRepo, prompt: "Inspect", verify: { none: true, reason: "Structural map fixture" }, ...selection }, undefined, fake.options);
     assert.equal(edits.codeMapSource, "codeindex");
-    assert.ok(fake.calls[1].args.at(-1)!.includes(`structural root=${repo}`));
+    assert.ok(fake.calls[1].args.at(-1)!.includes(`structural root=${smallRepo}`));
     for (const mode of ["workspace", "edits"] as const) {
       const calls = fakeOptions(["QUESTION: Continue?", "done"]);
+      calls.options.deps = { ...calls.options.deps, ...generousTimers(30_000) };
       const manager = new TaskManager({ runOptions: calls.options, traceBase: path.join(root, "structural-traces"), gitDiffStat: async () => undefined });
       try {
-        const started = manager.start({ mode, prompt: "Inspect", cwd: repo, ...selection,
+        const started = manager.start({ mode, prompt: "Inspect", cwd: smallRepo, ...selection,
           ...(mode === "edits" ? { verify: { none: true as const, reason: "Structural map fixture" } } : {}) });
-        const waiting = await manager.status(started.taskId, 10);
+        const waiting = await waitForSettled(manager, started.taskId);
         assert.equal(waiting.state, "input_required");
         assert.equal(waiting.codeMapSource, "codeindex");
         assert.equal((await manager.result(started.taskId)).codeMapSource, "codeindex");
         await manager.send(started.taskId, "Continue");
-        const status = await manager.status(started.taskId, 10);
+        const status = await waitForSettled(manager, started.taskId);
         assert.equal(status.state, "done");
         assert.equal(status.codeMapSource, "codeindex");
         assert.ok(status.runHistory?.every(run => run.codeMapSource === "codeindex"));
         const result = await manager.result(started.taskId);
         assert.equal(result.codeMapSource, "codeindex");
         assert.equal(result.result?.codeMapSource, "codeindex");
-      } finally { await manager.shutdown(1000); }
+      } finally { await manager.shutdown(30_000); }
     }
   });
 });

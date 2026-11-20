@@ -60,6 +60,8 @@ export interface FinalCheckDeps {
   verify?: typeof runVerification;
   /** Up-front check that the verify command can start (default: the real resolver; skipped when only `verify` is injected). */
   resolveVerify?: typeof resolveVerificationCommand;
+  /** Optional test seam: monotonic clock in ms (default: performance.now). */
+  now?: () => number;
 }
 export function aggregateUsage(target: Record<string, unknown>, source?: Record<string, unknown>): void {
   for (const [key, value] of Object.entries(source ?? {})) {
@@ -154,7 +156,8 @@ export class FinalCheckLifecycle {
     return this.deps.fits(prompt + interruption) ? prompt + interruption : prompt;
   }
   async execute(signal: AbortSignal, guidance?: string): Promise<void> {
-    const started = performance.now();
+    const now = this.deps.now ?? (() => performance.now());
+    const started = now();
     const remaining = (this.input.timeoutSeconds ?? 600) * 1000 - this.activeMs;
     const controller = new AbortController();
     const abort = () => controller.abort();
@@ -206,7 +209,7 @@ export class FinalCheckLifecycle {
         const calls = (this.input.guard?.maxToolCalls ?? 150) - this.totalToolCalls;
         const tokens = (this.input.guard?.maxInputTokens ?? 1_500_000) - this.budgetInputTokens;
         if (calls <= 0 || tokens <= 0) { this.wait("guard", new ClineRunError("budget_exceeded", "Cumulative edit guard budget exhausted.")); return; }
-        const remainingSeconds = Math.floor((remaining - (performance.now() - started) - verifyReserveMs) / 1000);
+        const remainingSeconds = Math.floor((remaining - (now() - started) - verifyReserveMs) / 1000);
         if (remainingSeconds < 1) {
           this.wait("budget", new ClineRunError("budget_exceeded", "Not enough time left for a run and its final check."));
           return;
@@ -246,14 +249,14 @@ export class FinalCheckLifecycle {
         if (this.question) { this.wait("cline_question"); return; }
         if ("none" in this.input.verify) { await this.complete(); return; }
         this.phase = "verify";
-        const verifyStarted = performance.now();
+        const verifyStarted = now();
         let verified: VerificationResult & { error?: string };
         try { verified = await (this.deps.verify ?? runVerification)(this.input.verify, this.workDir, controller.signal); }
         catch (error) {
           if (!(error instanceof VerificationError)) throw error;
           const message = redactSecrets(error.message);
           verified = { passed: false, exitCode: null, signal: null, timedOut: false, killedForOutput: false,
-            durationMs: performance.now() - verifyStarted, stdoutTail: "", stderrTail: message, error: message };
+            durationMs: now() - verifyStarted, stdoutTail: "", stderrTail: message, error: message };
         }
         if (verified.killConfirmed === false) {
           this.evidence.processesStillAlive = verified.stillAlive ?? [];
@@ -281,7 +284,7 @@ export class FinalCheckLifecycle {
       if (signal.aborted) { this.cancelled = true; this.error = new ClineRunError("cancelled", "The edit lifecycle was cancelled."); await this.restore(); }
       else this.wait(expired ? "budget" : "cline_error", error);
     } finally {
-      clearTimeout(timer); signal.removeEventListener("abort", abort); this.activeMs += performance.now() - started;
+      clearTimeout(timer); signal.removeEventListener("abort", abort); this.activeMs += now() - started;
     }
   }
   async restore(): Promise<boolean> {

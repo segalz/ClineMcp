@@ -11,6 +11,7 @@ import { shutdownJobObjects } from "./jobobject.js";
 import { TaskManager, MAX_TASK_TIMEOUT_SECONDS, MAX_WAIT_SECONDS } from "./tasks.js";
 import { startTaskObjectSchema, startTaskSchema, verificationSchema, maxFixRunsSchema, editActionSchema } from "./finalcheck.js";
 import { PROHIBITED_NAMES, resolveProviderSettingsPath, recoverProviderSettingsJournal } from "./settings.js";
+import { withProgressHeartbeat } from "./progress.js";
 import {
   attachCliToObject,
   attachCliToText,
@@ -106,7 +107,8 @@ server.registerTool(
       model: providerModelSchema
     }
   },
-  async (input, extra) => {
+  // The heartbeat covers the whole call, preflight (catalog sync) included.
+  async (input, extra) => withProgressHeartbeat(extra, async () => {
     await beforeToolCall();
     try {
       const result = await track(extra.signal, signal => askCline(input, signal, { trace: true }));
@@ -125,7 +127,7 @@ server.registerTool(
     } catch (error) {
       return await replyErrorText(error, "The local Cline bridge failed unexpectedly.");
     }
-  }
+  })
 );
 
 server.registerTool(
@@ -149,7 +151,7 @@ server.registerTool(
       keepOnFailure: z.boolean().optional()
     }
   },
-  async (input, extra) => {
+  async (input, extra) => withProgressHeartbeat(extra, async () => {
     await beforeToolCall();
     try {
       const { guard, ...rest } = input;
@@ -218,7 +220,7 @@ server.registerTool(
         ...((error as { guard?: unknown } | undefined)?.guard ? { guard: (error as { guard: unknown }).guard } : {})
       }, { isError: true });
     }
-  }
+  })
 );
 
 server.registerTool(
@@ -237,7 +239,7 @@ server.registerTool(
       guard: guardOptionsSchema.optional()
     }
   },
-  async (input, extra) => {
+  async (input, extra) => withProgressHeartbeat(extra, async () => {
     await beforeToolCall();
     try {
       const { guard, ...rest } = input;
@@ -256,7 +258,7 @@ server.registerTool(
     } catch (error) {
       return await replyErrorText(error, "The isolated Cline workspace review failed unexpectedly.");
     }
-  }
+  })
 );
 
 server.registerTool(

@@ -67,7 +67,9 @@ async function fakeCli(dir: string, writeAfterMs: number, rootExitsAfterMs?: num
   const rootBeat = path.join(dir, "root.beat"), childBeat = path.join(dir, "child.beat");
   await writeFile(childPath, [
     `const fs = require("node:fs");`,
-    `setTimeout(() => fs.writeFileSync(${JSON.stringify(trackedPath)}, String(Date.now())), ${writeAfterMs});`,
+    rootExitsAfterMs === undefined
+      ? `setTimeout(() => fs.writeFileSync(${JSON.stringify(trackedPath)}, String(Date.now())), ${writeAfterMs});`
+      : `setInterval(() => fs.writeFileSync(${JSON.stringify(trackedPath)}, String(Date.now())), 50);`,
     `setInterval(() => fs.appendFileSync(${JSON.stringify(childBeat)}, "."), 25);`
   ].join("\n"));
   await writeFile(entryPath, [
@@ -76,7 +78,9 @@ async function fakeCli(dir: string, writeAfterMs: number, rootExitsAfterMs?: num
     // An early-exiting root leaves its child holding the output pipes, so no `close` arrives until it dies.
     `const child = spawn(process.execPath, [${JSON.stringify(childPath)}], { stdio: ${rootExitsAfterMs === undefined ? `"ignore"` : `["ignore", "inherit", "inherit"]`}, windowsHide: true });`,
     `fs.writeFileSync(${JSON.stringify(pidsPath)}, JSON.stringify({ root: process.pid, child: child.pid }));`,
-    rootExitsAfterMs === undefined ? `setInterval(() => fs.appendFileSync(${JSON.stringify(rootBeat)}, "."), 25);` : `setInterval(() => { if (fs.existsSync(${JSON.stringify(childBeat)})) process.exit(0); }, 20);`
+    rootExitsAfterMs === undefined
+      ? `setInterval(() => fs.appendFileSync(${JSON.stringify(rootBeat)}, "."), 25);`
+      : `setInterval(() => { try { if (fs.statSync(${JSON.stringify(childBeat)}).size > 0) process.exit(0); } catch {} }, 20);`
   ].join("\n"));
   return { entryPath, pidsPath, trackedPath, rootBeat, childBeat };
 }
@@ -146,8 +150,8 @@ test("S3: a timed-out run with budget to spare still confirms the tree is dead b
 
 test("S3 review: a child left behind by an exited root is found and killed; the exited root's PID is never killed", { timeout: 60_000 }, async () => {
   const dir = await mkdtemp(path.join(root, "case-"));
-  const timeoutMs = 6_000; // startup alone can take seconds under full-suite load
-  const { entryPath, pidsPath, trackedPath, rootBeat, childBeat } = await fakeCli(dir, timeoutMs + 250, 300);
+  const timeoutMs = 30_000; // generous ceiling so timeout never races root startup and self-exit under load
+  const { entryPath, pidsPath, trackedPath, rootBeat, childBeat } = await fakeCli(dir, 0, 300);
   const settingsPath = path.join(dir, "providers.json");
   await writeFile(settingsPath, JSON.stringify({ lastUsedProvider: "cline", providers: {} }));
   let killCalls = 0;
@@ -168,6 +172,6 @@ test("S3 review: a child left behind by an exited root is found and killed; the 
   const pids = await readPids(pidsPath, rootBeat, childBeat);
   await assertSilent([childBeat], "the orphaned child must be dead when the run settles");
   if (process.platform === "win32") assert.equal(killCalls, 0, "the root had exited: its PID may belong to another process now");
-  await sleep(timeoutMs);
+  await sleep(500);
   assertNoWriteAfter(trackedPath, settledAt, "no write may land after the run settled");
 });

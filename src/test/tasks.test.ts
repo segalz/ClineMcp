@@ -1,7 +1,8 @@
 import assert from "node:assert/strict";
 import test, { after } from "node:test";
+import { spawnSync } from "node:child_process";
 import { EventEmitter } from "node:events";
-import { access, mkdtemp, rm } from "node:fs/promises";
+import { access, mkdtemp, realpath, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import {
@@ -21,7 +22,8 @@ process.env.CLINE_PROVIDER_SETTINGS_PATH = path.join(root, "providers.json");
 process.env.CLINE_MCP_CATALOG_PATH = path.join(root, "catalog.json");
 process.env.CLINE_MCP_STATE_PATH = path.join(root, "state.json");
 process.env.CLINE_MCP_TRACE_DIR = path.join(root, "traces-default");
-after(() => rm(root, { recursive: true, force: true }));
+process.env.CLINE_MCP_SNAPSHOT_DIR = path.join(root, "snapshots");
+after(() => rm(root, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 }));
 let counter = 0;
 const traceBase = () => path.join(root, `traces-${++counter}`);
 const sel = { provider: "p", model: "m" };
@@ -939,6 +941,19 @@ test("budget uses the exact system prompt that applyClineEdits passes", async ()
   assert.equal(typeof EDIT_SYSTEM_PROMPT, "string");
   assert.ok(EDIT_SYSTEM_PROMPT.length > 50);
 
+  const repoDir = await realpath(await mkdtemp(path.join(root, "edit-repo-")));
+  const git = (...args: string[]) => {
+    const r = spawnSync(process.platform === "win32" ? "git.exe" : "git", ["-C", repoDir, ...args],
+      { encoding: "utf8", windowsHide: true, timeout: 30_000, env: { ...process.env, GIT_OPTIONAL_LOCKS: "0" } });
+    assert.equal(r.status, 0, r.stderr || r.error?.message);
+    return r.stdout.trim();
+  };
+  git("init", "--quiet");
+  await writeFile(path.join(repoDir, "a.ts"), "export const a = 1;\n");
+  git("add", ".");
+  git("-c", "user.name=Test", "-c", "user.email=test@example.invalid", "commit", "-qm", "baseline");
+  const editCwd = path.resolve(git("rev-parse", "--show-toplevel"));
+
   // 1. Verify applyClineEdits passes EDIT_SYSTEM_PROMPT to runCline
   let capturedSystemPrompt: string | undefined;
   const mockDeps = {
@@ -958,13 +973,13 @@ test("budget uses the exact system prompt that applyClineEdits passes", async ()
     }) as any
   };
 
-  await applyClineEdits({ prompt: "edit test", cwd: process.cwd(), codeMap: false, verify: { none: true, reason: "System prompt fixture" }, ...sel }, undefined, {
+  await applyClineEdits({ prompt: "edit test", cwd: editCwd, codeMap: false, verify: { none: true, reason: "System prompt fixture" }, ...sel }, undefined, {
     deps: mockDeps as any, checkoutLockDirectory: path.join(root, "locks")
   });
-  assert.equal(capturedSystemPrompt, buildEditSystemPrompt(process.cwd()), "applyClineEdits passes the per-run environment and mode prompt");
+  assert.equal(capturedSystemPrompt, buildEditSystemPrompt(editCwd), "applyClineEdits passes the per-run environment and mode prompt");
 
   // 2. Verify isPromptTooLarge for edits mode uses the exact EDIT_SYSTEM_PROMPT
-  const task: any = { mode: "edits", provider: "p", model: "m", cwd: process.cwd(), thinking: "none", timeoutSeconds: 600 };
+  const task: any = { mode: "edits", provider: "p", model: "m", cwd: editCwd, thinking: "none", timeoutSeconds: 600 };
   const preamble = getEffectivePreamble("edits");
   const buildArgs = (prompt: string) => [
     "fake",
@@ -974,8 +989,8 @@ test("budget uses the exact system prompt that applyClineEdits passes", async ()
     "--timeout", "600",
     "-P", "p",
     "-m", "m",
-    "--system", buildEditSystemPrompt(process.cwd(), "win32"),
-    "--cwd", process.cwd(),
+    "--system", buildEditSystemPrompt(editCwd, "win32"),
+    "--cwd", editCwd,
     preamble + prompt
   ];
 

@@ -53,7 +53,7 @@ type SettingsReadOutcome =
   | { ok: true; data: Record<string, any> }
   | { ok: false; stage: "enoent" | "read" | "parse"; error: unknown };
 
-async function readSettingsWithRetry(settingsPath: string): Promise<SettingsReadOutcome> {
+async function readSettingsWithRetry(settingsPath: string, options: { retryEnoent?: boolean } = {}): Promise<SettingsReadOutcome> {
   const deadline = performance.now() + TRANSIENT_IO_BUDGET_MS;
   let backoff = 25;
   while (true) {
@@ -61,7 +61,15 @@ async function readSettingsWithRetry(settingsPath: string): Promise<SettingsRead
     try {
       content = await readFile(settingsPath, "utf8");
     } catch (err: any) {
-      if (err?.code === "ENOENT") return { ok: false, stage: "enoent", error: err };
+      if (err?.code === "ENOENT") {
+        const remaining = deadline - performance.now();
+        if (!options.retryEnoent || remaining <= 0) {
+          return { ok: false, stage: "enoent", error: err };
+        }
+        await delay(Math.min(backoff, remaining));
+        backoff = Math.min(250, backoff * 2);
+        continue;
+      }
       const remaining = deadline - performance.now();
       if (!TRANSIENT_FS_CODES.has(err?.code) || remaining <= 0) {
         return { ok: false, stage: "read", error: err };
@@ -90,13 +98,14 @@ async function readSettingsWithRetry(settingsPath: string): Promise<SettingsRead
 
 export async function readProviderSettingsSnapshot(
   settingsPath: string,
-  requestedProvider?: string
+  requestedProvider?: string,
+  options: { retryEnoent?: boolean } = {}
 ): Promise<ProviderSettingsSnapshot> {
   if (requestedProvider && PROHIBITED_NAMES.has(requestedProvider.toLowerCase())) {
     throw new ClineRunError("launch_failed", `provider "${requestedProvider}" is prohibited.`);
   }
 
-  const outcome = await readSettingsWithRetry(settingsPath);
+  const outcome = await readSettingsWithRetry(settingsPath, options);
   if (!outcome.ok) {
     if (outcome.stage === "enoent") {
       return {
@@ -515,7 +524,8 @@ export async function withProviderOverride<T extends { warnings?: string[] }>(
       if (existing && Object.hasOwn(existing.base.providers, provider)) {
         journal = existing;
       } else {
-        const snapshot = await readProviderSettingsSnapshot(settingsPath, provider);
+        const retryEnoent = !!existing && Object.keys(existing.runs).length > 0;
+        const snapshot = await readProviderSettingsSnapshot(settingsPath, provider, { retryEnoent });
         if (snapshot.skipRestore) throw new ClineRunError("settings_restore_failed", "Unable to snapshot provider settings.");
         journal = existing ?? { version: 2, base: baselineFrom(snapshot), runs: {} };
         // Capture a provider's original values only the first time any live run overrides it.

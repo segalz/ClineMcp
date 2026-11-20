@@ -248,7 +248,8 @@ export async function takeSnapshot(checkoutRoot: string, opts: SnapshotOptions =
   const maxFiles = limit(opts.maxFiles, 20_000);
   const maxFile = limit(opts.maxFileBytes, 64 * 1024 * 1024);
   const maxTotal = limit(opts.maxTotalBytes, 512 * 1024 * 1024);
-  const base = path.resolve(opts.snapshotBase ?? path.join(os.tmpdir(), "cline-mcp-snapshots"));
+  const envSnapshotDir = process.env.CLINE_MCP_SNAPSHOT_DIR?.trim();
+  const base = path.resolve(opts.snapshotBase ?? (envSnapshotDir || path.join(os.tmpdir(), "cline-mcp-snapshots")));
   // Resolve the closest existing ancestor too: a symlinked base must not lead back into the checkout.
   let ancestor = base;
   while (!await statOrMissing(ancestor)) ancestor = path.dirname(ancestor);

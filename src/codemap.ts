@@ -25,6 +25,12 @@ export interface CodeMapOptions {
   deadlineMs?: number;
   /** Full escaped Windows command-line length for a candidate map preamble. */
   commandLineLength?: (preamble: string) => number;
+  /** Optional test seam: override the regex scan budget (default TIME_BUDGET_MS). */
+  regexBudgetMs?: number;
+  /** Optional test seams: monotonic clock and timers. */
+  now?: () => number;
+  setTimeout?: typeof setTimeout;
+  clearTimeout?: typeof clearTimeout;
 }
 
 function trackedFiles(root: string, signal: AbortSignal): Promise<string[]> {
@@ -114,6 +120,9 @@ function formatMap(entries: Entry[], omitted: number, fits: (text: string) => bo
 /** Best-effort, bounded map of tracked files. A scan-budget stop keeps completed entries; I/O failure omits the map. */
 async function buildRegexCodeMap(root: string, options: CodeMapOptions = {}): Promise<string | undefined> {
   const controller = new AbortController();
+  const now = options.now ?? (() => performance.now());
+  const schedule = options.setTimeout ?? setTimeout;
+  const unschedule = options.clearTimeout ?? clearTimeout;
   let timer: ReturnType<typeof setTimeout> | undefined;
   const abort = () => controller.abort();
   try {
@@ -124,10 +133,11 @@ async function buildRegexCodeMap(root: string, options: CodeMapOptions = {}): Pr
     if (options.commandLineLength && commandLimit - options.commandLineLength("") < 800) return undefined;
     const fits = (text: string) => text.length <= maxChars &&
       (!options.commandLineLength || options.commandLineLength(text + "\n\n") <= commandLimit);
-    const duration = Math.min(TIME_BUDGET_MS, options.deadlineMs ?? TIME_BUDGET_MS);
+    const regexBudget = options.regexBudgetMs ?? TIME_BUDGET_MS;
+    const duration = Math.min(regexBudget, options.deadlineMs ?? regexBudget);
     if (duration <= 0) return undefined;
-    const deadline = performance.now() + duration;
-    timer = setTimeout(abort, duration);
+    const deadline = now() + duration;
+    timer = schedule(abort, duration);
     options.signal?.addEventListener("abort", abort, { once: true });
     // Bound every I/O operation, including metadata calls which do not accept an AbortSignal.
     const bounded = <T>(operation: Promise<T>): Promise<T> => new Promise((resolve, reject) => {
@@ -143,7 +153,7 @@ async function buildRegexCodeMap(root: string, options: CodeMapOptions = {}): Pr
     const entries: Entry[] = [];
     let scanned = 0;
     for (; scanned < files.length; scanned++) {
-      if (scanned >= MAX_FILES || performance.now() >= deadline) break;
+      if (scanned >= MAX_FILES || now() >= deadline) break;
       const file = files[scanned];
       try {
         const absolute = path.resolve(rootPath, file);
@@ -182,7 +192,7 @@ async function buildRegexCodeMap(root: string, options: CodeMapOptions = {}): Pr
   } catch {
     return undefined;
   } finally {
-    clearTimeout(timer);
+    if (timer !== undefined) unschedule(timer);
     options.signal?.removeEventListener("abort", abort);
     controller.abort();
   }
@@ -198,10 +208,13 @@ function checkCancellation(signal?: AbortSignal): void {
 
 /** A failed adapter is silent. Termination and regex fallback share the preparation deadline. */
 function codeindexMap(cli: string, root: string, prompt: string, budget: number, deadline: number,
-  signal?: AbortSignal): Promise<string | undefined> {
+  signal?: AbortSignal, timing?: Pick<CodeMapOptions, "now" | "setTimeout" | "clearTimeout">): Promise<string | undefined> {
   return new Promise(resolve => {
+    const now = timing?.now ?? (() => performance.now());
+    const schedule = timing?.setTimeout ?? setTimeout;
+    const unschedule = timing?.clearTimeout ?? clearTimeout;
     // Reserve a regex scan and a short process-termination window inside the same bound.
-    const remaining = Math.max(0, deadline - performance.now());
+    const remaining = Math.max(0, deadline - now());
     const duration = Math.floor(Math.min(CODEINDEX_TIME_BUDGET_MS,
       remaining - Math.min(TIME_BUDGET_MS, remaining / 4) - Math.min(KILL_BUDGET_MS, remaining / 3)));
     if (duration <= 0 || signal?.aborted) return resolve(undefined);
@@ -214,7 +227,7 @@ function codeindexMap(cli: string, root: string, prompt: string, budget: number,
     const finish = (map?: string) => {
       if (finished) return;
       finished = true;
-      clearTimeout(timer);
+      unschedule(timer);
       signal?.removeEventListener("abort", stop);
       child.stdin.destroy(); child.stdout.destroy();
       resolve(map);
@@ -222,10 +235,10 @@ function codeindexMap(cli: string, root: string, prompt: string, budget: number,
     const stop = () => {
       if (finished || stopping) return;
       stopping = true;
-      clearTimeout(timer);
-      void killCodeMapTree(child, Math.max(0, Math.min(KILL_BUDGET_MS, deadline - performance.now()))).then(() => finish());
+      unschedule(timer);
+      void killCodeMapTree(child, Math.max(0, Math.min(KILL_BUDGET_MS, deadline - now()))).then(() => finish());
     };
-    const timer = setTimeout(stop, duration);
+    const timer = schedule(stop, duration);
     signal?.addEventListener("abort", stop, { once: true });
     if (signal?.aborted) stop();
     child.stdin.on("error", () => {}); // EPIPE is expected if a failed CLI exits before consuming stdin.
@@ -259,19 +272,21 @@ export async function buildCodeMapWithSource(root: string, options: CodeMapOptio
   if (!Number.isFinite(maxChars) || maxChars <= 0 || room < 800) return { source: "none" };
   const cli = process.env.CODEINDEX_CLI;
   const configured = cli && path.isAbsolute(cli);
-  const deadline = performance.now() + Math.max(0, Math.min(configured
-    ? CODEINDEX_TIME_BUDGET_MS + TIME_BUDGET_MS + KILL_BUDGET_MS : TIME_BUDGET_MS,
+  const now = options.now ?? (() => performance.now());
+  const regexBudget = options.regexBudgetMs ?? TIME_BUDGET_MS;
+  const deadline = now() + Math.max(0, Math.min(configured
+    ? CODEINDEX_TIME_BUDGET_MS + regexBudget + KILL_BUDGET_MS : regexBudget,
     options.deadlineMs ?? Infinity));
   if (configured) {
     // Windows quoting can double each map code unit. Reserve both preamble newlines too.
     const budget = Math.floor(Math.min(maxChars, (room - 4) / 2));
-    const map = await codeindexMap(cli, root, options.prompt ?? "", budget, deadline, options.signal);
+    const map = await codeindexMap(cli, root, options.prompt ?? "", budget, deadline, options.signal, options);
     checkCancellation(options.signal);
     if (map && map.length <= maxChars && (!options.commandLineLength ||
         options.commandLineLength(map + "\n\n") <= WINDOWS_COMMAND_LINE_LIMIT - 1_000)) return { map, source: "codeindex" };
   }
   checkCancellation(options.signal);
-  const map = await buildRegexCodeMap(root, { ...options, maxChars, deadlineMs: deadline - performance.now() });
+  const map = await buildRegexCodeMap(root, { ...options, maxChars, deadlineMs: deadline - now() });
   checkCancellation(options.signal);
   return { map, source: map ? "regex" : "none" };
 }
@@ -301,7 +316,8 @@ export function codeMapCommandLineLength(input: AskClineInput, options: Partial<
 export async function withCodeMap(
   root: string, input: AskClineInput & { codeMap?: boolean }, options: Partial<ClineInvocationOptions>, signal?: AbortSignal
 ): Promise<Partial<ClineInvocationOptions>> {
-  const started = performance.now();
+  const now = options.deps?.now ?? (() => performance.now());
+  const started = now();
   const remaining = Math.min((input.timeoutSeconds ?? 180) * 1000, options.deps?.totalBudgetMs ?? Infinity) -
     (options.preparationMs ?? 0);
   const { map, source } = input.codeMap === false ? { source: "none" as const, map: undefined } : await buildCodeMapWithSource(root, {
@@ -309,9 +325,12 @@ export async function withCodeMap(
     deadlineMs: remaining,
     maxChars: Math.min(6_000, MAX_TOTAL_TEXT_CHARACTERS - input.prompt.length -
       (options.systemPrompt ?? input.systemPrompt ?? "").length - (options.promptPreamble?.length ?? 0) - 2),
-    commandLineLength: preamble => codeMapCommandLineLength(input, options, preamble)
+    commandLineLength: preamble => codeMapCommandLineLength(input, options, preamble),
+    now: options.deps?.now,
+    setTimeout: options.deps?.setTimeout,
+    clearTimeout: options.deps?.clearTimeout
   });
   options.onCodeMapSource?.(source);
-  return { ...options, codeMapSource: source, preparationMs: (options.preparationMs ?? 0) + performance.now() - started,
+  return { ...options, codeMapSource: source, preparationMs: (options.preparationMs ?? 0) + now() - started,
     ...(map ? { promptPreamble: map + "\n\n" + (options.promptPreamble ?? "") } : {}) };
 }

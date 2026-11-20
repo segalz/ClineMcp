@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import "./git-test-serial.js";
-import test from "node:test";
+import test, { after } from "node:test";
 import { spawnSync } from "node:child_process";
 import { mkdtemp, writeFile, readFile, mkdir, rm, readdir } from "node:fs/promises";
 import os from "node:os";
@@ -13,6 +13,10 @@ import { ClineRunError } from "../runner.js";
 import { headAndIndexIdentity } from "../snapshot.js";
 import { acquire } from "../checkoutlock.js";
 import { VerificationError } from "../verify.js";
+
+const snapshotDir = await mkdtemp(path.join(os.tmpdir(), "cline-finalcheck-snapshots-"));
+process.env.CLINE_MCP_SNAPSHOT_DIR = snapshotDir;
+after(() => rm(snapshotDir, { recursive: true, force: true, maxRetries: 5 }));
 
 const verify = { command: process.execPath, args: ["-e", 'process.exit(require("fs").readFileSync("a","utf8")==="pass"?0:7)'] };
 const none = { none: true as const, reason: "Explicit test opt-out" };
@@ -122,16 +126,41 @@ test("sync failure restores by default, keepOnFailure retains changes, and none 
 async function asyncFixture(t: test.TestContext, spec: VerifySpec = verify, extra: TaskManagerDeps = {}) {
   const f = await fixture(t);
   const runs: Array<{ input: any; options: any; signal: AbortSignal; finish: (text?: string, guard?: any) => void; fail: (error: unknown) => void }> = [];
+  const waiters: Array<{ count: number; resolve: () => void }> = [];
   const manager = new TaskManager({ ...extra, traceBase: path.join(f.base, "traces"), snapshotOptions: { snapshotBase: f.snapshots },
     runOptions: { checkoutLockDirectory: f.locks }, runners: { edits: (input, signal, options) => new Promise((resolve, reject) => {
       runs.push({ input, options, signal, finish: (text = "done", guard) => resolve({ text, durationMs: 1, guard, usage: { inputTokens: 10 } } as any), fail: reject });
+      for (let i = waiters.length - 1; i >= 0; i--) {
+        if (runs.length >= waiters[i].count) waiters.splice(i, 1)[0].resolve();
+      }
       signal.addEventListener("abort", () => reject(new ClineRunError("cancelled", "cancelled")), { once: true });
     }) } });
   t.after(() => manager.shutdown(30_000));
   const start = (options = {}) => manager.start({ mode: "edits", prompt: "Implement", cwd: f.cwd, verify: spec, maxFixRuns: 0,
     codeMap: false, provider: "p", model: "m", ...options });
-  const wait = (id: string, state: TaskStatusView["state"]) => until(() => manager.status(id, 0), s => s.state === state);
-  const launched = async (count: number) => { await until(async () => runs.length, n => n >= count); return runs[count - 1]; };
+  const wait = async (id: string, state: TaskStatusView["state"]) => {
+    const deadline = Date.now() + 60_000;
+    while (true) {
+      const value = await manager.status(id, Math.max(1, Math.min(30, Math.ceil((deadline - Date.now()) / 1000))));
+      if (value.state === state) return value;
+      assert.ok(Date.now() < deadline, JSON.stringify(value));
+      await new Promise(r => setTimeout(r, 10));
+    }
+  };
+  const launched = async (count: number) => {
+    if (runs.length < count) {
+      await new Promise<void>((resolve, reject) => {
+        const entry = { count, resolve: () => { clearTimeout(timer); resolve(); } };
+        const timer = setTimeout(() => {
+          const idx = waiters.indexOf(entry);
+          if (idx !== -1) waiters.splice(idx, 1);
+          reject(new Error(`Timed out waiting for launch #${count} (have ${runs.length})`));
+        }, 60_000);
+        waiters.push(entry);
+      });
+    }
+    return runs[count - 1];
+  };
   return { ...f, manager, runs, start, wait, launched };
 }
 
@@ -157,7 +186,12 @@ test("async exhausted verification waits with retained edits; restore, keep and 
 });
 
 test("QUESTION during automatic fix retains edits, check evidence and original baseline", async t => {
-  const f = await asyncFixture(t); const task = f.start({ maxFixRuns: 2 });
+  const f = await asyncFixture(t, verify, {
+    runVerification: async (_spec, cwd) => {
+      const passed = await readFile(path.join(cwd, "a"), "utf8") === "pass";
+      return { passed, exitCode: passed ? 0 : 7, signal: null, timedOut: false, killedForOutput: false, durationMs: 1, stdoutTail: "", stderrTail: "" };
+    }
+  }); const task = f.start({ maxFixRuns: 2 });
   const first = await f.launched(1); await f.put("failed"); first.finish();
   const second = await f.launched(2); await f.put("partial repair"); second.finish("QUESTION: Which behavior?\nOPTIONS: exact | approximate");
   const waiting = await f.wait(task.taskId, "input_required"); assert.equal(waiting.waitReason, "cline_question");

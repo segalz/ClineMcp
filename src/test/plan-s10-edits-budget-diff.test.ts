@@ -102,7 +102,7 @@ test("S10 B10: with an 80 s budget and a 60 s check, the first run gets at most 
   const f = await fixture(t); const seconds: number[] = [];
   const lifecycle = new FinalCheckLifecycle({ prompt: "Implement", cwd: f.cwd, verify: { ...verify, timeoutSeconds: 60 }, timeoutSeconds: 80 }, {
     resolveRoot: async cwd => cwd, fits: () => true, question: editQuestion, lockDirectory: f.locks,
-    snapshotOptions: { snapshotBase: f.snapshots },
+    snapshotOptions: { snapshotBase: f.snapshots }, now: () => 0,
     run: async (_prompt, _signal, _lock, _guard, remainingSeconds) => {
       seconds.push(remainingSeconds); await f.put("pass");
       return { text: "done", durationMs: 1, usage: { inputTokens: 10 } } as any;
@@ -112,8 +112,8 @@ test("S10 B10: with an 80 s budget and a 60 s check, the first run gets at most 
     await lifecycle.execute(new AbortController().signal);
     assert.equal(lifecycle.phase, "done");
     assert.equal(seconds.length, 1);
-    // 80 s - (60 s check + 10 s margin) = at most 10 s, minus setup time.
-    assert.ok(seconds[0] >= 5 && seconds[0] <= 10, `first run got ${seconds[0]} s`);
+    // 80 s - (60 s check + 10 s margin) = 10 s with the injected clock removing Git setup jitter.
+    assert.equal(seconds[0], 10, `first run got ${seconds[0]} s`);
   } finally { lifecycle.release(); }
 });
 

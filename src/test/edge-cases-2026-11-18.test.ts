@@ -17,7 +17,12 @@ after(async () => { for (const root of roots) await rm(root, { recursive: true, 
 async function repo(): Promise<string> {
   const root = await mkdtemp(path.join(os.tmpdir(), "cline-edge-test-"));
   roots.push(root);
-  const git = (...args: string[]) => spawnSync("git", ["-C", root, "-c", "user.name=t", "-c", "user.email=t@example.com", ...args]);
+  const git = (...args: string[]) => {
+    const r = spawnSync(process.platform === "win32" ? "git.exe" : "git",
+      ["-C", root, "-c", "user.name=t", "-c", "user.email=t@example.com", ...args],
+      { encoding: "utf8", windowsHide: true, env: { ...process.env, GIT_OPTIONAL_LOCKS: "0" } });
+    assert.equal(r.status, 0, r.stderr || r.error?.message);
+  };
   git("init", "-q");
   await writeFile(path.join(root, ".gitignore"), "dist/\n");
   await writeFile(path.join(root, "a.ts"), "export const a = 1;\n");
@@ -26,7 +31,9 @@ async function repo(): Promise<string> {
   await writeFile(path.join(root, "notes.txt"), "untracked baseline\n");
   return root;
 }
-const snapshotBase = () => path.join(os.tmpdir(), "cline-edge-snapshots");
+const snapshotRoot = await mkdtemp(path.join(os.tmpdir(), "cline-edge-snapshots-"));
+roots.push(snapshotRoot);
+const snapshotBase = () => snapshotRoot;
 
 test("restore undoes a .gitignore edit that hid a new file and a changed baseline file", async () => {
   const root = await repo();

@@ -16,6 +16,7 @@ import { editQuestion } from "../edits.js";
 
 const windowsOnly = { skip: process.platform !== "win32" ? "Windows shim resolution" : false };
 const base = await mkdtemp(path.join(os.tmpdir(), "cline-s4-test-"));
+process.env.CLINE_MCP_SNAPSHOT_DIR = path.join(base, "snapshots");
 after(async () => { await rm(base, { recursive: true, force: true }).catch(() => {}); });
 
 /** The exact cmd-shim npm writes for a node script (`target` is relative to the .bin folder). */

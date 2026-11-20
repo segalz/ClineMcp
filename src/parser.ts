@@ -44,70 +44,74 @@ function modelFrom(value: JsonObject): string | undefined {
   return provider && id ? `${provider}/${id}` : id;
 }
 
+type TerminalEvent =
+  | { kind: "result"; completed: boolean; result: ClineFinalResult }
+  | { kind: "error" }
+  | undefined;
+
 /**
- * Extracts a usable final result from stdout.
+ * Classifies one JSONL event as a terminal result, a terminal error, or neither. The last terminal event of a
+ * run decides its outcome: an error after an earlier answer cancels that answer (plan S15, C7).
+ */
+function terminalEvent(event: JsonObject): TerminalEvent {
+  if (["run_result", "run-finished", "run_completed"].includes(String(event.type))) {
+    const eventRun = object(event.run);
+    const result = event.type === "run_result"
+      ? event
+      : object(event.result) ?? object(event.run_result) ?? (eventRun ? object(eventRun.resultSummary) : undefined);
+    const finishReason = String(event.finishReason ?? result?.finishReason ?? "");
+    if (finishReason === "error") return { kind: "error" };
+    if (!result) return undefined;
+    const text = textFrom(result);
+    if (!text) return undefined;
+    return { kind: "result", completed: finishReason === "completed", result: {
+      text,
+      model: modelFrom(result) ?? modelFrom(event) ?? (eventRun ? modelFrom(eventRun) : undefined),
+      usage: object(result.usage) ?? (eventRun ? object(eventRun.usage) : undefined),
+      cost: result.cost ?? result.costUsd ?? result.totalCost ?? (eventRun?.cost ?? eventRun?.costUsd ?? eventRun?.totalCost),
+      durationMs: typeof result.durationMs === "number" ? result.durationMs : undefined
+    } };
+  }
+  if (event.type === "agent_event") {
+    const inner = object(event.event);
+    if (!inner || inner.type !== "done") return undefined;
+    if (inner.reason === "error") return { kind: "error" };
+    if (inner.reason !== "completed") return undefined;
+    const text = textFrom(inner) ?? (typeof inner.text === "string" ? inner.text : undefined);
+    if (!text) return undefined;
+    return { kind: "result", completed: true, result: {
+      text,
+      model: modelFrom(inner) ?? modelFrom(event),
+      usage: object(inner.usage) ?? object(event.usage),
+      cost: inner.cost ?? inner.costUsd ?? inner.totalCost ?? event.cost ?? event.costUsd ?? event.totalCost,
+      durationMs: typeof inner.durationMs === "number" ? inner.durationMs : typeof event.durationMs === "number" ? event.durationMs : undefined
+    } };
+  }
+  return undefined;
+}
+
+/**
+ * Extracts a usable final result from stdout. The last terminal event wins; a terminal error clears an earlier result.
  * For exitCode !== 0: accepts only run_result with finishReason:"completed" or agent_event done with reason:"completed".
  * For exitCode === 0: accepts run_result (unless finishReason is "error") or agent_event done with reason:"completed".
  */
 export function parseUsableResult(stdout: string, exitCode: number): ClineFinalResult | undefined {
-  let runResultFound: ClineFinalResult | undefined;
-  let doneResultFound: ClineFinalResult | undefined;
-
+  let found: ClineFinalResult | undefined;
   for (const rawLine of stdout.split(/\r?\n/)) {
     const line = rawLine.trim();
     if (!line) continue;
-
-    let event: JsonObject;
+    let event: JsonObject | undefined;
     try {
-      const parsed = JSON.parse(line);
-      if (!object(parsed)) continue;
-      event = parsed as JsonObject;
+      event = object(JSON.parse(line));
     } catch {
       continue;
     }
-
-    if (["run_result", "run-finished", "run_completed"].includes(String(event.type))) {
-      const finishReason = String(event.finishReason ?? "");
-      if (finishReason === "error") {
-        continue;
-      }
-      if (exitCode !== 0 && finishReason !== "completed") {
-        continue;
-      }
-
-      const eventRun = object(event.run);
-      const result = event.type === "run_result"
-        ? event
-        : object(event.result) ?? object(event.run_result) ?? (eventRun ? object(eventRun.resultSummary) : undefined);
-      if (!result) continue;
-      const text = textFrom(result);
-      if (!text) continue;
-
-      runResultFound = {
-        text,
-        model: modelFrom(result) ?? modelFrom(event) ?? (eventRun ? modelFrom(eventRun) : undefined),
-        usage: object(result.usage) ?? (eventRun ? object(eventRun.usage) : undefined),
-        cost: result.cost ?? result.costUsd ?? result.totalCost ?? (eventRun?.cost ?? eventRun?.costUsd ?? eventRun?.totalCost),
-        durationMs: typeof result.durationMs === "number" ? result.durationMs : undefined
-      };
-    } else if (event.type === "agent_event") {
-      const inner = object(event.event);
-      if (inner && inner.type === "done" && inner.reason === "completed") {
-        const text = textFrom(inner) ?? (typeof inner.text === "string" ? inner.text : undefined);
-        if (text) {
-          doneResultFound = {
-            text,
-            model: modelFrom(inner) ?? modelFrom(event),
-            usage: object(inner.usage) ?? object(event.usage),
-            cost: inner.cost ?? inner.costUsd ?? inner.totalCost ?? event.cost ?? event.costUsd ?? event.totalCost,
-            durationMs: typeof inner.durationMs === "number" ? inner.durationMs : typeof event.durationMs === "number" ? event.durationMs : undefined
-          };
-        }
-      }
-    }
+    if (!event) continue;
+    const terminal = terminalEvent(event);
+    if (terminal?.kind === "error") found = undefined;
+    else if (terminal?.kind === "result" && (exitCode === 0 || terminal.completed)) found = terminal.result;
   }
-
-  return runResultFound ?? doneResultFound;
+  return found;
 }
 
 /**
@@ -153,7 +157,7 @@ export function extractLastJsonlError(stdout: string, stderr: string): string | 
 
 /**
  * Extracts only a terminal Cline result. Streamed assistant/reasoning events are
- * deliberately ignored so they can never be returned to an MCP client.
+ * deliberately ignored so they can never be returned to an MCP client. The last terminal event wins.
  */
 export function parseClineJsonl(jsonl: string): ClineFinalResult {
   let finalResult: ClineFinalResult | undefined;
@@ -170,39 +174,9 @@ export function parseClineJsonl(jsonl: string): ClineFinalResult {
       hasMalformed = true;
       continue;
     }
-
-    if (["run_result", "run-finished", "run_completed"].includes(String(event.type))) {
-      if (String(event.finishReason ?? "") === "error") continue;
-      const eventRun = object(event.run);
-      const result = event.type === "run_result"
-        ? event
-        : object(event.result) ?? object(event.run_result) ?? (eventRun ? object(eventRun.resultSummary) : undefined);
-      if (!result) continue;
-      const text = textFrom(result);
-      if (!text) continue;
-
-      finalResult = {
-        text,
-        model: modelFrom(result) ?? modelFrom(event) ?? (eventRun ? modelFrom(eventRun) : undefined),
-        usage: object(result.usage) ?? (eventRun ? object(eventRun.usage) : undefined),
-        cost: result.cost ?? result.costUsd ?? result.totalCost ?? (eventRun?.cost ?? eventRun?.costUsd ?? eventRun?.totalCost),
-        durationMs: typeof result.durationMs === "number" ? result.durationMs : undefined
-      };
-    } else if (event.type === "agent_event") {
-      const inner = object(event.event);
-      if (inner && inner.type === "done" && inner.reason === "completed") {
-        const text = textFrom(inner) ?? (typeof inner.text === "string" ? inner.text : undefined);
-        if (text && !finalResult) {
-          finalResult = {
-            text,
-            model: modelFrom(inner) ?? modelFrom(event),
-            usage: object(inner.usage) ?? object(event.usage),
-            cost: inner.cost ?? inner.costUsd ?? inner.totalCost ?? event.cost ?? event.costUsd ?? event.totalCost,
-            durationMs: typeof inner.durationMs === "number" ? inner.durationMs : typeof event.durationMs === "number" ? event.durationMs : undefined
-          };
-        }
-      }
-    }
+    const terminal = terminalEvent(event);
+    if (terminal?.kind === "error") finalResult = undefined;
+    else if (terminal?.kind === "result") finalResult = terminal.result;
   }
 
   if (hasMalformed && !finalResult) {

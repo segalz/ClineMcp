@@ -490,20 +490,22 @@ export function createGuard(options?: GuardOptions): Guard {
     if (trippedVerdict !== null) return null;
     if (!event || typeof event !== "object") return null;
 
-    // 0. Capture assistant text excerpt
+    // 0. Capture assistant text excerpt (only assistant text blocks and terminal done/run_result)
     const inner = (event.type === "agent_event" && isObject(event.event)) ? event.event : event;
     if (isObject(inner)) {
-      if ((inner.contentType === "text" || inner.contentType === undefined) &&
-          typeof inner.accumulated === "string" && inner.accumulated.trim()) {
-        lastAssistantText = inner.accumulated.trim();
-      } else if (inner.contentType === "text" && typeof inner.text === "string" && inner.text.trim()) {
-        lastAssistantText = inner.text.trim();
-      } else if (inner.type === "text" && typeof inner.text === "string" && inner.text.trim()) {
-        lastAssistantText = inner.text.trim();
-      } else if (typeof inner.text === "string" && inner.text.trim()) {
-        lastAssistantText = inner.text.trim();
-      } else if (typeof inner.content === "string" && inner.content.trim()) {
-        lastAssistantText = inner.content.trim();
+      if (inner.contentType === "text" && typeof inner.type === "string" && inner.type.startsWith("content_")) {
+        if (typeof inner.accumulated === "string" && inner.accumulated.trim()) {
+          lastAssistantText = inner.accumulated.trim();
+        } else if (inner.type === "content_end" && typeof inner.text === "string" && inner.text.trim()) {
+          lastAssistantText = inner.text.trim();
+        }
+      } else if (
+        (inner.type === "done" && inner.reason !== "error") ||
+        ((inner.type === "run_result" || inner.type === "run-finished" || inner.type === "run_completed") && inner.finishReason !== "error")
+      ) {
+        if (typeof inner.text === "string" && inner.text.trim()) {
+          lastAssistantText = inner.text.trim();
+        }
       }
     }
 

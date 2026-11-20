@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import "./git-test-serial.js";
-import test from "node:test";
+import test, { after } from "node:test";
 import fs from "node:fs";
 import { syncBuiltinESMExports } from "node:module";
 import { spawnSync } from "node:child_process";
@@ -12,14 +12,18 @@ import { applyClineEdits } from "../edits.js";
 import { ClineRunError } from "../runner.js";
 import { TaskManager } from "../tasks.js";
 
+const snapshotDir = await mkdtemp(path.join(os.tmpdir(), "cline-checkoutlock-snapshots-"));
+process.env.CLINE_MCP_SNAPSHOT_DIR = snapshotDir;
+after(() => rm(snapshotDir, { recursive: true, force: true, maxRetries: 5 }));
+
 async function fixture(t: test.TestContext) {
   const base = await mkdtemp(path.join(os.tmpdir(), "cline-checkoutlock-test-"));
   t.after(() => rm(base, { recursive: true, force: true, maxRetries: 5 }));
   const root = path.join(base, "repo"), locks = path.join(base, "locks");
   await mkdir(root); await mkdir(locks);
   const git = (...args: string[]) => {
-    const result = spawnSync(process.platform === "win32" ? "git.exe" : "git", ["-C", root, ...args], { encoding: "utf8", windowsHide: true, timeout: 10_000 });
-    assert.equal(result.status, 0, result.stderr);
+    const result = spawnSync(process.platform === "win32" ? "git.exe" : "git", ["-C", root, ...args], { encoding: "utf8", windowsHide: true, timeout: 60_000 });
+    assert.equal(result.status, 0, result.stderr || result.error?.message);
   };
   git("init", "--quiet"); await writeFile(path.join(root, "a"), "baseline"); git("add", ".");
   git("-c", "user.name=Test", "-c", "user.email=test@example.invalid", "commit", "-qm", "fixture");
@@ -99,13 +103,14 @@ test("canonical path aliases share one writer, releases are idempotent and repla
 test("cross-process contention and a dead holder's stale lock", async t => {
   const { root, locks } = await fixture(t);
   const moduleUrl = new URL("../checkoutlock.js", import.meta.url).href;
-  const child = (source: string) => spawnSync(process.execPath, ["--input-type=module", "-e", source, root, locks], { encoding: "utf8", windowsHide: true, timeout: 10_000 });
+  const child = (source: string) => spawnSync(process.execPath, ["--input-type=module", "-e", source, root, locks], { encoding: "utf8", windowsHide: true, timeout: 60_000 });
   const release = await acquire(root, { lockDirectory: locks });
+  t.after(release);
   const result = child(`import { acquire } from ${JSON.stringify(moduleUrl)}; try { await acquire(process.argv[1], {lockDirectory:process.argv[2]}); process.exit(2); } catch(e) { if(e.kind !== 'checkout_busy') throw e; console.log(e.kind); }`);
-  assert.equal(result.status, 0, result.stderr); assert.match(result.stdout, /checkout_busy/);
+  assert.equal(result.status, 0, result.stderr || result.error?.message); assert.match(result.stdout, /checkout_busy/);
   release();
   const stale = child(`import { acquire } from ${JSON.stringify(moduleUrl)}; await acquire(process.argv[1], {lockDirectory:process.argv[2]});`);
-  assert.equal(stale.status, 0, stale.stderr);
+  assert.equal(stale.status, 0, stale.stderr || stale.error?.message);
   const next = await acquire(root, { lockDirectory: locks }); next();
   await assert.rejects(readFile(checkoutLockPath(root, locks)), { code: "ENOENT" });
 });
