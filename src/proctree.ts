@@ -1,4 +1,5 @@
 import { spawn } from "node:child_process";
+import { PROCESS_TABLE_TIMEOUT_MS, TREE_KILL_CONFIRM_MS } from "./waits.js";
 
 // Confirmed process-tree kill (plan S3, review item A2). A stopped run must not settle while any process
 // of its tree is alive: callers restore the snapshot right after, and a living child could still write.
@@ -30,7 +31,7 @@ export const CREATION_SLACK_MS = 100;
  * One snapshot of every process with its parent and creation time (Windows). Null when it cannot be read
  * (timeout, error, empty output) so callers never mistake "unknown" for "no descendants".
  */
-export function listProcessTable(timeoutMs = 4_000): Promise<ProcessEntry[] | null> {
+export function listProcessTable(timeoutMs = PROCESS_TABLE_TIMEOUT_MS): Promise<ProcessEntry[] | null> {
   if (process.platform !== "win32") return Promise.resolve(null);
   const script = "Get-CimInstance Win32_Process -Property ProcessId,ParentProcessId,CreationDate | ForEach-Object { "
     + "$c = if ($_.CreationDate) { ([DateTimeOffset]$_.CreationDate).ToUnixTimeMilliseconds() } else { 0 }; "
@@ -138,7 +139,7 @@ const sleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve,
  */
 export async function confirmTreeDead(rootPid: number, opts: ConfirmTreeDeadOptions): Promise<TreeKillResult> {
   const platform = opts.platform ?? process.platform;
-  const capMs = opts.capMs ?? 10_000;
+  const capMs = opts.capMs ?? TREE_KILL_CONFIRM_MS;
   const pollMs = opts.pollMs ?? 250;
   const isAlive = opts.isAlive ?? pidAlive;
   const killPid = opts.killPid ?? ((pid: number) => killOnePid(pid, platform));

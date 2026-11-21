@@ -5,6 +5,7 @@ import { randomUUID } from "node:crypto";
 import { spawn } from "node:child_process";
 import { buildEnvironmentLine, WORKING_RULES } from "./rules.js";
 import { withCodeMap } from "./codemap.js";
+import { KILL_SETTLE_MS } from "./waits.js";
 import { subfolderOf } from "./finalcheck.js";
 import { listClineProcesses, type ProcessInfo } from "./procs.js";
 import {
@@ -72,8 +73,8 @@ function runGit(cwd: string, args: string[], signal?: AbortSignal, timeoutMs = G
         if (process.platform === "win32" && typeof child.pid === "number") defaultKillTree(child.pid, "SIGKILL", "win32");
         else child.kill();
       } catch { /* already gone */ }
-      // Reject only once Git has really exited (or after 5 s), so the caller's cleanup does not race it.
-      const giveUp = setTimeout(() => reject(new Error(message)), 5000);
+      // Reject only once Git has really exited (or after KILL_SETTLE_MS), so the caller's cleanup does not race it.
+      const giveUp = setTimeout(() => reject(new Error(message)), KILL_SETTLE_MS);
       child.once("close", () => { clearTimeout(giveUp); reject(new Error(message)); });
     };
     const timer = setTimeout(() => stop(`git ${args[0]} timed out after ${Math.round(timeoutMs / 1000)} s`), timeoutMs);

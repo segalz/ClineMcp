@@ -10,7 +10,9 @@ import {
 export const CODE_MAP_HEADER = "## Code map (bridge-generated, line numbers at HEAD)";
 const MAX_FILES = 3_000;
 const MAX_BYTES = 512 * 1024;
-const TIME_BUDGET_MS = 1_500;
+// Was 1.5 s: on a busy machine the regex scan ran out of time and the model got no map at all (plan
+// after-bridges, 2026-11-21). The caller's deadlineMs still bounds it.
+const TIME_BUDGET_MS = 5_000;
 const CODEINDEX_TIME_BUDGET_MS = 10_000;
 const KILL_BUDGET_MS = 1_500;
 const SKIP_DIRS = new Set(["node_modules", "dist", "build", "out", "vendor", ".git"]);

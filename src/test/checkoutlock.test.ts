@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import "./git-test-serial.js";
+import { TEST_WAIT_MS } from "./test-waits.js";
 import test, { after } from "node:test";
 import fs from "node:fs";
 import { syncBuiltinESMExports } from "node:module";
@@ -74,7 +75,7 @@ test("failed lock writes close the descriptor before Windows-style unlink cleanu
 });
 async function until(check: () => Promise<boolean>) {
   // Whole-suite parallel Git/process work can delay a fake runner before it is scheduled.
-  const deadline = Date.now() + 20_000;
+  const deadline = Date.now() + TEST_WAIT_MS;
   while (!await check()) {
     assert.ok(Date.now() < deadline, "condition did not become true");
     await new Promise(resolve => setTimeout(resolve, 10));

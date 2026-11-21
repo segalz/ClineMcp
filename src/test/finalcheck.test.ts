@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import "./git-test-serial.js";
+import { TEST_WAIT_MS } from "./test-waits.js";
 import test, { after } from "node:test";
 import { spawnSync } from "node:child_process";
 import { mkdtemp, writeFile, readFile, mkdir, rm, readdir } from "node:fs/promises";
@@ -41,7 +42,7 @@ async function fixture(t: test.TestContext) {
   return { base, cwd, locks, snapshots, identity, put, bytes, clean };
 }
 async function until<T>(read: () => Promise<T>, predicate: (value: T) => boolean): Promise<T> {
-  const deadline = Date.now() + 20_000;
+  const deadline = Date.now() + TEST_WAIT_MS;
   while (true) { const value = await read(); if (predicate(value)) return value;
     assert.ok(Date.now() < deadline, JSON.stringify(value)); await new Promise(r => setTimeout(r, 10)); }
 }

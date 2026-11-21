@@ -9,13 +9,17 @@ import { acquire, CheckoutBusyError, type CheckoutRelease } from "../checkoutloc
 // Serialize those files, rather than changing production scan budgets or weakening content assertions.
 const root = path.join(os.tmpdir(), "cline-mcp-git-tests", createHash("sha256").update(process.cwd()).digest("hex"));
 await mkdir(root, { recursive: true });
-const deadline = Date.now() + 600_000;
+// Files wait their turn; with node's default concurrency (one file per CPU) the queue alone exceeded the old
+// 10-minute cap and whole files failed with CheckoutBusyError. A file still fails after an hour in the queue.
+const deadline = Date.now() + 3_600_000;
 let release: CheckoutRelease;
 while (true) {
   try { release = await acquire(root, { lockDirectory: path.join(root, "locks") }); break; }
   catch (error) {
     if (!(error instanceof CheckoutBusyError) || Date.now() >= deadline) throw error;
-    await new Promise(resolve => setTimeout(resolve, 25));
+    // Each try against a live holder starts PowerShell to read the holder's start time (checkoutlock.ts).
+    // At 25 ms, four waiting files started ~160 PowerShell processes a second and slowed the whole suite.
+    await new Promise(resolve => setTimeout(resolve, 1_000));
   }
 }
 after(() => release());

@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import "./git-test-serial.js";
+import { TEST_WAIT_MS } from "./test-waits.js";
 import test, { after } from "node:test";
 import { spawnSync } from "node:child_process";
 import { EventEmitter } from "node:events";
@@ -169,7 +170,7 @@ test("S18 (2): retry after an unconfirmed kill is refused with a clear error; re
   t.after(() => manager.shutdown(30_000));
   const task = manager.start({ mode: "edits", prompt: "Implement", cwd: f.root, maxFixRuns: 2, codeMap: false, provider: "p", model: "m",
     verify: { command: process.execPath, args: ["-e", "0"] } });
-  const deadline = Date.now() + 20_000;
+  const deadline = Date.now() + TEST_WAIT_MS;
   let status = await manager.status(task.taskId, 0);
   while (status.state !== "input_required") { assert.ok(Date.now() < deadline, status.state); await new Promise(r => setTimeout(r, 10)); status = await manager.status(task.taskId, 0); }
   assert.equal(runs, 1);

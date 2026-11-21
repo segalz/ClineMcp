@@ -4,6 +4,7 @@ import path from "node:path";
 import { defaultKillTree, redactSecrets } from "./runner.js";
 import { confirmTreeDead, type TreeKillResult } from "./proctree.js";
 import { createWindowsJob } from "./jobobject.js";
+import { KILL_SETTLE_MS } from "./waits.js";
 
 export interface VerificationCommand { command: string; args?: string[]; timeoutSeconds?: number; }
 export interface VerificationResult {
@@ -232,7 +233,7 @@ export async function runVerification(spec: VerificationCommand, cwd: string, si
         if (rootAlive()) { try { child.kill("SIGKILL"); } catch { /* confirmation reports the failure */ } }
         finish(null, "SIGKILL");
         destroyPipes();
-      }, 5000);
+      }, KILL_SETTLE_MS);
       // After exit the root PID may already belong to another process.
       if (pid && rootAlive()) defaultKillTree(pid);
       void job?.close();

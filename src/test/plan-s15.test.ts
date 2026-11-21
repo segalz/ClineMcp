@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import "./git-test-serial.js";
+import { TEST_WAIT_MS } from "./test-waits.js";
 import test, { after } from "node:test";
 import { spawnSync } from "node:child_process";
 import { EventEmitter } from "node:events";
@@ -190,7 +191,7 @@ test("S15 Gate 2: while a resumed async edit runs, cline_status shows no stale g
     }) } });
   t.after(() => manager.shutdown(30_000));
   const until = async (predicate: () => boolean | Promise<boolean>) => {
-    const deadline = Date.now() + 20_000;
+    const deadline = Date.now() + TEST_WAIT_MS;
     while (!await predicate()) { assert.ok(Date.now() < deadline); await delay(10); }
   };
   const task = manager.start({ mode: "edits", prompt: "Implement", cwd, verify: { none: true, reason: "Explicit test opt-out" },
@@ -278,7 +279,7 @@ test("S15 Gate 2: CLINE_MCP_SNAPSHOT_DIR sets the default snapshot base", async 
 
 // ---- D5: progress heartbeat on long sync calls ----
 
-async function waitFor(predicate: () => boolean, ms = 20_000) {
+async function waitFor(predicate: () => boolean, ms = TEST_WAIT_MS) {
   const deadline = Date.now() + ms;
   while (!predicate()) { assert.ok(Date.now() < deadline, "condition not met in time"); await delay(5); }
 }

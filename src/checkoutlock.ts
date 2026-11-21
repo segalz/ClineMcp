@@ -5,6 +5,7 @@ import { readFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { ClineRunError } from "./runner.js";
+import { PROCESS_QUERY_TIMEOUT_MS } from "./waits.js";
 
 export class CheckoutBusyError extends ClineRunError {
   constructor(public readonly checkoutRoot: string) {
@@ -55,7 +56,7 @@ async function readProcessStartMs(pid: number): Promise<number | "denied" | unde
         `catch { $e = $_.Exception; while ($e) { ` +
         `if (($e -is [System.ComponentModel.Win32Exception] -and $e.NativeErrorCode -eq 5) -or $e -is [System.UnauthorizedAccessException]) { Write-Output 'ACCESS_DENIED'; exit 0 }; ` +
         `$e = $e.InnerException }; exit 1 }`;
-      const out = await execFileText("powershell.exe", ["-NoProfile", "-NonInteractive", "-Command", command], 10_000);
+      const out = await execFileText("powershell.exe", ["-NoProfile", "-NonInteractive", "-Command", command], PROCESS_QUERY_TIMEOUT_MS);
       if (!out.ok) return undefined;
       const text = out.stdout.trim();
       if (text === "ACCESS_DENIED") return "denied";

@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import "./git-test-serial.js";
+import { TEST_WAIT_MS } from "./test-waits.js";
 import test from "node:test";
 import { spawnSync } from "node:child_process";
 import { mkdtemp, mkdir, readFile, realpath, rm, symlink, writeFile } from "node:fs/promises";
@@ -84,7 +85,7 @@ test("S5: an async edit task runs Cline in the subfolder and holds the lock of t
   t.after(() => manager.shutdown(30_000));
   const task = manager.start({ mode: "edits", prompt: "Implement", cwd: f.app, verify: runsIn(f.app), maxFixRuns: 0,
     codeMap: false, provider: "p", model: "m" });
-  const deadline = Date.now() + 20_000;
+  const deadline = Date.now() + TEST_WAIT_MS;
   let view: TaskStatusView;
   while (true) {
     view = await manager.status(task.taskId, 0);

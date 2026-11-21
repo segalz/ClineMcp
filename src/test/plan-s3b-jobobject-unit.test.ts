@@ -32,7 +32,7 @@ test("aborted preparation and exhausted budgets fall back before starting an own
 
 test("an unavailable helper cache preserves the verification result", windows, async t => {
   const dir = await mkdtemp(path.join(os.tmpdir(), "job-fallback-"));
-  t.after(() => rm(dir, { recursive: true, force: true }));
+  t.after(() => rm(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 }));
   const blocked = path.join(dir, "file");
   await writeFile(blocked, "");
   const moduleUrl = new URL("../verify.js", import.meta.url).href;
@@ -49,7 +49,7 @@ test("an unavailable helper cache preserves the verification result", windows, a
 
 test("a failed build can be retried once after cooldown and a fast owner failure keeps its spare", windows, async t => {
   const dir = await mkdtemp(path.join(os.tmpdir(), "job-retry-"));
-  t.after(() => rm(dir, { recursive: true, force: true }));
+  t.after(() => rm(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 }));
   await writeFile(path.join(dir, "blocked"), "");
   const moduleUrl = new URL("../jobobject.js", import.meta.url).href;
   await runNode(process.execPath, ["--input-type=module", "-e", `
@@ -125,7 +125,7 @@ const ticker = `const fs = require("node:fs");
 
 test("verification reaps inherited pipes after root exit and rejects unconfirmed cleanup", windows, async t => {
   const dir = await mkdtemp(path.join(os.tmpdir(), "verify-pipes-"));
-  t.after(() => rm(dir, { recursive: true, force: true }));
+  t.after(() => rm(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 }));
   // The descendant holds the pipe until the verifier closes its end, including if the test host exits.
   const holdPipes = `process.stdout.on("error", () => process.exit()); setInterval(() => process.stdout.write("."), 50);`;
   const rootScript = `
@@ -149,7 +149,7 @@ test("verification reaps inherited pipes after root exit and rejects unconfirmed
 
 test("an unreferenced owner lets its host exit and kills an assigned detached process on host death", windows, async t => {
   const dir = await mkdtemp(path.join(os.tmpdir(), "job-host-"));
-  t.after(() => rm(dir, { recursive: true, force: true }));
+  t.after(() => rm(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 }));
   const moduleUrl = new URL("../jobobject.js", import.meta.url).href;
   const host = spawn(process.execPath, ["--input-type=module", "-e", `
     import { createWindowsJob } from ${JSON.stringify(moduleUrl)};
@@ -210,7 +210,7 @@ for (const cancel of [false, true]) {
 for (const mode of ["normal retry", "final cancellation", "owner failure"]) {
   test(`dedicated hub job lifecycle on ${mode}`, windows, async t => {
     const dir = await mkdtemp(path.join(os.tmpdir(), "job-hub-"));
-    t.after(() => rm(dir, { recursive: true, force: true }));
+    t.after(() => rm(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 }));
     const entryPath = path.join(dir, "cli.cjs"), settings = path.join(dir, "providers.json");
     await writeFile(settings, JSON.stringify({ lastUsedProvider: "cline", providers: {} }));
     const cancel = mode === "final cancellation";

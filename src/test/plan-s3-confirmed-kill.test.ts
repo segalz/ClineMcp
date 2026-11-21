@@ -91,9 +91,10 @@ async function readPids(pidsPath: string, rootBeat: string, childBeat: string): 
   return pids;
 }
 
-test("S3: a timed-out run settles only after the whole CLI tree is dead, even when the first kill is ignored", { timeout: 60_000 }, async () => {
+test("S3: a timed-out run settles only after the whole CLI tree is dead, even when the first kill is ignored", { timeout: 120_000 }, async () => {
   const dir = await mkdtemp(path.join(root, "case-"));
-  const timeoutMs = 6_000; // startup alone can take seconds under full-suite load
+  // Startup of the fake CLI and its child alone took over 6 s under full-suite load ("the heartbeat never started").
+  const timeoutMs = 15_000;
   const { entryPath, pidsPath, trackedPath, rootBeat, childBeat } = await fakeCli(dir, timeoutMs + 250);
   const settingsPath = path.join(dir, "providers.json");
   await writeFile(settingsPath, JSON.stringify({ lastUsedProvider: "cline", providers: {} }));
@@ -122,9 +123,10 @@ test("S3: a timed-out run settles only after the whole CLI tree is dead, even wh
   assertNoWriteAfter(trackedPath, settledAt, "no write may land after the run settled");
 });
 
-test("S3: a timed-out run with budget to spare still confirms the tree is dead before it settles", { timeout: 60_000 }, async () => {
+test("S3: a timed-out run with budget to spare still confirms the tree is dead before it settles", { timeout: 120_000 }, async () => {
   const dir = await mkdtemp(path.join(root, "case-"));
-  const timeoutMs = 6_000; // startup alone can take seconds under full-suite load
+  // Startup of the fake CLI and its child alone took over 6 s under full-suite load ("the heartbeat never started").
+  const timeoutMs = 15_000;
   const { entryPath, pidsPath, trackedPath, rootBeat, childBeat } = await fakeCli(dir, timeoutMs + 250);
   const settingsPath = path.join(dir, "providers.json");
   await writeFile(settingsPath, JSON.stringify({ lastUsedProvider: "cline", providers: {} }));

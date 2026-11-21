@@ -15,6 +15,7 @@ import { FinalCheckLifecycle, startTaskSchema, editActionSchema, type VerifySpec
 import { resolveTraceBase, type TraceInfo, type TraceRecorder, type TraceStatus } from "./trace.js";
 import type { SnapshotOptions } from "./snapshot.js";
 import { runVerification, VerificationError } from "./verify.js";
+import { DIFF_STAT_TIMEOUT_MS, KILL_SETTLE_MS } from "./waits.js";
 
 export type TaskMode = "ask" | "workspace" | "edits";
 export type TaskState = "running" | "resuming" | "done" | "failed" | "cancelled" | "input_required";
@@ -621,7 +622,7 @@ export class TaskManager {
             child.kill();
           }
         } catch { /* already gone */ }
-        const giveUp = setTimeout(() => resolve(undefined), 5000);
+        const giveUp = setTimeout(() => resolve(undefined), KILL_SETTLE_MS);
         giveUp.unref?.();
         child.once("close", () => {
           clearTimeout(giveUp);
@@ -629,7 +630,7 @@ export class TaskManager {
         });
       };
 
-      const timer = setTimeout(stop, 5000);
+      const timer = setTimeout(stop, DIFF_STAT_TIMEOUT_MS);
       timer.unref?.();
 
       const onAbort = () => stop();

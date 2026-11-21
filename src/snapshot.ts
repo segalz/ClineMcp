@@ -4,6 +4,7 @@ import { lstat, mkdir, open, readdir, readFile, readlink, realpath, rename, rm, 
 import os from "node:os";
 import path from "node:path";
 import { defaultKillTree } from "./runner.js";
+import { KILL_SETTLE_MS, SNAPSHOT_GIT_TIMEOUT_MS } from "./waits.js";
 
 export type SnapshotErrorKind = "snapshot_limit" | "snapshot_unsupported" | "snapshot_git_failed" | "snapshot_invalid";
 export class SnapshotError extends Error {
@@ -51,9 +52,9 @@ async function git(root: string, args: string[], signal?: AbortSignal, input?: s
       killDeadline = setTimeout(() => {
         child.kill("SIGKILL"); child.stdout.destroy(); child.stderr.destroy();
         cleanup(); reject(failure);
-      }, 5000);
+      }, KILL_SETTLE_MS);
     };
-    const timer = setTimeout(stop, 10_000);
+    const timer = setTimeout(stop, SNAPSHOT_GIT_TIMEOUT_MS);
     const abort = () => stop();
     signal?.addEventListener("abort", abort, { once: true });
     if (signal?.aborted) stop();

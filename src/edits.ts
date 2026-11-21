@@ -5,6 +5,7 @@ import { withCodeMap, codeMapCommandLineLength } from "./codemap.js";
 import { FinalCheckLifecycle, verificationSchema, type VerifySpec, type FinalVerification } from "./finalcheck.js";
 import { ownsCheckoutLock } from "./checkoutlock.js";
 import { VerificationError } from "./verify.js";
+import { KILL_SETTLE_MS } from "./waits.js";
 import {
   defaultKillTree,
   ClineRunError,
@@ -135,8 +136,8 @@ export function runGit(
         if (process.platform === "win32" && typeof child.pid === "number") defaultKillTree(child.pid, "SIGKILL", "win32");
         else child.kill();
       } catch { /* already gone */ }
-      // Reject only once Git has really exited (or after 5 s), so the caller's cleanup does not race it.
-      const giveUp = setTimeout(() => reject(new Error(message)), 5000);
+      // Reject only once Git has really exited (or after KILL_SETTLE_MS), so the caller's cleanup does not race it.
+      const giveUp = setTimeout(() => reject(new Error(message)), KILL_SETTLE_MS);
       child.once("close", () => { clearTimeout(giveUp); reject(new Error(message)); });
     };
     const timer = setTimeout(() => stop(`git ${args[0]} timed out after ${Math.round(timeoutMs / 1000)} s`), timeoutMs);
