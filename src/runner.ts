@@ -518,7 +518,7 @@ function plainStderrDiagnostics(stderr: string): string[] {
     if (
       /error/i.test(line) ||
       // A bare leading status (`429 status code (no body)`) is a provider diagnostic too (plan S20, Gate 6).
-      /^429\b/.test(line) ||
+      /^429\b(?!\s*\|)/.test(line) ||
       /(?:status|code|http)\D{0,5}(?:429|5\d\d)\b/i.test(line) ||
       /\b(overloaded|rate\s*limit|too\s*many\s*requests|temporarily\s*unavailable|temporarily\s*overloaded|econnreset|etimedout)\b/i.test(line) ||
       /\b(upstream\s*error|provider\s*error)\b/i.test(line)

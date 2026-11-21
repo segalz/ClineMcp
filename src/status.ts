@@ -81,7 +81,8 @@ function httpStatusPattern(code: string): RegExp {
 const RATE_LIMIT_PATTERNS = [
   httpStatusPattern("429"),
   // A leading 429 is a status (`429 Provider returned error`), unless it counts things (`429 files could not be indexed`).
-  /^\s*429\b(?!\s+(?:files?|items?|lines?|records?|rows?|entries|tests?|objects?|bytes?|chars?|characters?|paths?|modules?|packages?|matches|results?|commits?|warnings?)\b)/i,
+  // A compiler code frame (`429 | const x = ;`) is a source line number, not a status.
+  /^\s*429\b(?!\s*\|)(?!\s+(?:files?|items?|lines?|records?|rows?|entries|tests?|objects?|bytes?|chars?|characters?|paths?|modules?|packages?|matches|results?|commits?|warnings?)\b)/i,
   /\brate[\s-]*limit/i,
   /\btoo\s+many\s+requests\b/i
 ];

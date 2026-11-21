@@ -106,3 +106,8 @@ test("Gate 6: a failed hub stop with an unreadable process list is not confirmed
     isListening: async () => false, listProcesses: async () => undefined } as any);
   assert.equal((result as any)?.confirmed, false, JSON.stringify(result));
 });
+
+test("final check: a stderr code frame starting with '429 |' is not a rate limit", async () => {
+  const error = await failure(child([], "src/app.ts:429:7 - error TS1109: Expression expected.\n429 | const x = ;\n"));
+  assert.notEqual(classifyRunError(error, Date.now())?.state, "rate_limited", `${error.kind}: ${error.message}`);
+});

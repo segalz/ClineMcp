@@ -68,11 +68,19 @@ for (const stage of ["before check", "after pass", "explicit opt-out"] as const)
     const signal = new AbortController().signal;
     await lifecycle.execute(signal);
     assert.deepEqual([runs, checks], [1, stage === "after pass" ? 1 : 0]);
-    assert.equal(lifecycle.phase, "waiting");
+    // A passing check (or an explicit opt-out answer) is the commit point (final Codex check): the edit stays done,
+    // the unconfirmed stop is evidence and the recovery snapshot is kept. Before the check it is a wait.
+    const committed = stage !== "before check";
+    assert.equal(lifecycle.phase, committed ? "done" : "waiting");
     assert.deepEqual(lifecycle.evidence.processesStillAlive, []);
     assert.equal(lifecycle.evidence.killUnverified, true);
     await lifecycle.execute(signal, "try again");
     assert.equal(runs, 1);
+    if (committed) {
+      const kept = lifecycle.evidence.snapshotDirectory as string;
+      assert.ok(kept && existsSync(kept), JSON.stringify(lifecycle.evidence));
+      return;
+    }
     const directory = lifecycle.snapshot!.directory;
     assert.equal(await lifecycle.restore(), true);
     assert.ok(existsSync(directory));
@@ -224,4 +232,24 @@ test("S20 (7): publishing the same async edit error twice keeps one hub note", a
     assert.equal((await manager.result(taskId)).error?.split(note).length, 2);
     if (publication === 1) await manager.send(taskId, "retry edit", "retry");
   }
+});
+
+test("final check: a passing edit is never restored because its hub stop outlasts the deadline", async t => {
+  const root = await checkout(t);
+  const lifecycle = new FinalCheckLifecycle({ prompt: "Edit", cwd: root, timeoutSeconds: 2,
+    verify: { none: true, reason: "Test opt-out for the commit point" } }, {
+    resolveRoot: async () => root, fits: () => true, question: () => undefined, lockDirectory: path.join(base, "locks"),
+    snapshotOptions: { snapshotBase: path.join(base, "snapshots") },
+    run: async (_prompt, _signal, _lock, _guard, _remaining, _run, hub) => {
+      // The hub stop takes longer than the whole 2 s budget, but it stops cleanly (confirmed).
+      await hub.environment(root, { deps: { startHub: async () => ({ env: {}, stop: () => new Promise<void>(r => setTimeout(r, 2_500)) }) } } as any);
+      hub.launched = true;
+      return { text: "done", durationMs: 0, guard: { window: 10, totalToolCalls: 0, totalInputTokens: 0,
+        filesTouched: [], lastErrors: [], processToolCalls: 0 } } as any;
+    }
+  });
+  t.after(() => lifecycle.release());
+  await lifecycle.execute(new AbortController().signal);
+  assert.equal(lifecycle.phase, "done", JSON.stringify({ wait: lifecycle.waitReason, error: String(lifecycle.error) }));
+  assert.equal(lifecycle.verification.restored, false);
 });

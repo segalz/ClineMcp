@@ -190,6 +190,12 @@ export class FinalCheckLifecycle {
       if (hub.unconfirmedStop) throw hub.unconfirmedStop;
       check();
     };
+    // After a passing check (or a verify-none answer) the edit is committed: a slow hub stop or the overall deadline
+    // must never restore it. An unconfirmed stop only keeps the snapshot and blocks further runs (plan S20, final check).
+    const stopHubAfterPass = async () => {
+      await hub.stop();
+      if (hub.unconfirmedStop) this.recordUnconfirmedKill(hub.unconfirmedStop.processesStillAlive, true);
+    };
     try {
       check();
       if (!this.lock) {
@@ -259,7 +265,6 @@ export class FinalCheckLifecycle {
         if (typeof metrics?.cost === "number") this.cost += metrics.cost;
         this.durationMs += metrics?.durationMs ?? 0;
         check();
-        if (response && "none" in this.input.verify) await stopHub();
         if (!await this.unchanged(wait)) return;
         check();
         if (failure) {
@@ -274,7 +279,13 @@ export class FinalCheckLifecycle {
         }
         this.question = this.deps.question(response!.text);
         if (this.question) { wait("cline_question"); return; }
-        if ("none" in this.input.verify) { await this.complete(); return; }
+        if ("none" in this.input.verify) {
+          // An explicit opt-out answer is the commit point, like a passing check.
+          await stopHubAfterPass();
+          if (!await this.unchanged(wait)) return;
+          if (signal.aborted) throw new ClineRunError("cancelled", "The edit lifecycle was cancelled.");
+          await this.complete(); return;
+        }
         // A run that may have started a process (a command tool, or a run without a guard report) must not leave
         // it running during the check: stop the hub and its job, which kills those processes, as before S16. The
         // next fix run then gets a fresh hub; file-only runs keep theirs (plan S16 review).
@@ -296,11 +307,16 @@ export class FinalCheckLifecycle {
         verified.stdoutTail = redactSecrets(verified.stdoutTail); verified.stderrTail = redactSecrets(verified.stderrTail);
         this.verification.attempts.push({ ...verified, run: this.launches });
         this.verification.passed = verified.passed;
+        if (verified.passed) {
+          await stopHubAfterPass();
+          if (!await this.unchanged(wait)) return;
+          // Only a caller cancel before this point restores a passing edit, never the deadline (README commit point).
+          if (signal.aborted) throw new ClineRunError("cancelled", "The edit lifecycle was cancelled.");
+          await this.complete(); return;
+        }
         check();
-        if (verified.passed) await stopHub();
         if (!await this.unchanged(wait)) return;
         check();
-        if (verified.passed) { await this.complete(); return; }
         if (this.killUnconfirmed || verified.error || manual || this.automaticFixes >= (this.input.maxFixRuns ?? 2)) {
           wait("verify_failed", verified.error ? new VerificationError("verification_launch_failed", verified.error) : undefined); return;
         }
@@ -315,8 +331,11 @@ export class FinalCheckLifecycle {
         this.hubWarnings.push(...hub.warnings);
         if (hub.unconfirmedStop) {
           this.recordUnconfirmedKill(hub.unconfirmedStop.processesStillAlive, true);
-          this.question = undefined;
-          if (!pendingWait?.error) wait("cline_error", hub.unconfirmedStop);
+          // A committed (passing) edit stays done: the unconfirmed stop is evidence and a kept snapshot, not a wait.
+          if (this.phase !== "done") {
+            this.question = undefined;
+            if (!pendingWait?.error) wait("cline_error", hub.unconfirmedStop);
+          }
         }
         if (signal.aborted && this.phase !== "done") {
           this.cancelled = true; this.error = new ClineRunError("cancelled", "The edit lifecycle was cancelled."); await this.restore();
