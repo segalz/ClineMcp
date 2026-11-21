@@ -19,6 +19,7 @@ import {
 import {
   TaskManager,
   hintFor,
+  hintTokens,
   type Task
 } from "../tasks.js";
 import { TraceRecorder } from "../trace.js";
@@ -430,6 +431,21 @@ test("tasks: hintFor maps loop_detected and budget_exceeded to crash with error 
     error_text: "Stopped by the bridge: tool-call budget exceeded (151 > 150 tool calls)",
     duration_s: 5
   });
+});
+
+test("tasks: hintFor carries the run's token counts in log_run field names", () => {
+  const dummyTrace = { runId: "r1", dir: "/tmp/d", events: "/tmp/e", status: "/tmp/s" };
+  const base = {
+    id: "task-2", mode: "ask", startedAt: 1000, endedAt: 6000, activeMs: 5000, run: 1, runs: [dummyTrace], trace: dummyTrace,
+    controller: new AbortController(), settled: Promise.resolve(), provider: "p", model: "m", originalPrompt: "prompt", qaHistory: []
+  };
+  const done = { ...base, state: "done",
+    result: { text: "ok", durationMs: 5000, usage: { inputTokens: 1200, outputTokens: 80, cacheReadTokens: 900, reasoningTokens: 15, totalCost: 0 } } } as unknown as Task;
+  assert.deepEqual(hintFor(done), { ok: true, duration_s: 5, input_tokens: 1200, output_tokens: 80, cached_input_tokens: 900, reasoning_tokens: 15 });
+  // No usage, or malformed counts: the hint stays as before.
+  const bare = { ...base, state: "done", result: { text: "ok", durationMs: 5000, usage: { inputTokens: -1, outputTokens: 1.5 } } } as unknown as Task;
+  assert.deepEqual(hintFor(bare), { ok: true, duration_s: 5 });
+  assert.deepEqual(hintTokens(undefined), {});
 });
 
 test("tasks: run ending in loop_detected transitions to input_required with bridge question and history", async t => {

@@ -435,7 +435,29 @@ export interface Task {
 }
 
 /** What model-picker's log_run needs; null when the run must not be logged (cancelled by the caller). */
-export interface LogRunHint { ok: boolean; error_kind?: "timeout" | "quota" | "crash"; retry_after_s?: number; error_text?: string; duration_s: number; }
+export interface LogRunHint {
+  ok: boolean; error_kind?: "timeout" | "quota" | "crash"; retry_after_s?: number; error_text?: string; duration_s: number;
+  input_tokens?: number; output_tokens?: number; cached_input_tokens?: number; reasoning_tokens?: number;
+}
+
+const HINT_TOKEN_FIELDS: Array<[keyof LogRunHint, string[]]> = [
+  ["input_tokens", ["inputTokens", "input_tokens"]],
+  ["output_tokens", ["outputTokens", "output_tokens"]],
+  ["cached_input_tokens", ["cacheReadTokens", "cache_read_tokens", "cache_read_input_tokens"]],
+  ["reasoning_tokens", ["reasoningTokens", "reasoning_tokens"]]
+];
+
+/** Token counts from a run's summed usage, in model-picker's log_run field names; absent fields stay absent. */
+export function hintTokens(usage: unknown): Partial<LogRunHint> {
+  if (!usage || typeof usage !== "object") return {};
+  const source = usage as Record<string, unknown>;
+  const out: Record<string, number> = {};
+  for (const [target, names] of HINT_TOKEN_FIELDS) {
+    const value = names.map(name => source[name]).find(v => typeof v === "number");
+    if (typeof value === "number" && Number.isSafeInteger(value) && value >= 0) out[target] = value;
+  }
+  return out as Partial<LogRunHint>;
+}
 
 export interface TaskStatusView {
   codeMapSource: CodeMapSource;
@@ -493,6 +515,12 @@ function errorText(error: unknown): string {
 }
 
 export function hintFor(task: Task): LogRunHint | null {
+  const hint = outcomeHint(task);
+  // Tokens let model-picker learn real token use for the free bridges; failed runs report what they spent too.
+  return hint ? { ...hint, ...hintTokens((task.result as { usage?: unknown } | undefined)?.usage) } : null;
+}
+
+function outcomeHint(task: Task): LogRunHint | null {
   const activeDuration = task.activeMs || ((task.endedAt ?? Date.now()) - task.startedAt);
   const duration_s = Math.round(activeDuration / 100) / 10;
   if (task.finalCheck) {

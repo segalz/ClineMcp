@@ -391,7 +391,7 @@ server.registerTool(
   "cline_result",
   {
     description: "Final result of a finished Cline task, or partial result of an input_required task (does not remove the task), " +
-      "plus verification evidence and summed edit-run usage. log_run_hint for model-picker is null while waiting, cancelled, or on local failure; " +
+      "plus verification evidence and summed edit-run usage. log_run_hint for model-picker carries the run's token counts and is null while waiting, cancelled, or on local failure; " +
       "edits are ok only on success with a passing check or explicit none opt-out. " +
       "Removes the task and its trace unless keepTrace.",
     inputSchema: { taskId: z.string().uuid(), keepTrace: z.boolean().optional() }
