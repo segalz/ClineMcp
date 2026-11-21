@@ -179,7 +179,24 @@ All work is on branch `fix/after-bridges` in each repo. That branch is stacked o
   - **Later (layers 1 and 3 from the owner's question).**
     - A machine-wide queue for heavy bridge runs.
     - A "busy" status that `pick` reads.
-- **Next:** P1 (needs the owner's answer to open question 2), then P4 (Codex), then A8 merge, rebuild, restart, and the live proof (pick → bridge → log_run on both bridges).
+- **2026-11-21, P1 done** (owner: a passing real checked edit renews write freshness). Written by Neon, reviewed by Codex. Codex's migration fixes were made by Claude.
+- **2026-11-21, P4 done.** Written by Codex. Opus reviewed it in two rounds and accepted it.
+- **2026-11-21, A8 text done.** Tool descriptions were updated in both bridges, and model-picker gained `read_note`. Memory was updated, and the CLAUDE.md draft is in `plan/claude-md-changes-2026-11-21.md`, waiting for the owner.
+- **2026-11-21, live check after the owner's restart, on the `fix/after-bridges` code (not merged).**
+  - `pick` (before `backend_status`):
+    - S writes go to the Cline bridge; M writes without Cline go to OpenCode `nvidia/poolside/laguna-xs-2.1`;
+    - reads carry `read_note`;
+    - models without `write_ok` are read-only.
+  - `backend_status` wrote `agy-discovery.json`; `pick` then listed the discovered AGY models and marked the exhausted Claude/GPT family.
+  - Reads on a small test repository (a missing `multiply`):
+    - `ask_cline_workspace` with `cline-free/nemotron-3.5-super-vl`: correct, 16.9 s, 22.6k input tokens;
+    - `analyze_code` with `opencode/deepseek-v4.1-flash-free`: correct, 15.2 s, 23.0k tokens.
+  - Checked edits, each passing on the first run with no fix runs and only `math.js` touched:
+    - `apply_cline_edits` with `nvidia/nemotron-3.5-lightning-free`: 18.4 s, 108k input tokens (84k cached);
+    - `apply_opencode_edits` with `laguna`: 44.4 s, 46k tokens.
+  - All four runs were logged with tokens, and the edits with `write=true`.
+  - P1 live: `laguna`'s write score went from 0.613 to 1.047 (state from unknown to available) after its passing edit was logged.
+- **Next:** owner approval for the merge to `main` (three repos) and for the CLAUDE.md changes; then B1 re-seed, C1 real-size task, D items.
 - **D3 finding, 2026-11-21.**
   - The full ClineMcp suite at node's default concurrency (15 files at once on this machine) failed 16 tests twice. Every failing file passes alone, and the whole suite passes with `--test-concurrency=4`.
   - From now on, run it as `node --test --test-concurrency=4 dist/test/*.test.js`.
