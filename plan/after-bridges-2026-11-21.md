@@ -200,7 +200,28 @@ All work is on branch `fix/after-bridges` in each repo. That branch is stacked o
   - `main` was fast-forwarded to `fix/after-bridges` and pushed in all three repos: ClineMcp 4ff4c2e, openCodeHelperMcp 8f7c8b3, model-picker 918281a. This is the code that ran the live check.
   - CLAUDE.md has the 9 changes from `plan/claude-md-changes-2026-11-21.md` (backup `CLAUDE.md.bak-2026-11-21`).
   - At the owner's request, the same changes went into Codex's `~/.codex/AGENTS.md` (backup `AGENTS.md.bak-2026-11-21`, synced 2026-11-21).
-- **Next (not started):** B1 re-seed, C1 real-size task, C3/C4, the D items, and later layers 1 and 3 (machine-wide queue, "busy" status for `pick`).
+- **2026-11-22, B1 done** (24 min).
+  - Write approval (2/2 edits): Nvidia `nemotron-3-ultra-550b`, `nemotron-3.5-super-vl-120b`, `nemotron-3.5-lightning-30b`, `nemotron-3-nano-omni`, `laguna-xs-2.1`, plus `freellmapi/gpt-oss-120b`.
+  - Cline: both models 2/2.
+  - All `opencode/*` edits ran into "Free usage limit reached" (checked in the OpenCode log), so they are recorded as quota, not as skill, and their `write_ok` is unchanged (P6 working). Re-seed their edit track when that quota returns.
+  - FreeLLMAPI mostly timed out; a few Nvidia models failed the probe.
+- **2026-11-22, C1 + D1 done.** The real task was D1 (sweep old kept snapshots), written by the free bridges themselves on `feat/snapshot-sweep` (ClineMcp f9aa81c, openCodeHelperMcp 60544ba), from tests Claude wrote first.
+  - Cline `nemotron-3.5-lightning`: 19 s, first try.
+  - OpenCode `nemotron-3-ultra`: 85 s, first try.
+  - The three earlier failures were caller settings: verify timeout reserved out of the budget, a slow test file in verify, and no "do not run tests" in the prompt.
+  - Two fixes came out of this live use:
+    - both bridges refuse a first run left under 60 s after the check's reserve;
+    - the OpenCode edit rule forbids helper scripts.
+  - Suites: OpenCode 332/0; Cline 562 plus the updated S10 test (the old 80 s → 10 s case is now refused by design).
+  - Lessons are in memory (`free-bridges-limits`).
+- **D2 done** (`plan/open-items.md` rows 10-14). **D6:** the sandbox folders need admin rights (owner, row 14).
+- **Not done, recorded:**
+  - C3: re-measure Cline's ~6k-char edit cap on a large file (part of open item 9, Stage 14).
+  - C4: whether Claude Code sends `progressToken` (unverified, low value).
+  - D3: remaining load flakes were fixed by W.
+  - D4: agent-intern 0.40 (open item 13).
+  - D5: codeindex OpenCode half (waits for `opencode/*` quota).
+- **Next:** owner OK to merge `feat/snapshot-sweep` (both bridges), then a restart.
 - **D3 finding, 2026-11-21.**
   - The full ClineMcp suite at node's default concurrency (15 files at once on this machine) failed 16 tests twice. Every failing file passes alone, and the whole suite passes with `--test-concurrency=4`.
   - From now on, run it as `node --test --test-concurrency=4 dist/test/*.test.js`.
