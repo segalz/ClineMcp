@@ -139,8 +139,10 @@ server.registerTool(
       "The bridge stops on repeated failures or budget. codeMap defaults to true. " +
       "verify is checked before the run (a missing command is refused at once, with no model use) and runs in the requested cwd " +
       "(e.g. a monorepo package), not the repository root. A passing check is final: nothing after it restores the edit. " +
-      "If a stopped process may still be running, no repair runs and the recovery snapshot is kept (evidence.snapshotDirectory). " +
-      "With an MCP progressToken the call sends notifications/progress every 15 s.",
+      "If a stopped process may still be running, no repair runs, nothing is restored automatically, and the recovery snapshot is kept (evidence.snapshotDirectory). " +
+      "Internal waits follow the call's budget, so a busy machine slows the call instead of failing it. " +
+      "With an MCP progressToken the call sends notifications/progress every 15 s. " +
+      "For model-picker log_run pass the returned usage as tokens and write=true.",
     inputSchema: {
       prompt: z.string().min(1).max(20_000),
       cwd: z.string().min(1),
@@ -302,7 +304,12 @@ server.registerTool(
       "Ask/workspace have one attempt and no automatic retry. " +
       "The bridge stops a run on repeated failures or budget and waits for guidance via cline_send. " +
       "codeMap defaults to true for workspace/edits, including resumed runs; ignored in ask mode. " +
-      "HEAD/index changes refuse restoration and retain recovery evidence. Input is strict and at most 64 KiB.",
+      "HEAD/index changes refuse restoration and retain recovery evidence. Input is strict and at most 64 KiB. " +
+      "Edits: verify is checked before the run (a missing command is refused at once) and runs in the requested cwd, not the repository root. " +
+      "A passing check followed by the identity re-read is final: nothing after it restores the edit. " +
+      "If a stopped process may still be running, the kill is unconfirmed: nothing is restored automatically, retry is refused (restore or keep), " +
+      "and the recovery snapshot is kept. A restore is bounded and reports any file it could not reach. " +
+      "cline_result's log_run_hint carries tokens and write=true for edits; pass it to model-picker log_run.",
     inputSchema: startTaskObjectSchema.extend({
       provider: providerModelSchema,
       model: providerModelSchema
