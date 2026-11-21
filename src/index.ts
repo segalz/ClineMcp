@@ -3,6 +3,7 @@ import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
 import { z } from "zod";
 import { askCline, ClineRunError, formatErrorAsText, guardOptionsSchema } from "./runner.js";
 import { applyClineEdits, editFailurePayload } from "./edits.js";
+import { sweepOldSnapshots } from "./snapshot.js";
 import { askClineWorkspace } from "./workspace.js";
 import { clinePing } from "./ping.js";
 import { listFreeModels, writeCatalogSnapshot } from "./models.js";
@@ -141,6 +142,7 @@ server.registerTool(
       "(e.g. a monorepo package), not the repository root. A passing check is final: nothing after it restores the edit. " +
       "If a stopped process may still be running, no repair runs, nothing is restored automatically, and the recovery snapshot is kept (evidence.snapshotDirectory). " +
       "Internal waits follow the call's budget, so a busy machine slows the call instead of failing it. " +
+      "The check's timeout plus 10 s is reserved from timeoutSeconds; if less than 60 s would be left for Cline, the call is refused before the model starts. " +
       "With an MCP progressToken the call sends notifications/progress every 15 s. " +
       "For model-picker log_run pass the returned usage as tokens and write=true.",
     inputSchema: {
@@ -449,3 +451,4 @@ void (async () => {
 })();
 
 await server.connect(new StdioServerTransport());
+void sweepOldSnapshots().catch(() => {});

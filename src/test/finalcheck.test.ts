@@ -98,6 +98,22 @@ test("shared lifecycle passes first time and fail/fix/pass retains the original 
   }
 });
 
+test("a first run left under a minute after the check's reserve is refused before the model starts", async t => {
+  // Live use 2026-11-21: verify 240 s of a 300 s budget left Cline 47 s, and the run could only time out.
+  const f = await fixture(t); let runs = 0;
+  const lifecycle = new FinalCheckLifecycle({ prompt: "Implement", cwd: f.cwd, timeoutSeconds: 300, verify: { ...verify, timeoutSeconds: 240 } }, {
+    resolveRoot: async cwd => cwd, fits: () => true, question: editQuestion, lockDirectory: f.locks,
+    snapshotOptions: { snapshotBase: f.snapshots },
+    run: async () => { runs++; return { text: "done", durationMs: 1 } as any; }
+  });
+  await lifecycle.execute(new AbortController().signal);
+  assert.equal(runs, 0);
+  assert.equal(lifecycle.phase, "waiting");
+  assert.equal(lifecycle.waitReason, "budget");
+  assert.match(String((lifecycle.error as Error)?.message), /left for Cline after reserving 250 s for the check/);
+  lifecycle.release();
+});
+
 test("sync failure restores by default, keepOnFailure retains changes, and none reports its reason", async t => {
   for (const keepOnFailure of [false, true]) {
     const f = await fixture(t);

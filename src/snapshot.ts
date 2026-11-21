@@ -281,8 +281,7 @@ export async function takeSnapshot(checkoutRoot: string, opts: SnapshotOptions =
   const maxFiles = limit(opts.maxFiles, 20_000);
   const maxFile = limit(opts.maxFileBytes, MAX_FILE_BYTES);
   const maxTotal = limit(opts.maxTotalBytes, 512 * 1024 * 1024);
-  const envSnapshotDir = process.env.CLINE_MCP_SNAPSHOT_DIR?.trim();
-  const base = path.resolve(opts.snapshotBase ?? (envSnapshotDir || path.join(os.tmpdir(), "cline-mcp-snapshots")));
+  const base = path.resolve(opts.snapshotBase ?? defaultSnapshotBase());
   // Resolve the closest existing ancestor too: a symlinked base must not lead back into the checkout.
   let ancestor = base;
   while (!await statOrMissing(ancestor)) ancestor = path.dirname(ancestor);
@@ -571,6 +570,34 @@ export async function discardSnapshot(handle: SnapshotHandle, signal?: AbortSign
   // Only private snapshot storage is touched once the checkout is committed.
   const removal = rm(handle.directory, { recursive: true, force: true });
   await (signal ? untilAborted(removal, signal) : removal);
+}
+
+export const SNAPSHOT_RETENTION_MS = 14 * 86_400_000;
+
+export function defaultSnapshotBase(): string {
+  return path.resolve(process.env.CLINE_MCP_SNAPSHOT_DIR?.trim() || path.join(os.tmpdir(), "cline-mcp-snapshots"));
+}
+
+const SNAPSHOT_NAME = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+/** Remove kept snapshot folders (UUID names) older than maxAgeMs; never throws. */
+export async function sweepOldSnapshots(base?: string, opts: { now?: () => number; maxAgeMs?: number } = {}): Promise<string[]> {
+  const now = opts.now ?? Date.now;
+  const maxAgeMs = opts.maxAgeMs ?? SNAPSHOT_RETENTION_MS;
+  const directory = base ?? defaultSnapshotBase();
+  let names: string[];
+  try { names = await readdir(directory); } catch { return []; }
+  const removed: string[] = [];
+  for (const name of names) {
+    if (!SNAPSHOT_NAME.test(name)) continue;
+    const full = path.join(directory, name);
+    try {
+      const info = await lstat(full);
+      if (!info.isDirectory() || info.isSymbolicLink()) continue;
+      if (now() - info.mtimeMs > maxAgeMs) { await rm(full, { recursive: true, force: true }); removed.push(name); }
+    } catch { /* unreadable entry: skip */ }
+  }
+  return removed.sort();
 }
 
 export async function headAndIndexIdentity(checkoutRoot: string, signal?: AbortSignal): Promise<{ head: string; indexHash: string | null }> {

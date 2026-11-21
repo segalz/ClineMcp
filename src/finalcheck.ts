@@ -11,6 +11,8 @@ import type { GuardOptions } from "./guard.js";
 /** Extra margin reserved alongside the final check's timeout so each run leaves time to verify.
  * `runVerification` settles within `verify.timeoutSeconds + SETTLE_MARGIN_MS` (4 s), fitting inside this 10 s reserve. */
 export const VERIFY_RESERVE_MARGIN_MS = 10_000;
+/** A first edit run shorter than this (after the check's reserve) is refused before the model starts. */
+export const MIN_FIRST_RUN_SECONDS = 60;
 
 const VERIFY_COMMAND_HELP = "Program for the final check, run without a shell. It must already be runnable before the edit "
   + "starts (it is checked up front; a tool the edit would install is refused). On Windows, npm/pnpm/yarn and "
@@ -253,6 +255,14 @@ export class FinalCheckLifecycle {
         const remainingSeconds = Math.floor((remaining - (now() - started) - verifyReserveMs) / 1000);
         if (remainingSeconds < 1) {
           wait("budget", new ClineRunError("budget_exceeded", "Not enough time left for a run and its final check."));
+          return;
+        }
+        // The check's time is reserved up front; refuse a first run left too short to do real work rather than
+        // spend the model on a run that can only time out (live use 2026-11-21: verify 240 s of 300 s left 47 s).
+        if (this.launches === 0 && verifyReserveMs > 0 && remainingSeconds < MIN_FIRST_RUN_SECONDS) {
+          wait("budget", new ClineRunError("budget_exceeded",
+            `Only ${remainingSeconds} s of the call's budget would be left for Cline after reserving ` +
+            `${Math.round(verifyReserveMs / 1000)} s for the check. Lower verify.timeoutSeconds or raise timeoutSeconds.`));
           return;
         }
         this.phase = "run";

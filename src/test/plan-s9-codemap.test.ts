@@ -43,7 +43,8 @@ async function withoutCodeindex<T>(action: () => Promise<T>): Promise<T> {
 test("S9 B7: a tracked file deleted from the working tree is skipped; the rest of the map is built", async () => {
   const repo = await repository({ "a.ts": "export const kept = 1;\n", "b.ts": "export const gone = 1;\n", "c.ts": "export const alsoKept = 1;\n" });
   await rm(path.join(repo, "b.ts"));
-  const map = await withoutCodeindex(() => buildCodeMap(repo));
+  // A generous budget: this test is about which paths are skipped, not about scan speed under full-suite load.
+  const map = await withoutCodeindex(() => buildCodeMap(repo, { regexBudgetMs: 60_000 }));
   assert.ok(map, "the map must not be dropped");
   assert.match(map, /a\.ts/);
   assert.match(map, /c\.ts/);
@@ -54,7 +55,7 @@ test("S9 B7: a tracked path whose parent became a file is skipped too", async ()
   const repo = await repository({ "a.ts": "export const kept = 1;\n", "dir/inner.ts": "export const inner = 1;\n", "z.ts": "export const last = 1;\n" });
   await rm(path.join(repo, "dir"), { recursive: true });
   await writeFile(path.join(repo, "dir"), "a file where Git expects a folder\n");
-  const map = await withoutCodeindex(() => buildCodeMap(repo));
+  const map = await withoutCodeindex(() => buildCodeMap(repo, { regexBudgetMs: 60_000 }));
   assert.match(map ?? "", /a\.ts/);
   assert.match(map ?? "", /z\.ts/, "files after the bad path are still scanned");
 });

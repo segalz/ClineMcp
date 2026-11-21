@@ -98,9 +98,10 @@ test("S10 B10: other Cline errors are still cline_error", async t => {
 
 // --- B10: the first run keeps time for its check --------------------------------------
 
-test("S10 B10: with an 80 s budget and a 60 s check, the first run gets at most 20 s", async t => {
+// Was 80 s budget → 10 s run; since 2026-11-21 a first run under MIN_FIRST_RUN_SECONDS (60 s) is refused up front.
+test("S10 B10: with a 140 s budget and a 60 s check, the first run gets exactly the 70 s left", async t => {
   const f = await fixture(t); const seconds: number[] = [];
-  const lifecycle = new FinalCheckLifecycle({ prompt: "Implement", cwd: f.cwd, verify: { ...verify, timeoutSeconds: 60 }, timeoutSeconds: 80 }, {
+  const lifecycle = new FinalCheckLifecycle({ prompt: "Implement", cwd: f.cwd, verify: { ...verify, timeoutSeconds: 60 }, timeoutSeconds: 140 }, {
     resolveRoot: async cwd => cwd, fits: () => true, question: editQuestion, lockDirectory: f.locks,
     snapshotOptions: { snapshotBase: f.snapshots }, now: () => 0,
     run: async (_prompt, _signal, _lock, _guard, remainingSeconds) => {
@@ -112,8 +113,8 @@ test("S10 B10: with an 80 s budget and a 60 s check, the first run gets at most 
     await lifecycle.execute(new AbortController().signal);
     assert.equal(lifecycle.phase, "done");
     assert.equal(seconds.length, 1);
-    // 80 s - (60 s check + 10 s margin) = 10 s with the injected clock removing Git setup jitter.
-    assert.equal(seconds[0], 10, `first run got ${seconds[0]} s`);
+    // 140 s - (60 s check + 10 s margin) = 70 s with the injected clock removing Git setup jitter.
+    assert.equal(seconds[0], 70, `first run got ${seconds[0]} s`);
   } finally { lifecycle.release(); }
 });
 
