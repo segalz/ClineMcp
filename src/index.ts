@@ -136,7 +136,11 @@ server.registerTool(
     description: "Have Cline implement a development task directly in the current Git checkout. Files may change, but commits are forbidden and the resulting diff is returned. " +
       "verify is required: a shell-free command or explicit {none:true, reason}. Up to maxFixRuns automatic repairs (0-3, default 2) share cumulative guard and active-time budgets. " +
       "Failure restores the original dirty baseline unless keepOnFailure; HEAD/index changes refuse restoration and retain a recovery snapshot. " +
-      "The bridge stops on repeated failures or budget. codeMap defaults to true.",
+      "The bridge stops on repeated failures or budget. codeMap defaults to true. " +
+      "verify is checked before the run (a missing command is refused at once, with no model use) and runs in the requested cwd " +
+      "(e.g. a monorepo package), not the repository root. A passing check is final: nothing after it restores the edit. " +
+      "If a stopped process may still be running, no repair runs and the recovery snapshot is kept (evidence.snapshotDirectory). " +
+      "With an MCP progressToken the call sends notifications/progress every 15 s.",
     inputSchema: {
       prompt: z.string().min(1).max(20_000),
       cwd: z.string().min(1),
@@ -183,7 +187,10 @@ server.registerTool(
   "ask_cline_workspace",
   {
     description: "Analyze a Git workspace through Cline in a disposable worktree. The worktree is always removed after the request. " +
-      "The bridge automatically stops a run on repeated failures or budget. codeMap defaults to true; set false to omit the generated code map.",
+      "The bridge automatically stops a run on repeated failures or budget. codeMap defaults to true; set false to omit the generated code map. " +
+      "Cline sees committed HEAD only (uncommitted work is not in the worktree); a cwd inside the repository runs in the same " +
+      "subfolder of the worktree. A quota-locked model is refused before any worktree is created. " +
+      "With an MCP progressToken the call sends notifications/progress every 15 s.",
     inputSchema: {
       prompt: z.string().min(1).max(20_000),
       cwd: z.string().min(1),
@@ -342,6 +349,7 @@ server.registerTool(
   "cline_send",
   {
     description: "Answer a waiting Cline task. Edits support retry (default), restore and keep, with optional message as guidance. " +
+      "After a stopped process that may still be running, retry is refused: only restore or keep (the recovery snapshot is kept). " +
       "Retry retains partial edits and performs one repair or answers a Cline question without resetting automatic-fix capacity or budgets. " +
       "Restore undoes every edit run back to the original dirty baseline; keep ends unverified. " +
       "Ask/workspace require a message and support retry only.",
