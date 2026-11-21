@@ -103,15 +103,15 @@ The free bridges and `pick` are what this plan fixes, so they do not route or wr
 
 Quota on 2026-11-21:
 - AGY Gemini Models: 96% weekly. Argon: 100%. AGY Claude/GPT: 0% until 2026-11-25.
-- Codex: 4% weekly. Owner 2026-11-21: use Codex fully; when its quota runs out, tell the owner and they reset it.
+- Codex: 4% weekly. Owner 2026-11-21: use Codex fully. When its quota runs out, tell the owner and stop (no backup) until they reset it.
 - Claude-self: reset on 2026-11-21. 1% of the weekly limit used, 8% of the 5-hour window.
 
 So every strong model has quota. Codex `gpt-6.2-astra` (the strongest, AA 62) writes the hard items. Gemini writes the rest. Codex and Opus review across families.
 
 | Difficulty | Items | Writer | Reviewer |
 |---|---|---|---|
-| 4 | P4 (shared limit patterns, per-model lock, `AVAILABILITY_ERRORS`), C2 (large-file Cline edits) | Codex `gpt-6.2-astra` xhigh, `workspace-write`; backup AGY `gemini-4-argon-high` | Claude Opus (subagent, high) |
-| 3 | P1 (write freshness), P2 (cold-start discovery), P6 (seeding vs infrastructure errors, old failures), P8 (external-score matching), D1 (snapshot sweep, both bridges), D3 (flaky tests), D4 (agent-intern upgrade) | AGY `gemini-4-neon-xhigh`, backup `gemini-4-hydrogen-xhigh` | Codex `gpt-6.2-astra` high, read-only; Opus while Codex waits for a reset |
+| 4 | P4 (shared limit patterns, per-model lock, `AVAILABILITY_ERRORS`), C2 (large-file Cline edits) | Codex `gpt-6.2-astra` xhigh, `workspace-write` | Claude Opus (subagent, high) |
+| 3 | P1 (write freshness), P2 (cold-start discovery), P6 (seeding vs infrastructure errors, old failures), P8 (external-score matching), D1 (snapshot sweep, both bridges), D3 (flaky tests), D4 (agent-intern upgrade) | AGY `gemini-4-neon-xhigh`, backup `gemini-4-hydrogen-xhigh` | Codex `gpt-6.2-astra` high, read-only |
 | 1-2 | P3 (read the Cline ladder), P5 (tokens into `log_run`), P7 (remove GLM), B3 (static lists), D6 (stray folders) | AGY `gemini-4-hydrogen-xhigh`, or Claude by hand when it is a few lines | Claude reads the diff (AGY Neon when Claude wrote it) |
 | Final pass over all of P | - | - | Opus high plus AGY Argon high (two families) |
 | 1 (text) | A1-A8 (rules, memory, docs branches) | Claude | The owner approves CLAUDE.md and the merges |
