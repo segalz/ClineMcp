@@ -103,19 +103,20 @@ The free bridges and `pick` are what this plan fixes, so they do not route or wr
 
 Quota on 2026-11-21:
 - AGY Gemini Models: 96% weekly. Argon: 100%. AGY Claude/GPT: 0% until 2026-11-25.
-- Codex: 4% weekly until 2026-11-25. Claude-self: 3% weekly until 2026-11-23.
+- Codex: 4% weekly until 2026-11-25.
+- Claude-self: reset on 2026-11-21. 1% of the weekly limit used, 8% of the 5-hour window.
 
-The Gemini writers are therefore free to use, and the non-Gemini reviewers (Claude, Codex) are scarce.
+So the Gemini writers have quota, Claude reviews, and Codex is kept for one last pass after 2026-11-25.
 
 | Difficulty | Items | Writer | Reviewer |
 |---|---|---|---|
-| 4 | P4 (shared limit patterns, per-model lock, `AVAILABILITY_ERRORS`), C2 (large-file Cline edits) | AGY `gemini-4-argon-high`; one repo per call, tight design | Claude Opus (subagent) after the Claude reset on 2026-11-23, or Codex `gpt-6.2-astra` high after 2026-11-25 |
-| 3 | P1 (write freshness), P2 (cold-start discovery), P6 (seeding vs infrastructure errors, old failures), P8 (external-score matching), D1 (snapshot sweep, both bridges), D3 (flaky tests), D4 (agent-intern upgrade) | AGY `gemini-4-neon-xhigh`, backup `gemini-4-hydrogen-xhigh` | Claude reads the diff; Opus or Codex for one final pass over all of P |
+| 4 | P4 (shared limit patterns, per-model lock, `AVAILABILITY_ERRORS`), C2 (large-file Cline edits) | AGY `gemini-4-argon-high`; one repo per call, tight design | Claude Opus (subagent, high) |
+| 3 | P1 (write freshness), P2 (cold-start discovery), P6 (seeding vs infrastructure errors, old failures), P8 (external-score matching), D1 (snapshot sweep, both bridges), D3 (flaky tests), D4 (agent-intern upgrade) | AGY `gemini-4-neon-xhigh`, backup `gemini-4-hydrogen-xhigh` | Claude Opus (subagent, high); at the end one pass over all of P (Opus, or Codex after 2026-11-25) |
 | 1-2 | P3 (read the Cline ladder), P5 (tokens into `log_run`), P7 (remove GLM), B3 (static lists), D6 (stray folders) | AGY `gemini-4-hydrogen-xhigh`, or Claude by hand when it is a few lines | Claude reads the diff (with AGY Neon when Claude wrote it) |
 | 1 (text) | A1-A8 (rules, memory, docs branches) | Claude | The owner approves CLAUDE.md and the merges |
 | Runs | B1, B2, B4, C1, C3, C4 (re-seed, measure, check routing) | Claude runs them | - (after P and A8; these are where the free bridges and `pick` come back) |
 
-Order inside P: P7, P3 and P5 first (easy, two days to the Claude reset), then P6, P1 and P2, then P4. P1 is not urgent while `pick` does not route this work. Every step goes on a work branch per repo, never `main`, and must pass the full suite of the repo it touches.
+Order inside P: P7, P3 and P5 first (easy), then P6, P1 and P2, then P4. P1 is not urgent while `pick` does not route this work. Every step goes on a work branch per repo, never `main`, and must pass the full suite of the repo it touches.
 
 ## Open questions for the owner
 
