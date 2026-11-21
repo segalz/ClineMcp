@@ -446,6 +446,15 @@ test("tasks: hintFor carries the run's token counts in log_run field names", () 
   const bare = { ...base, state: "done", result: { text: "ok", durationMs: 5000, usage: { inputTokens: -1, outputTokens: 1.5 } } } as unknown as Task;
   assert.deepEqual(hintFor(bare), { ok: true, duration_s: 5 });
   assert.deepEqual(hintTokens(undefined), {});
+  // A provider that reports the cache read apart from the input: the full input is input + read.
+  assert.deepEqual(hintTokens({ inputTokens: 1000, cacheReadTokens: 8000, outputTokens: 50 }),
+    { input_tokens: 9000, cached_input_tokens: 8000, output_tokens: 50 });
+  // A malformed primary field falls back to its alias.
+  assert.deepEqual(hintTokens({ inputTokens: Number.NaN, input_tokens: 70 }), { input_tokens: 70 });
+  // A failed run without a result reports the guard's input count.
+  const failed = { ...base, state: "failed",
+    error: new ClineRunError("timeout", "Cline timed out.", { attempts: 1, guard: { totalInputTokens: 4321 } as any }) } as unknown as Task;
+  assert.deepEqual(hintFor(failed), { ok: false, error_kind: "timeout", error_text: "Cline timed out.", duration_s: 5, input_tokens: 4321 });
 });
 
 test("tasks: run ending in loop_detected transitions to input_required with bridge question and history", async t => {

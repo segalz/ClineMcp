@@ -119,6 +119,35 @@ So every strong model has quota. Codex `gpt-6.2-astra` (the strongest, AA 62) wr
 
 Order inside P: P7, P3 and P5 first (easy), then P6, P1 and P2, then P4. P1 is not urgent while `pick` does not route this work. Every step goes on a work branch per repo, never `main`, and must pass the full suite of the repo it touches.
 
+## Progress
+
+All work is on branch `fix/after-bridges` in each repo. That branch is stacked on the `docs/*` branch, and nothing is merged.
+
+- **2026-11-21, P7 done.**
+  - openCodeHelperMcp 0094bf1: GLM was removed from `PREFERRED_MODELS`, the description and the README.
+  - model-picker 0c11e94: config, README and tests, together with B3. Written by Hydrogen, reviewed and adjusted by Claude.
+  - What remains are only historical notes and test fixtures. CLAUDE.md is A3.
+- **2026-11-21, B3 done** (model-picker 0c11e94).
+  - `solar-mini4` and GLM are out of the static lists.
+  - A static `opencode-free` model now writes only with a seeded `write_ok`; a model configured read-only stays read-only.
+  - So until B1 re-seeds, cold-start S writes go to Cline, not OpenCode.
+- **2026-11-21, P3 done** (model-picker 125c43e).
+  - The picker falls back to the bridge's `expires_at`, so a limit shows "exhausted until" instead of "down", and `strikes` is kept.
+  - The dashboard showing an expired limit is by design: it shows the last observation with its time.
+  - Neon finding, pre-existing, left as is: `reset_at` and `retry_after_s` still come before `expires_at`. So a `retry_after_s` over the bridge's 1-hour cap locks longer in the picker than in the bridge.
+- **2026-11-21, P5 done.**
+  - model-picker 125c43e and e6e9009: `log_run` description, `SUPERVISOR.md`, and seed tokens (cache and reasoning).
+  - ClineMcp 4a3ae2e plus the review fix: `log_run_hint` carries tokens.
+    - A cache read reported apart from the input is added to the input.
+    - A failed ask/workspace run reports the guard's input count.
+  - Reviewed by Neon xhigh: "accept with fixes"; the fixes are applied.
+  - CLAUDE.md token line: A-phase, owner approval.
+- **D3 finding, 2026-11-21.**
+  - The full ClineMcp suite at node's default concurrency (15 files at once on this machine) failed 16 tests twice. Every failing file passes alone, and the whole suite passes with `--test-concurrency=4`.
+  - From now on, run it as `node --test --test-concurrency=4 dist/test/*.test.js`.
+  - Consider setting that in the npm test script.
+  - `guard-runner.test.js` once failed 1 test right after a build, then passed alone 3 of 3: another timing flake.
+
 ## Open questions for the owner
 
 1. A2: the owner lifted "Codex off" for this plan on 2026-11-21. Does the CLAUDE.md note go for good?

@@ -447,14 +447,22 @@ const HINT_TOKEN_FIELDS: Array<[keyof LogRunHint, string[]]> = [
   ["reasoning_tokens", ["reasoningTokens", "reasoning_tokens"]]
 ];
 
-/** Token counts from a run's summed usage, in model-picker's log_run field names; absent fields stay absent. */
+/**
+ * Token counts from a run's summed usage, in model-picker's log_run field names; absent fields stay absent.
+ * input_tokens is the full input: when a provider reports a cache read larger than the input, the read
+ * was counted separately (as guard.ts budgetTokensFor assumes) and is added, so the ledger's
+ * total (input + output) is not under-counted.
+ */
 export function hintTokens(usage: unknown): Partial<LogRunHint> {
   if (!usage || typeof usage !== "object") return {};
   const source = usage as Record<string, unknown>;
   const out: Record<string, number> = {};
   for (const [target, names] of HINT_TOKEN_FIELDS) {
-    const value = names.map(name => source[name]).find(v => typeof v === "number");
-    if (typeof value === "number" && Number.isSafeInteger(value) && value >= 0) out[target] = value;
+    const value = names.map(name => source[name]).find(v => typeof v === "number" && Number.isSafeInteger(v) && v >= 0);
+    if (typeof value === "number") out[target] = value;
+  }
+  if (out.cached_input_tokens !== undefined && out.input_tokens !== undefined && out.cached_input_tokens > out.input_tokens) {
+    out.input_tokens += out.cached_input_tokens;
   }
   return out as Partial<LogRunHint>;
 }
@@ -516,8 +524,15 @@ function errorText(error: unknown): string {
 
 export function hintFor(task: Task): LogRunHint | null {
   const hint = outcomeHint(task);
-  // Tokens let model-picker learn real token use for the free bridges; failed runs report what they spent too.
-  return hint ? { ...hint, ...hintTokens((task.result as { usage?: unknown } | undefined)?.usage) } : null;
+  if (!hint) return null;
+  // Tokens let model-picker learn real token use for the free bridges. A failed ask/workspace run has no
+  // result, so its guard's input count stands in (output is unknown there).
+  const tokens = hintTokens((task.result as { usage?: unknown } | undefined)?.usage);
+  const spent = task.error instanceof ClineRunError ? task.error.guard?.totalInputTokens : undefined;
+  if (tokens.input_tokens === undefined && typeof spent === "number" && Number.isSafeInteger(spent) && spent > 0) {
+    tokens.input_tokens = spent;
+  }
+  return { ...hint, ...tokens };
 }
 
 function outcomeHint(task: Task): LogRunHint | null {
