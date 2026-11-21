@@ -20,6 +20,17 @@ Rule from earlier work: the reviewer is always from a different family than the 
 | F10 | Open item 12: a machine-wide queue for heavy bridge runs (Cline and OpenCode edits, seed runs) and a "busy" status that `pick` reads | 4 | Codex `gpt-6.2-astra` xhigh | Opus | Over a set number of heavy runs, a call waits in a queue with progress instead of failing. The bridge writes "busy" to its status file and `pick` routes elsewhere. Full suites pass in all three repos, plus one live check with 4 parallel edits. |
 | F11 | Close the bookkeeping: `open-items.md` rows 9-14 closed with results; `after-bridges` plan marked closed; memory updated | 1 | Claude | none | No row is left open |
 
+## Progress
+
+- **F1 done.** The owner ran the admin command, and all 4 folders are gone. Scratch-folder patterns were added to model-picker's `.gitignore`.
+- **F4 done.** The Claude Code docs say progress notifications count only as activity against the 30 min idle timeout and never extend the hard per-call timeout; `progressToken` is not documented. Our calls are capped at 10 min, so the heartbeat changes nothing for Claude Code and serves other clients. No code change.
+- **F5 waiting.** At 00:44 the `opencode/*` quota was still exhausted ("Free usage limit reached", provider lock about 1 h) and FreeLLMAPI timed out. Run it again near the end.
+- **F7 written, Codex re-check pending.**
+  - model-picker `feat/external-score-matching` a1dce17 and 8dec743, written by Neon. Codex rejected the first version (wrong-vendor matches, merged snapshots, incomplete baseline); Neon fixed all three, and the suite passed 3793.
+  - The Codex re-check was cut off by Codex's 5-hour limit (frees about 03:19). Owner rule: stop and tell the owner.
+- **F9 running.** The OpenCode half of the hard set (`runhard4.sh`, Nvidia `nemotron-3-ultra`, 2 lanes) started about 00:45.
+- **F3 decided (owner, 2026-11-22):** `ui` and `general` writes stay with AGY. The free bonus stays on coding, debugging and testing. No code change; the decision is written into CLAUDE.md wording (F2).
+
 ## Order
 
 1. F1, F2, F3 together: they need the owner. Claude prepares F2 and asks F3 now.
