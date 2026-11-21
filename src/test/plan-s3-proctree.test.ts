@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import { PROCESS_TABLE_TIMEOUT_MS, TREE_KILL_CONFIRM_MS } from "../waits.js";
 import { confirmTreeDead, treeDescendants, CREATION_SLACK_MS, type ProcessEntry } from "../proctree.js";
 
 // Plan S3 review fixes: the confirmed tree kill must never reach an unrelated process through a reused PID,
@@ -67,3 +68,30 @@ test("S3 review: a descendant seen dead once is never killed again, and an exite
   assert.deepEqual(killed, [7001], "killed while alive, then forgotten once seen dead (its PID may be reused)");
   assert.equal(rootKills, 0, "the root already exited: its PID must not be killed");
 });
+
+const flush = () => new Promise<void>(resolve => setImmediate(resolve));
+
+for (const capMs of [TREE_KILL_CONFIRM_MS, 600]) {
+  test(`two slow process-table reads and confirmation respect a ${capMs} ms cap`, async t => {
+    t.mock.timers.enable({ apis: ["Date", "setTimeout"], now: START });
+    const reads: number[] = [];
+    const confirmation = confirmTreeDead(ROOT, {
+      platform: "win32", capMs, now: Date.now, rootStartedMs: START, isRootAlive: () => false, killRoot: () => {},
+      listTable: ms => {
+        reads.push(ms);
+        return new Promise(resolve => setTimeout(() => resolve(reads.length === 1 ? null : []), ms));
+      }
+    });
+    const first = Math.min(PROCESS_TABLE_TIMEOUT_MS, (capMs - Math.min(250, capMs / 10)) / 2);
+    assert.deepEqual(reads, [first]);
+    t.mock.timers.tick(first);
+    await flush();
+    assert.deepEqual(reads, [first, first]);
+    t.mock.timers.tick(first);
+    await flush();
+    t.mock.timers.tick(Math.min(250, capMs - 2 * first));
+    assert.deepEqual(await confirmation, { confirmed: true, alive: [] });
+    assert.ok(Date.now() - START <= capMs);
+    if (capMs === TREE_KILL_CONFIRM_MS) assert.ok(2 * PROCESS_TABLE_TIMEOUT_MS + 250 < capMs);
+  });
+}

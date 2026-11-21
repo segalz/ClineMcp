@@ -1,3 +1,4 @@
+import { SETTLE_MARGIN_MS } from "./waits.js";
 import { spawn, type ChildProcess } from "node:child_process";
 
 /** taskkill uses WMI, which can be denied even for our own children in a restricted Windows token.
@@ -44,39 +45,72 @@ public static class CodeMapTree {
 [CodeMapTree]::Kill([uint32]$rootId)
 `;
 
-/** Completion is bounded by the adapter's shared deadline. No shell interprets any user data. */
-export function killCodeMapTree(child: ChildProcess, graceMs: number): Promise<void> {
+/** Stop the helper as well as the wait at the caller's deadline. */
+export function killWindowsTree(pid: number, graceMs: number, signal?: AbortSignal, cancelGraceMs = 0): Promise<void> {
+  if (!Number.isSafeInteger(pid) || pid <= 0) return Promise.resolve();
+  if (graceMs <= 0) {
+    spawn("taskkill.exe", ["/PID", String(pid), "/T", "/F"],
+      { shell: false, windowsHide: true, stdio: "ignore" }).on("error", () => {});
+    return Promise.resolve();
+  }
   return new Promise(resolve => {
-    if (!child.pid) { resolve(); return; }
     let killer: ChildProcess | undefined;
     let settled = false;
     let fallbackStarted = false;
+    let cancelTimer: NodeJS.Timeout | undefined;
     const finish = () => {
       if (settled) return;
       settled = true;
-      clearTimeout(timer);
-      // A stuck termination helper must not keep a task slot or the bridge alive.
-      killer?.kill(); child.kill();
+      clearTimeout(timer); clearTimeout(cancelTimer);
+      signal?.removeEventListener("abort", cancel);
+      killer?.kill();
       resolve();
     };
+    const cancel = () => { if (cancelGraceMs > 0) cancelTimer = setTimeout(finish, cancelGraceMs); else finish(); };
     const timer = setTimeout(finish, Math.max(0, graceMs));
-    if (process.platform !== "win32") {
-      try { process.kill(-child.pid, "SIGKILL"); } catch { /* already exited */ }
-      child.once("close", finish);
-      return;
-    }
+    if (signal?.aborted) cancel(); else signal?.addEventListener("abort", cancel, { once: true });
+    if (settled) return;
     const nativeFallback = () => {
       if (settled || fallbackStarted) return;
       fallbackStarted = true;
-      const script = WINDOWS_TREE_KILL.replace("param([int]$rootId)", `$rootId = ${child.pid}`);
+      const script = WINDOWS_TREE_KILL.replace("param([int]$rootId)", `$rootId = ${pid}`);
       killer = spawn("powershell.exe", ["-NoProfile", "-NonInteractive", "-EncodedCommand",
         Buffer.from(script, "utf16le").toString("base64")], { shell: false, windowsHide: true, stdio: "ignore" });
       killer.once("error", finish);
       killer.once("close", finish);
     };
-    killer = spawn("taskkill.exe", ["/PID", String(child.pid), "/T", "/F"],
+    killer = spawn("taskkill.exe", ["/PID", String(pid), "/T", "/F"],
       { shell: false, windowsHide: true, stdio: "ignore" });
     killer.once("error", nativeFallback);
     killer.once("close", code => { if (code === 0) finish(); else nativeFallback(); });
   });
+}
+
+/** Completion is bounded by the adapter's shared deadline. */
+export async function killCodeMapTree(child: ChildProcess, graceMs: number, signal?: AbortSignal): Promise<void> {
+  if (!child.pid) return;
+  if (process.platform === "win32") {
+    await killWindowsTree(child.pid, graceMs, signal, SETTLE_MARGIN_MS);
+  } else {
+    try { process.kill(-child.pid, "SIGKILL"); } catch { /* already exited */ }
+    if (graceMs > 0 && child.exitCode === null && child.signalCode === null) {
+      await new Promise<void>(resolve => {
+        let cancelTimer: NodeJS.Timeout | undefined;
+        let settled = false;
+        const finish = () => {
+          if (settled) return;
+          settled = true;
+          clearTimeout(timer); clearTimeout(cancelTimer);
+          signal?.removeEventListener("abort", cancel);
+          child.removeListener("close", finish);
+          resolve();
+        };
+        const cancel = () => { cancelTimer = setTimeout(finish, SETTLE_MARGIN_MS); };
+        const timer = setTimeout(finish, graceMs);
+        if (signal?.aborted) cancel(); else signal?.addEventListener("abort", cancel, { once: true });
+        child.once("close", finish);
+      });
+    }
+  }
+  try { child.kill(); } catch { /* already gone */ }
 }

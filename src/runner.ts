@@ -1,5 +1,8 @@
+import { setTimeout as delay } from "node:timers/promises";
 import { ChildProcess, spawn } from "node:child_process";
 import { hubDaemonPidsOnPort, listClineProcesses } from "./procs.js";
+import { PROCESS_QUERY_TIMEOUT_MS, PROCESS_TABLE_TIMEOUT_MS, TREE_KILL_CONFIRM_MS, settlementBudget, untilAborted, type SettlementBudget } from "./waits.js";
+import { killWindowsTree } from "./codemap-kill.js";
 import { confirmTreeDead, type TreeKillResult } from "./proctree.js";
 import { createWindowsJob, type WindowsJob } from "./jobobject.js";
 import { randomUUID } from "node:crypto";
@@ -194,23 +197,24 @@ export function defaultKillTree(pid: number, signal: NodeJS.Signals = "SIGKILL",
 }
 
 /** Kill a process tree and wait until the root process is gone (or the deadline passes). True when it is gone. */
-export async function killTreeAndWait(pid: number, timeoutMs = 10_000, platform: NodeJS.Platform = process.platform): Promise<boolean> {
+export async function killTreeAndWait(pid: number, timeoutMs = TREE_KILL_CONFIRM_MS, platform: NodeJS.Platform = process.platform, signal?: AbortSignal): Promise<boolean> {
   const gone = () => { try { process.kill(pid, 0); return false; } catch (error) { return (error as NodeJS.ErrnoException).code === "ESRCH"; } };
   if (gone()) return true;
-  const deadline = Date.now() + timeoutMs;
+  if (signal?.aborted || timeoutMs <= 0) return false;
+  const capMs = Math.min(timeoutMs, TREE_KILL_CONFIRM_MS);
+  const deadline = performance.now() + capMs;
   if (platform === "win32") {
-    await new Promise<void>((resolve) => {
-      try {
-        const killer = spawn("taskkill", ["/PID", String(pid), "/T", "/F"], { windowsHide: true, stdio: "ignore" });
-        const timer = setTimeout(() => { try { killer.kill(); } catch { /* gone */ } resolve(); }, timeoutMs);
-        killer.on("error", () => { clearTimeout(timer); resolve(); });
-        killer.on("close", () => { clearTimeout(timer); resolve(); });
-      } catch { resolve(); }
-    });
+    await killWindowsTree(pid, capMs, signal);
   } else {
     try { process.kill(-pid, "SIGKILL"); } catch { try { process.kill(pid, "SIGKILL"); } catch { /* gone */ } }
   }
-  while (!gone() && Date.now() < deadline) await new Promise((resolve) => setTimeout(resolve, 100));
+  while (!gone() && !signal?.aborted && performance.now() < deadline) {
+    await new Promise<void>(resolve => {
+      const wake = () => { clearTimeout(timer); signal?.removeEventListener("abort", wake); resolve(); };
+      const timer = setTimeout(wake, Math.min(100, Math.max(0, deadline - performance.now())));
+      signal?.addEventListener("abort", wake, { once: true });
+    });
+  }
   return gone();
 }
 
@@ -244,6 +248,7 @@ export interface ClineDependencies {
   /** Test seams for the hub and its Windows job, including with a fake spawn. */
   startHub?: (options: ClineInvocationOptions) => Promise<DedicatedHub | undefined>;
   createWindowsJob?: typeof createWindowsJob;
+  confirmTreeDead?: typeof confirmTreeDead;
 }
 
 export interface ClineInvocationOptions {
@@ -681,53 +686,75 @@ async function freeLoopbackPort(): Promise<number | undefined> {
 
 export const DEDICATED_HUB_BASE = path.join(os.tmpdir(), "cline-mcp-hubs");
 
-export interface DedicatedHub { env: Record<string, string>; stop: () => Promise<TreeKillResult | void>; isListening?: () => Promise<boolean> }
+export interface DedicatedHub { env: Record<string, string>; stop: (budget?: SettlementBudget) => Promise<TreeKillResult | void>; isListening?: (timeoutMs?: number, signal?: AbortSignal) => Promise<boolean> }
 
 export interface HubStopDeps {
   /** True while something accepts connections on the hub's loopback port. */
-  isListening?: (port: number) => Promise<boolean>;
+  isListening?: (port: number, timeoutMs?: number, signal?: AbortSignal) => Promise<boolean>;
   /** True when the hub wrote its discovery record, i.e. it started even if the port probe misses it. */
   hubStarted?: () => Promise<boolean>;
   /** Runs `cline hub stop` for this hub's discovery record. False signals a failed stop. */
-  runHubStop?: () => Promise<boolean | void>;
+  runHubStop?: (timeoutMs: number, signal?: AbortSignal) => Promise<boolean | void>;
   listProcesses?: typeof listClineProcesses;
-  killTree?: (pid: number) => Promise<unknown>;
+  killTree?: (pid: number, timeoutMs: number) => Promise<unknown>;
   removeFiles?: () => Promise<void>;
 }
 
-export function loopbackPortListening(port: number, timeoutMs = 1_500): Promise<boolean> {
+export function loopbackPortListening(port: number, timeoutMs = 1_500, signal?: AbortSignal): Promise<boolean> {
   return new Promise((resolve) => {
+    if (timeoutMs <= 0 || signal?.aborted) { resolve(false); return; }
     const socket = net.createConnection({ host: "127.0.0.1", port });
-    const done = (open: boolean) => { socket.destroy(); resolve(open); };
-    socket.setTimeout(timeoutMs, () => done(false));
+    const done = (open: boolean) => { signal?.removeEventListener("abort", abort); socket.destroy(); resolve(open); };
+    const abort = () => done(false);
+    signal?.addEventListener("abort", abort, { once: true });
+    socket.setTimeout(Math.max(1, Math.floor(timeoutMs)), () => done(false));
     socket.once("connect", () => done(true));
     socket.once("error", () => done(false));
   });
 }
 
 /** Stop a detected hub and fall back to a Windows process scan if the stop fails or the port stays open. */
-export async function stopDedicatedHub(port: number, deps: HubStopDeps): Promise<TreeKillResult | void> {
-  const isListening = deps.isListening ?? loopbackPortListening;
-  const hubDetected = async () => (await deps.hubStarted?.()) || isListening(port);
+export async function stopDedicatedHub(port: number, deps: HubStopDeps, budget?: SettlementBudget): Promise<TreeKillResult | void> {
+  const deadline = performance.now() + 60_000;
+  const remaining = (cap: number) => Math.max(0, Math.min(cap, deadline - performance.now(), budget?.remaining() ?? Infinity));
+  const check = () => { if (!remaining(Infinity) || budget?.signal.aborted) throw new Error("Hub stop deadline expired."); };
+  const bounded = <T>(work: Promise<T>): Promise<T> => budget ? untilAborted(work, budget.signal) : work;
+  const isListening = async () => {
+    check();
+    const listening = await bounded((deps.isListening ?? loopbackPortListening)(port, remaining(1_500), budget?.signal));
+    check();
+    return listening;
+  };
+  const hubDetected = async () => (await deps.hubStarted?.()) || isListening();
   const alive: number[] = [];
   try {
     if (!await hubDetected()) {
-      await new Promise(resolve => setTimeout(resolve, 300));
+      await new Promise<void>(resolve => {
+        const wait = remaining(300);
+        if (wait <= 0 || budget?.signal.aborted) { resolve(); return; }
+        const wake = () => { clearTimeout(timer); budget?.signal.removeEventListener("abort", wake); resolve(); };
+        const timer = setTimeout(wake, wait);
+        budget?.signal.addEventListener("abort", wake, { once: true });
+      });
       if (!await hubDetected()) return;
     }
-    const stopped = await deps.runHubStop?.().catch(() => false);
-    if (stopped !== false && !await isListening(port)) return;
+    check();
+    const stopped = deps.runHubStop
+      ? await bounded(deps.runHubStop(remaining(PROCESS_QUERY_TIMEOUT_MS), budget?.signal)).catch(() => false)
+      : undefined;
+    if (stopped !== false && !await isListening()) return;
     if (process.platform === "win32") {
       const listProcesses = deps.listProcesses ?? listClineProcesses;
-      const processes = await listProcesses();
+      const processes = await bounded(listProcesses(remaining(PROCESS_TABLE_TIMEOUT_MS), budget?.signal)).catch(() => undefined);
       // The stop failed and the process list cannot be read: the daemon is not confirmed dead (plan S20, Gate 6).
       if (!processes) return { confirmed: false, alive, unverified: true };
       for (const pid of hubDaemonPidsOnPort(port, processes)) {
-        const confirmed = await (deps.killTree ?? killTreeAndWait)(pid).catch(() => false);
+        const cap = remaining(TREE_KILL_CONFIRM_MS);
+        const confirmed = await bounded(deps.killTree ? deps.killTree(pid, cap) : killTreeAndWait(pid, cap, process.platform, budget?.signal)).catch(() => false);
         if (confirmed !== true) alive.push(pid);
       }
     }
-    if (await isListening(port) || alive.length) return { confirmed: false, alive, unverified: true };
+    if (await isListening() || alive.length) return { confirmed: false, alive, unverified: true };
   } catch {
     return { confirmed: false, alive, unverified: true };
   } finally {
@@ -751,24 +778,28 @@ async function dedicatedHub(options: ClineInvocationOptions): Promise<DedicatedH
   await mkdir(DEDICATED_HUB_BASE, { recursive: true });
   const discovery = path.join(DEDICATED_HUB_BASE, `hub-${randomUUID()}.json`);
   const env = { CLINE_HUB_DISCOVERY_PATH: discovery, CLINE_HUB_PORT: String(port) };
-  const stop = () => stopDedicatedHub(port, {
+  const stop = (budget?: SettlementBudget) => stopDedicatedHub(port, {
     hubStarted: () => access(discovery).then(() => true, () => false),
-    runHubStop: () => new Promise<boolean>((resolve) => {
+    runHubStop: (timeoutMs, signal) => new Promise<boolean>((resolve) => {
+      if (!timeoutMs || signal?.aborted) { resolve(false); return; }
       const child = spawn(process.execPath, [entry, "hub", "stop"], {
         cwd: os.homedir(), windowsHide: true, stdio: "ignore", env: { ...process.env, ...env }
       });
-      const timer = setTimeout(() => { try { child.kill(); } catch { /* gone */ } resolve(false); }, 20_000);
+      const stop = () => { try { child.kill(); } catch { /* gone */ } resolve(false); };
+      const timer = setTimeout(stop, timeoutMs);
+      signal?.addEventListener("abort", stop, { once: true });
+      const cleanup = () => { clearTimeout(timer); signal?.removeEventListener("abort", stop); };
       timer.unref?.();
-      child.once("error", () => { clearTimeout(timer); resolve(false); });
-      child.once("close", code => { clearTimeout(timer); resolve(code === 0); });
+      child.once("error", () => { cleanup(); resolve(false); });
+      child.once("close", code => { cleanup(); resolve(code === 0); });
     }).catch(() => false),
     removeFiles: async () => {
       for (const file of [discovery, `${discovery}.instance.lock`]) {
         await rm(file, { force: true, maxRetries: 3, retryDelay: 200 }).catch(() => {});
       }
     }
-  });
-  return { env, stop, isListening: () => loopbackPortListening(port) };
+  }, budget);
+  return { env, stop, isListening: (ms, signal) => loopbackPortListening(port, ms, signal) };
 }
 
 interface RunJobs {
@@ -785,10 +816,10 @@ export class DedicatedHubSession {
   private cwd?: string;
   launched = false;
 
-  async environment(cwd: string, options: ClineInvocationOptions): Promise<Record<string, string> | undefined> {
+  async environment(cwd: string, options: ClineInvocationOptions, budget?: SettlementBudget): Promise<Record<string, string> | undefined> {
     if (this.hub) {
-      if (cwd === this.cwd && (!this.hub.isListening || await this.hub.isListening())) return this.hub.env;
-      await this.stop();
+      if (cwd === this.cwd && (!this.hub.isListening || await this.hub.isListening(Math.min(1_500, budget?.remaining() ?? Infinity), budget?.signal))) return this.hub.env;
+      await this.stop(budget);
     }
     if (this.unconfirmedStop) throw this.unconfirmedStop;
     this.cwd = cwd;
@@ -796,12 +827,12 @@ export class DedicatedHubSession {
     return this.hub?.env;
   }
 
-  async stop(): Promise<void> {
+  async stop(budget?: SettlementBudget): Promise<void> {
     const job = this.jobs.current;
     try {
-      if (this.jobs.stopped) await job?.close();
+      if (this.jobs.stopped) await job?.close(budget?.remaining(), budget?.signal);
       // Only the launched CLI can have started the daemon.
-      const result = this.launched ? await this.hub?.stop() : undefined;
+      const result = this.launched ? await this.hub?.stop(budget) : undefined;
       if (result && !result.confirmed) {
         const message = "The dedicated Cline hub could not be confirmed stopped.";
         this.unconfirmedStop = new ClineRunError("edits_inspection_failed", message,
@@ -811,7 +842,7 @@ export class DedicatedHubSession {
     } catch (error) {
       this.warnings.push(redactSecrets(`Failed to stop the dedicated Cline hub: ${error instanceof Error ? error.message : String(error)}`));
     } finally {
-      await job?.close();
+      await job?.close(budget?.remaining(), budget?.signal);
       this.jobs.current = undefined;
       this.jobs.stopped = false;
       this.hub = undefined;
@@ -827,23 +858,25 @@ export async function runCline(
 ): Promise<ClineResponse> {
   // The hub starts only when Cline is about to launch (plan S6, B6): a call refused before launch (quota
   // lock, bad cwd, cancel) starts and stops nothing.
+  const workMs = (options.deps?.totalBudgetMs ?? (input.timeoutSeconds ?? DEFAULT_TIMEOUT_SECONDS) * 1000) - (options.preparationMs ?? 0);
+  const budget = settlementBudget(workMs, signal, options.deps?.now);
   const hub = options.editHub ?? new DedicatedHubSession();
   // Internal CLI attempts share their original environment; only the next run probes the hub.
   let hubEnv: Promise<Record<string, string> | undefined> | undefined;
-  const hubProvider = (cwd?: string) => hubEnv ??= hub.environment(cwd ?? process.cwd(), options);
+  const hubProvider = (cwd?: string) => hubEnv ??= hub.environment(cwd ?? process.cwd(), options, budget);
   const invocation = options.hubEnv ? options : { ...options, hubProvider, onLaunched: () => { hub.launched = true; } };
-  if (options.editHub) return runClineInner(input, signal, invocation, hub.jobs);
+
   let result: ClineResponse | undefined;
   let runError: unknown;
   try {
-    result = await runClineInner(input, signal, invocation, hub.jobs);
+    result = await runClineInner(input, signal, invocation, hub.jobs, budget);
     return result;
   } catch (error) {
     runError = error;
     throw error;
   } finally {
-    await hub.stop();
-    if (hub.warnings.length) {
+    try { if (!options.editHub) await hub.stop(budget); } finally { budget.dispose(); }
+    if (!options.editHub && hub.warnings.length) {
       if (result) (result.warnings ??= []).push(...hub.warnings);
       else if (runError instanceof ClineRunError) (runError.notes ??= []).push(...hub.warnings);
     }
@@ -854,7 +887,7 @@ async function runClineInner(
   input: AskClineInput,
   signal: AbortSignal | undefined,
   options: ClineInvocationOptions,
-  jobs: RunJobs
+  jobs: RunJobs, budget: SettlementBudget
 ): Promise<ClineResponse> {
   const guards: Guard[] = [];
   const finalReport = (existing?: GuardReport): GuardReport => {
@@ -870,7 +903,7 @@ async function runClineInner(
       filesTouched: [...new Set(reports.length ? reports.flatMap(report => report.filesTouched) : last.filesTouched)] });
   };
   try {
-    const response = await runClineCore(input, signal, options, guards, jobs);
+    const response = await runClineCore(input, signal, options, guards, jobs, budget);
     response.guard = finalReport();
     if (options.codeMapSource) response.codeMapSource = options.codeMapSource;
     return response;
@@ -885,7 +918,7 @@ async function runClineInner(
 }
 
 async function runClineCore(input: AskClineInput, signal: AbortSignal | undefined,
-  options: ClineInvocationOptions, guards: Guard[], jobs: RunJobs): Promise<ClineResponse> {
+  options: ClineInvocationOptions, guards: Guard[], jobs: RunJobs, budget: SettlementBudget): Promise<ClineResponse> {
   if (signal?.aborted) {
     throw new ClineRunError("cancelled", "The Cline request was cancelled.", { attempts: 0 });
   }
@@ -913,11 +946,10 @@ async function runClineCore(input: AskClineInput, signal: AbortSignal | undefine
   const settingsPath = resolveProviderSettingsPath(deps.providerSettingsPath);
 
   const nowFn = deps.now ?? (() => performance.now());
-  const overallStarted = nowFn();
   const totalBudgetMs = deps.totalBudgetMs ?? (timeoutSeconds * 1000);
-  const overallDeadline = overallStarted + totalBudgetMs - (options.preparationMs ?? 0);
+  const overallDeadline = budget.workDeadline;
   const getRemainingBudgetMs = () => Math.max(0, overallDeadline - nowFn());
-  const sleep = deps.sleep ?? (ms => new Promise<void>(resolve => setTimeout(resolve, ms)));
+  const sleep = deps.sleep ?? (ms => delay(ms, undefined, { signal }).catch(() => {}));
   const schedule = deps.setTimeout ?? setTimeout;
   const unschedule = deps.clearTimeout ?? clearTimeout;
   const minRetryBudgetMs = deps.minRetryBudgetMs ?? (deps.timeoutMs !== undefined ? 0 : Math.min(15_000, Math.floor(totalBudgetMs * 0.25)));
@@ -1139,12 +1171,12 @@ async function runClineCore(input: AskClineInput, signal: AbortSignal | undefine
         // A hub launched by this CLI inherits its job, even when it detaches. Its job spans retries.
         const ownsHub = !!hubEnv && !options.hubEnv;
         const useJob = platform === "win32" && (!deps.spawn || !!deps.createWindowsJob);
-        const prepareStarted = performance.now();
+        const prepareStarted = nowFn();
         if (useJob && !jobs.current?.alive) {
           jobs.current = await (deps.createWindowsJob ?? createWindowsJob)(Math.min(attemptTimerMs, remainingLaunchBudgetMs()), signal);
         }
         const job = jobs.current;
-        const setupMs = useJob ? performance.now() - prepareStarted : 0;
+        const setupMs = useJob ? nowFn() - prepareStarted : 0;
         const env = {
           ...process.env,
           CLINE_NO_AUTO_UPDATE: "1",
@@ -1169,7 +1201,7 @@ async function runClineCore(input: AskClineInput, signal: AbortSignal | undefine
           let spawnError: any;
           let closeStoppedJob: (() => Promise<void>) | undefined;
 
-          const clampGrace = (ms: number) => Math.max(0, Math.min(ms, getRemainingBudgetMs()));
+          const clampGrace = (ms: number) => Math.min(ms, getRemainingBudgetMs(), budget.remaining());
           const cleanup = () => {
             if (settled) return false;
             settled = true;
@@ -1193,7 +1225,7 @@ async function runClineCore(input: AskClineInput, signal: AbortSignal | undefine
             if (job) {
               const retryPossible = reason === "timeout" && attempt < maxAttempts &&
                 getRemainingBudgetMs() > 0 && getRemainingBudgetMs() >= minRetryBudgetMs;
-              if (!ownsHub || !retryPossible) closeStoppedJob = job.close;
+              if (!ownsHub || !retryPossible) closeStoppedJob = () => job.close(budget.remaining(), budget.signal);
             }
 
             const kill = (signal: NodeJS.Signals) => {
@@ -1217,8 +1249,7 @@ async function runClineCore(input: AskClineInput, signal: AbortSignal | undefine
 
             const pid = child?.pid;
             if (hasRealPid && typeof pid === "number") {
-              // A real child settles only once its whole tree is confirmed dead (not clamped to the budget):
-              // the caller restores the snapshot next, and a living child could still write after that.
+              // At the deadline return survivor/unknown evidence so a retry cannot race the old tree.
               if (exitTimer) {
                 unschedule(exitTimer);
                 exitTimer = undefined;
@@ -1249,16 +1280,20 @@ async function runClineCore(input: AskClineInput, signal: AbortSignal | undefine
                   });
                 }
               };
-              confirmTreeDead(pid, {
+              const isRootAlive = () => !exitSeen && child.exitCode === null && child.signalCode === null;
+              untilAborted((deps.confirmTreeDead ?? confirmTreeDead)(pid, {
+                capMs: Math.min(budget.remaining(), deps.settlementDeadlineMs ?? TREE_KILL_CONFIRM_MS),
+                now: nowFn,
+                signal: budget.signal,
                 killRoot,
-                isRootAlive: () => !exitSeen && child.exitCode === null && child.signalCode === null,
+                isRootAlive,
                 rootStartedMs,
                 rootExitedMs: () => exitSeenAt,
                 firstPollMs: platform === "win32" ? undefined : (deps.killGracePeriodMs ?? deps.closeGracePeriodMs ?? 500),
                 platform
-              }).then(
+              }), budget.signal).then(
                 ({ confirmed, alive, unverified }) => settleAfterKill(confirmed ? undefined : alive, unverified),
-                () => settleAfterKill([pid], true)
+                () => settleAfterKill(isRootAlive() ? [pid] : [], true)
               );
               return;
             }
@@ -1338,7 +1373,7 @@ async function runClineCore(input: AskClineInput, signal: AbortSignal | undefine
             if (job) {
               if (job.assigned) unschedule(timer);
               if (terminating) void closeStoppedJob?.();
-              else if (!ownsHub) void job.close();
+              else if (!ownsHub) void job.close(budget.remaining(), budget.signal);
             }
             // The group remains addressable while descendants live, even after its leader exits.
             if (platform !== "win32" && typeof child.pid === "number") {
@@ -1374,8 +1409,9 @@ async function runClineCore(input: AskClineInput, signal: AbortSignal | undefine
               const pid = child.pid;
               if (hasRealPid && platform === "win32" && typeof pid === "number" && !terminating) {
                 terminating = true;
-                confirmTreeDead(pid, { killRoot: () => {}, isRootAlive: () => false, rootStartedMs, rootExitedMs: () => exitSeenAt, platform })
-                  .then((result) => result, () => ({ confirmed: false, alive: [pid], unverified: true }))
+                untilAborted((deps.confirmTreeDead ?? confirmTreeDead)(pid, { capMs: Math.min(budget.remaining(), deps.settlementDeadlineMs ?? TREE_KILL_CONFIRM_MS),
+                  now: nowFn, signal: budget.signal, killRoot: () => {}, isRootAlive: () => false, rootStartedMs, rootExitedMs: () => exitSeenAt, platform }), budget.signal)
+                  .then((result) => result, () => ({ confirmed: false, alive: [] as number[], unverified: true }))
                   .then(({ confirmed, alive, unverified }) => settleExit(confirmed ? undefined : alive, unverified));
                 return;
               }
@@ -1409,7 +1445,7 @@ async function runClineCore(input: AskClineInput, signal: AbortSignal | undefine
           });
         } finally {
           if (job && !ownsHub) {
-            await job.close();
+            await job.close(budget.remaining(), budget.signal);
             jobs.current = undefined;
           }
         }

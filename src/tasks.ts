@@ -15,7 +15,7 @@ import { FinalCheckLifecycle, startTaskSchema, editActionSchema, type VerifySpec
 import { resolveTraceBase, type TraceInfo, type TraceRecorder, type TraceStatus } from "./trace.js";
 import type { SnapshotOptions } from "./snapshot.js";
 import { runVerification, VerificationError } from "./verify.js";
-import { DIFF_STAT_TIMEOUT_MS, KILL_SETTLE_MS } from "./waits.js";
+import { DIFF_STAT_TIMEOUT_MS } from "./waits.js";
 
 export type TaskMode = "ask" | "workspace" | "edits";
 export type TaskState = "running" | "resuming" | "done" | "failed" | "cancelled" | "input_required";
@@ -600,6 +600,7 @@ export class TaskManager {
   }
 
   private async getGitDiffStat(cwd: string, signal?: AbortSignal): Promise<string | undefined> {
+    if (signal?.aborted) return undefined;
     if (this.deps.gitDiffStat) return this.deps.gitDiffStat(cwd, signal);
     return new Promise<string | undefined>((resolve) => {
       let stdout = "";
@@ -618,16 +619,11 @@ export class TaskManager {
         try {
           if (process.platform === "win32" && typeof child.pid === "number") {
             defaultKillTree(child.pid, "SIGKILL", "win32");
-          } else {
-            child.kill();
           }
+          child.kill();
         } catch { /* already gone */ }
-        const giveUp = setTimeout(() => resolve(undefined), KILL_SETTLE_MS);
-        giveUp.unref?.();
-        child.once("close", () => {
-          clearTimeout(giveUp);
-          resolve(undefined);
-        });
+        child.stdout.destroy(); child.stderr.destroy();
+        resolve(undefined);
       };
 
       const timer = setTimeout(stop, DIFF_STAT_TIMEOUT_MS);
@@ -815,10 +811,14 @@ export class TaskManager {
     let gitReport: { gitDiff: string; status: string; headBefore?: string; headAfter?: string; warnings: string[] } | undefined;
     task.settled = (async () => {
       if (action === "restore" || action === "cancel") await lifecycle.restore();
-      else if (action === "keep") await lifecycle.keep();
-      else await lifecycle.execute(task.controller.signal, action === "retry" ? message : undefined);
-      if (task.controller.signal.aborted && action !== "cancel" && !lifecycle.verification.restored) await lifecycle.restore();
-      if (action === "cancel" || task.controller.signal.aborted) {
+      else if (action === "keep") {
+        try { await lifecycle.keep(task.controller.signal); }
+        catch (error) { if (!task.controller.signal.aborted) throw error; }
+      } else await lifecycle.execute(task.controller.signal, action === "retry" ? message : undefined);
+      // Cancelling report-only work after the commit point preserves the completed edit.
+      const cancelled = action === "cancel" || lifecycle.cancelled || (task.controller.signal.aborted && lifecycle.phase !== "done");
+      if (cancelled && action !== "cancel" && action !== "restore" && !lifecycle.cancelled && !lifecycle.verification.restored) await lifecycle.restore();
+      if (cancelled) {
         nextState = "cancelled"; nextError = new ClineRunError("cancelled", "The task was cancelled.");
       } else if (lifecycle.phase === "waiting") {
         nextState = lifecycle.lock ? "input_required" : "failed"; nextError = lifecycle.error;
@@ -827,7 +827,7 @@ export class TaskManager {
         // Collect report-only Git diff/status before releasing the checkout lock.
         if (action !== "restore" && !lifecycle.verification.restored &&
             (lifecycle.verification.passed === true || !lifecycle.verification.required || lifecycle.verification.kept)) {
-          gitReport = await collectEditsGitReport(lifecycle.root, lifecycle.identity?.head, lifecycle.verification.kept ? "kept edits" : "verified edits");
+          gitReport = await collectEditsGitReport(lifecycle.root, lifecycle.identity?.head, lifecycle.verification.kept ? "kept edits" : "verified edits", task.controller.signal);
         }
       }
     })().catch(error => {
@@ -1162,7 +1162,8 @@ export class TaskManager {
   async cancel(taskId: string, waitMs = 5000): Promise<TaskStatusView> {
     const task = this.get(taskId);
     if (task.finalCheck) {
-      if (task.finalCheck.phase === "done") { await task.settled; return this.view(task); }
+      // Edit callers rely on cancel returning with the checkout lease released. Restoration
+      // has its own bounded deadline and must not inherit the signal which stopped the writer.
       if (task.state === "input_required") this.launchFinalCheck(task, "cancel");
       else if (task.state === "running" || task.state === "resuming") task.controller.abort();
       await task.settled; return this.view(task);

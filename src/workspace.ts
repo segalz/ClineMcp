@@ -5,7 +5,7 @@ import { randomUUID } from "node:crypto";
 import { spawn } from "node:child_process";
 import { buildEnvironmentLine, WORKING_RULES } from "./rules.js";
 import { withCodeMap } from "./codemap.js";
-import { KILL_SETTLE_MS } from "./waits.js";
+import { KILL_SETTLE_MS, PROCESS_TABLE_TIMEOUT_MS, TREE_KILL_CONFIRM_MS } from "./waits.js";
 import { subfolderOf } from "./finalcheck.js";
 import { listClineProcesses, type ProcessInfo } from "./procs.js";
 import {
@@ -54,6 +54,8 @@ export const GIT_TIMEOUT_MS = 60_000;
 export const CLEANUP_GIT_TIMEOUT_MS = 20_000;
 
 function runGit(cwd: string, args: string[], signal?: AbortSignal, timeoutMs = GIT_TIMEOUT_MS): Promise<string> {
+  if (signal?.aborted) return Promise.reject(new Error("git command cancelled"));
+  if (!(timeoutMs > 0)) return Promise.reject(new Error(`git ${args[0]} timed out after 0 s`));
   return new Promise((resolve, reject) => {
     let stdout = "";
     const child = spawn(gitExecutable(), ["-C", cwd, ...args], {
@@ -74,7 +76,12 @@ function runGit(cwd: string, args: string[], signal?: AbortSignal, timeoutMs = G
         else child.kill();
       } catch { /* already gone */ }
       // Reject only once Git has really exited (or after KILL_SETTLE_MS), so the caller's cleanup does not race it.
-      const giveUp = setTimeout(() => reject(new Error(message)), KILL_SETTLE_MS);
+      const giveUp = setTimeout(() => {
+        try { child.kill(); } catch { /* already gone */ }
+        child.stdout.destroy(); child.stderr.destroy();
+        reject(new Error(message));
+      }, KILL_SETTLE_MS);
+      giveUp.unref?.();
       child.once("close", () => { clearTimeout(giveUp); reject(new Error(message)); });
     };
     const timer = setTimeout(() => stop(`git ${args[0]} timed out after ${Math.round(timeoutMs / 1000)} s`), timeoutMs);
@@ -178,6 +185,8 @@ export interface LeftoverHubCleanupDeps {
   isSoleRun?: () => boolean;
   listProcesses?: typeof listClineProcesses;
   killTree?: (pid: number) => Promise<unknown>;
+  signal?: AbortSignal;
+  budgetMs?: number;
 }
 
 /**
@@ -189,12 +198,17 @@ export async function cleanupLeftoverHubs(deps: LeftoverHubCleanupDeps = {}): Pr
   const minAgeMs = deps.minAgeMs ?? LEFTOVER_MIN_AGE_MS;
   const now = deps.now ?? Date.now;
   const isSoleRun = deps.isSoleRun ?? (() => true);
-  if (!isSoleRun()) return;
+  const deadline = deps.budgetMs !== undefined ? performance.now() + Math.max(0, deps.budgetMs) : Infinity;
+  const remaining = (cap: number) => Math.max(0, Math.min(cap, deadline - performance.now()));
+  if (!isSoleRun() || deps.signal?.aborted || remaining(Infinity) <= 0) return;
   const normalizedBase = `${normalizePathForMatch(path.resolve(worktreeBase))}/`;
   // The ~1 s process scan runs only when an emptied worktree folder is left behind (plan S6, B6): that is
   // the sign of a hub still holding it. Each run's own hub is stopped by runCline itself.
-  if (!await hasEmptyWorktreeFolder(worktreeBase, minAgeMs, now()) || !isSoleRun()) return;
-  for (const { pid, commandLine } of await (deps.listProcesses ?? listClineProcesses)() ?? []) {
+  if (!await hasEmptyWorktreeFolder(worktreeBase, minAgeMs, now()) || !isSoleRun() || deps.signal?.aborted) return;
+  const listCap = remaining(PROCESS_TABLE_TIMEOUT_MS);
+  if (listCap <= 0) return;
+  for (const { pid, commandLine } of await (deps.listProcesses ?? listClineProcesses)(listCap, deps.signal) ?? []) {
+    if (deps.signal?.aborted) return;
     const cwd = hubDaemonCwd(commandLine);
     if (!cwd) continue;
     const resolvedCwd = path.resolve(cwd);
@@ -210,12 +224,14 @@ export async function cleanupLeftoverHubs(deps: LeftoverHubCleanupDeps = {}): Pr
         !await folderIsOldEnoughOrGone(worktreeRoot, minAgeMs, nowMs)) continue;
     // Wait for the kill: the sweep below cannot remove a folder the hub still holds.
     if (!await folderIsEmptyOrGone(resolvedCwd)) continue;
-    if (!isSoleRun()) return;
-    await (deps.killTree ?? killTreeAndWait)(pid);
+    if (!isSoleRun() || deps.signal?.aborted) return;
+    const killCap = remaining(TREE_KILL_CONFIRM_MS);
+    if (killCap <= 0) return;
+    await (deps.killTree ? deps.killTree(pid) : killTreeAndWait(pid, killCap, process.platform, deps.signal));
   }
   for await (const folders of emptyWorktreeFolders(worktreeBase, minAgeMs, now())) {
     for (const folder of folders) {
-      if (!isSoleRun()) return;
+      if (!isSoleRun() || deps.signal?.aborted) return;
       // rmdir also checks at removal time: a file created since the sweep must survive.
       await rmdir(folder).catch(() => {});
     }
@@ -228,11 +244,11 @@ export async function cleanupLeftoverHubs(deps: LeftoverHubCleanupDeps = {}): Pr
  * Before each worktree run: stop such a leftover hub when its folder is already empty, and sweep empty
  * leftover `review-*` folders.
  */
-async function ensureNeutralHub(options: Partial<ClineInvocationOptions>): Promise<void> {
+async function ensureNeutralHub(options: Partial<ClineInvocationOptions>, signal?: AbortSignal, budgetMs?: number): Promise<void> {
   if (process.platform !== "win32" || options.deps?.spawn || options.deps?.entryPath || activeWorktreeRuns !== 1) return;
   // The hub is shared by every Cline run on the machine, so a leftover one is stopped only while
   // this bridge has no other worktree run in flight, and only when its folder is already empty.
-  await cleanupLeftoverHubs({ isSoleRun: () => activeWorktreeRuns === 1 });
+  await cleanupLeftoverHubs({ isSoleRun: () => activeWorktreeRuns === 1, signal, budgetMs });
 }
 
 async function removeWorktreeFolder(repositoryRoot: string, worktreePath: string): Promise<void> {
@@ -274,12 +290,15 @@ async function runWorkspace(input: AskClineWorkspaceInput, signal: AbortSignal |
   const provider = options.provider ?? input.provider;
   const model = options.model ?? input.model;
   if (provider && model) await enforceQuotaLock(provider, model, options);
+  const workBudgetMs = Math.min((input.timeoutSeconds ?? 180) * 1000, options.deps?.totalBudgetMs ?? Infinity);
+  const setupDeadline = performance.now() + workBudgetMs;
+  const setupRemaining = (cap: number) => Math.max(0, Math.min(cap, setupDeadline - performance.now()));
   const requestedCwd = path.resolve(input.cwd);
   let repositoryRoot: string;
   let commit: string;
   try {
-    repositoryRoot = await runGit(requestedCwd, ["rev-parse", "--show-toplevel"], signal);
-    commit = await runGit(repositoryRoot, ["rev-parse", "HEAD"], signal);
+    repositoryRoot = await runGit(requestedCwd, ["rev-parse", "--show-toplevel"], signal, setupRemaining(GIT_TIMEOUT_MS));
+    commit = await runGit(repositoryRoot, ["rev-parse", "HEAD"], signal, setupRemaining(GIT_TIMEOUT_MS));
   } catch {
     if (signal?.aborted) throw new ClineRunError("cancelled", "The Cline request was cancelled.", { attempts: 0 });
     throw new ClineRunError("workspace_not_git", "The requested cwd must be inside a Git repository with at least one commit.");
@@ -288,7 +307,7 @@ async function runWorkspace(input: AskClineWorkspaceInput, signal: AbortSignal |
   await mkdir(WORKTREE_BASE, { recursive: true });
   const worktreePath = path.join(WORKTREE_BASE, `review-${randomUUID()}`);
   try {
-    await runGit(repositoryRoot, ["worktree", "add", "--detach", worktreePath, commit], signal);
+    await runGit(repositoryRoot, ["worktree", "add", "--detach", worktreePath, commit], signal, setupRemaining(GIT_TIMEOUT_MS));
   } catch {
     // A failed, timed-out or cancelled add can leave a partial worktree behind; if removing it fails too,
     // the caller is told where it is.
@@ -325,7 +344,7 @@ async function runWorkspace(input: AskClineWorkspaceInput, signal: AbortSignal |
   let result: ClineResponse | undefined;
   let runError: unknown;
   try {
-    await ensureNeutralHub(options);
+    await ensureNeutralHub(options, signal, setupRemaining(Infinity));
     result = await runCline(
       { ...input, cwd: runCwd },
       signal,

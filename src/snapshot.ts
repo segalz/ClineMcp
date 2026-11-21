@@ -4,7 +4,7 @@ import { lstat, mkdir, open, readdir, readFile, readlink, realpath, rename, rm, 
 import os from "node:os";
 import path from "node:path";
 import { defaultKillTree } from "./runner.js";
-import { KILL_SETTLE_MS, SNAPSHOT_GIT_TIMEOUT_MS } from "./waits.js";
+import { RESTORE_BUDGET_MS, SNAPSHOT_GIT_TIMEOUT_MS, boundedSignal, untilAborted } from "./waits.js";
 
 export type SnapshotErrorKind = "snapshot_limit" | "snapshot_unsupported" | "snapshot_git_failed" | "snapshot_invalid";
 export class SnapshotError extends Error {
@@ -35,6 +35,7 @@ const missing = (err: unknown) => (err as NodeJS.ErrnoException).code === "ENOEN
 
 /** All Git operations are read-only, bounded in time and aggregate output, and do not refresh the index. */
 async function git(root: string, args: string[], signal?: AbortSignal, input?: string, allowedCodes = [0]): Promise<Buffer> {
+  signal?.throwIfAborted();
   return new Promise((resolve, reject) => {
     const child = spawn(process.platform === "win32" ? "git.exe" : "git", ["-C", root, ...args], {
       shell: false, windowsHide: true, detached: process.platform !== "win32", stdio: ["pipe", "pipe", "pipe"],
@@ -42,22 +43,29 @@ async function git(root: string, args: string[], signal?: AbortSignal, input?: s
     });
     const chunks: Buffer[] = [];
     let bytes = 0;
-    let failure: Error | undefined;
-    let killDeadline: ReturnType<typeof setTimeout> | undefined;
+    let settled = false;
+    const settle = (fn: () => void) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      signal?.removeEventListener("abort", stop);
+      fn();
+    };
     const stop = () => {
-      if (failure) return;
-      failure = new SnapshotError("snapshot_git_failed", "Snapshot Git call cancelled or exceeded its time/output bound.");
-      if (child.pid) defaultKillTree(child.pid);
-      // Killing trees may be denied by the host. Do not leave a Git call or inherited pipe unbounded.
-      killDeadline = setTimeout(() => {
-        child.kill("SIGKILL"); child.stdout.destroy(); child.stderr.destroy();
-        cleanup(); reject(failure);
-      }, KILL_SETTLE_MS);
+      const error = signal?.aborted
+        ? signal.reason
+        : new SnapshotError("snapshot_git_failed", "Snapshot Git call cancelled or exceeded its time/output bound.");
+      settle(() => {
+        if (child.pid) defaultKillTree(child.pid);
+        // Snapshot Git is read-only. Close our handles and release the caller immediately on abort.
+        try { child.kill("SIGKILL"); } catch { /* already gone */ }
+        child.stdin.destroy(); child.stdout.destroy(); child.stderr.destroy();
+        reject(error);
+      });
     };
     const timer = setTimeout(stop, SNAPSHOT_GIT_TIMEOUT_MS);
-    const abort = () => stop();
-    signal?.addEventListener("abort", abort, { once: true });
-    if (signal?.aborted) stop();
+    timer.unref?.();
+    if (signal?.aborted) stop(); else signal?.addEventListener("abort", stop, { once: true });
     child.stdin.on("error", () => {});
     child.stdin.end(input);
     const collect = (chunk: Buffer, stdout: boolean) => {
@@ -67,14 +75,11 @@ async function git(root: string, args: string[], signal?: AbortSignal, input?: s
     };
     child.stdout.on("data", (chunk: Buffer) => collect(chunk, true));
     child.stderr.on("data", (chunk: Buffer) => collect(chunk, false));
-    const cleanup = () => { clearTimeout(timer); clearTimeout(killDeadline); signal?.removeEventListener("abort", abort); };
-    child.on("error", () => { cleanup(); reject(new SnapshotError("snapshot_git_failed", "Could not launch Git.")); });
-    child.on("close", code => {
-      cleanup();
-      if (failure) reject(failure);
-      else if (code === null || !allowedCodes.includes(code)) reject(new SnapshotError("snapshot_git_failed", `Git ${args[0]} failed.`));
+    child.on("error", () => settle(() => reject(new SnapshotError("snapshot_git_failed", "Could not launch Git."))));
+    child.on("close", code => settle(() => {
+      if (code === null || !allowedCodes.includes(code)) reject(new SnapshotError("snapshot_git_failed", `Git ${args[0]} failed.`));
       else resolve(Buffer.concat(chunks));
-    });
+    }));
   });
 }
 
@@ -249,17 +254,19 @@ async function ignoredEntries(root: string, signal?: AbortSignal): Promise<strin
 
 async function excludeFile(root: string, signal?: AbortSignal): Promise<{ path: string; content: string | null }> {
   const file = path.resolve(root, (await git(root, ["rev-parse", "--git-path", "info/exclude"], signal)).toString("utf8").trim());
-  try { return { path: file, content: (await readFile(file)).toString("base64") }; }
+  try { return { path: file, content: (await readFile(file, { signal })).toString("base64") }; }
   catch (err) { if (missing(err)) return { path: file, content: null }; throw err; }
 }
 
-async function checkout(root: string): Promise<string> {
+async function checkout(root: string, signal?: AbortSignal): Promise<string> {
+  signal?.throwIfAborted();
   const stat = await lstat(path.resolve(root));
   if (stat.isSymbolicLink()) throw new SnapshotError("snapshot_unsupported", "Checkout root is a symlink/reparse point.");
   const resolved = await realpath(root);
-  const top = (await git(resolved, ["rev-parse", "--show-toplevel"])).toString("utf8").trim();
+  const top = (await git(resolved, ["rev-parse", "--show-toplevel"], signal)).toString("utf8").trim();
   const normalize = (value: string) => process.platform === "win32" ? path.normalize(value).toLowerCase() : path.normalize(value);
   if (normalize(await realpath(top)) !== normalize(resolved)) throw new SnapshotError("snapshot_invalid", "Expected the checkout root.");
+  signal?.throwIfAborted();
   return resolved;
 }
 
@@ -270,7 +277,7 @@ function limit(value: number | undefined, maximum: number): number {
 }
 
 export async function takeSnapshot(checkoutRoot: string, opts: SnapshotOptions = {}): Promise<SnapshotHandle> {
-  const root = await checkout(checkoutRoot);
+  const root = await checkout(checkoutRoot, opts.signal);
   const maxFiles = limit(opts.maxFiles, 20_000);
   const maxFile = limit(opts.maxFileBytes, MAX_FILE_BYTES);
   const maxTotal = limit(opts.maxTotalBytes, 512 * 1024 * 1024);
@@ -317,6 +324,7 @@ export async function takeSnapshot(checkoutRoot: string, opts: SnapshotOptions =
   const entries: { path: string; size: number }[] = [];
   let total = 0;
   for (const file of candidates) {
+    opts.signal?.throwIfAborted();
     // Git reports an untracked nested repository with a trailing slash.
     const normalized = file.endsWith("/") ? file.slice(0, -1) : file;
     const stat = await safeFile(root, normalized);
@@ -343,27 +351,28 @@ export async function takeSnapshot(checkoutRoot: string, opts: SnapshotOptions =
     specialEntries, ignoredEntries: await ignoredEntries(root, opts.signal), excludeFile: await excludeFile(root, opts.signal) };
   try {
     await mkdir(directory, { recursive: true, mode: 0o700 });
-    for (let i = 0; i < content.length; i++) await writeFile(path.join(directory, String(i)), content[i], { flag: "wx", mode: 0o600 });
-    await writeFile(path.join(directory, "manifest.json"), JSON.stringify(handle), { flag: "wx", mode: 0o600 });
+    for (let i = 0; i < content.length; i++) await writeFile(path.join(directory, String(i)), content[i], { flag: "wx", mode: 0o600, signal: opts.signal });
+    await writeFile(path.join(directory, "manifest.json"), JSON.stringify(handle), { flag: "wx", mode: 0o600, signal: opts.signal });
     return handle;
   } catch (err) { await rm(directory, { recursive: true, force: true }); throw err; }
 }
 
 /** Restore one baseline file in place; true when it had to be rewritten. */
-async function restoreEntry(root: string, handle: SnapshotHandle, i: number): Promise<boolean> {
+async function restoreEntry(root: string, handle: SnapshotHandle, i: number, signal: AbortSignal): Promise<boolean> {
   const entry = handle.manifest[i];
-  const bytes = await readFile(path.join(handle.directory, String(i)));
+  const bytes = await readFile(path.join(handle.directory, String(i)), { signal });
   if (bytes.length !== entry.size || hash(bytes) !== entry.sha256) throw new SnapshotError("snapshot_invalid", "Snapshot bytes failed integrity check.");
   const stat = await safeFile(root, entry.path);
   const absolute = relativePath(root, entry.path);
-  if (stat?.isFile() && hash(await readFile(absolute)) === entry.sha256) return false;
+  if (stat?.isFile() && hash(await readFile(absolute, { signal })) === entry.sha256) return false;
   if (stat?.isDirectory()) await rmdir(absolute); // Only an empty replacement directory is safe to remove.
   else if (stat && !stat.isFile()) throw new SnapshotError("snapshot_unsupported", "Baseline path is no longer a regular file.");
   await mkdir(path.dirname(absolute), { recursive: true });
   // Replace instead of writing through a hard link to another (possibly ignored) path.
   const temporary = path.join(path.dirname(absolute), `.cline-restore-${randomUUID()}`);
   try {
-    await writeFile(temporary, bytes, { flag: "wx" });
+    await writeFile(temporary, bytes, { flag: "wx", signal });
+    signal.throwIfAborted();
     await rename(temporary, absolute);
   } finally { await rm(temporary, { force: true }); }
   return true;
@@ -371,18 +380,21 @@ async function restoreEntry(root: string, handle: SnapshotHandle, i: number): Pr
 
 const isIgnoreFile = (file: string) => file === ".gitignore" || file.endsWith("/.gitignore");
 
-export async function restoreSnapshot(handle: SnapshotHandle): Promise<RestoreReport> {
-  const root = await checkout(handle.checkoutRoot);
+export async function restoreSnapshot(handle: SnapshotHandle, parent?: AbortSignal): Promise<RestoreReport> {
+  const signal = boundedSignal(RESTORE_BUDGET_MS, parent);
+  const root = await checkout(handle.checkoutRoot, signal);
   const report: RestoreReport = { restored: [], removed: [], failed: [] };
   const baseline = new Set(handle.manifest.map(entry => entry.path));
   const specials = handle.specialEntries ?? [];
   const prune = async (dir: string) => {
     while (dir !== root) {
+      signal.throwIfAborted();
       try { await rmdir(dir); } catch { break; } // Never recursively remove directories or ignored content.
       dir = path.dirname(dir);
     }
   };
   const remove = async (file: string) => {
+    signal.throwIfAborted();
     try {
       const stat = await safeFile(root, file);
       if (!stat) return;
@@ -391,24 +403,32 @@ export async function restoreSnapshot(handle: SnapshotHandle): Promise<RestoreRe
       await rm(absolute);
       report.removed.push(file);
       await prune(path.dirname(absolute));
-    } catch (err) { report.failed.push({ path: file, error: (err as Error).message }); }
+    } catch (err) {
+      if (signal.aborted) throw signal.reason;
+      report.failed.push({ path: file, error: (err as Error).message });
+    }
   };
   // Ignore rules first: a rule the model added must not hide its new files from removal,
   // and must not make a baseline file look "newly ignored" and stay changed.
   const ignoreDone = new Set<number>();
   for (let i = 0; i < handle.manifest.length; i++) {
+    signal.throwIfAborted();
     if (!isIgnoreFile(handle.manifest[i].path)) continue;
     ignoreDone.add(i);
-    try { if (await restoreEntry(root, handle, i)) report.restored.push(handle.manifest[i].path); }
-    catch (err) { report.failed.push({ path: handle.manifest[i].path, error: (err as Error).message }); }
+    try { if (await restoreEntry(root, handle, i, signal)) report.restored.push(handle.manifest[i].path); }
+    catch (err) {
+      if (signal.aborted) throw signal.reason;
+      report.failed.push({ path: handle.manifest[i].path, error: (err as Error).message });
+    }
   }
   if (handle.ignoredEntries) {
     // Remove .gitignore files the model created: visible ones, and self-ignoring ones found through
     // ignored entries that did not exist at snapshot time. Repeat for nested ones, a bounded number of times.
     const known = new Set(handle.ignoredEntries);
     for (let round = 0; round < 5; round++) {
-      const candidates = new Set((await files(root)).regular.filter(file => isIgnoreFile(file) && !baseline.has(file) && !isUnderSpecial(file, specials)));
-      for (const entry of await ignoredEntries(root)) {
+      const candidates = new Set((await files(root, signal)).regular.filter(file => isIgnoreFile(file) && !baseline.has(file) && !isUnderSpecial(file, specials)));
+      for (const entry of await ignoredEntries(root, signal)) {
+        signal.throwIfAborted();
         if (known.has(entry)) continue;
         const file = entry.endsWith("/") ? `${entry}.gitignore` : entry;
         if (isIgnoreFile(file) && !baseline.has(file) && !isUnderSpecial(file, specials) && await statOrMissing(relativePath(root, file)).catch(() => undefined)) candidates.add(file);
@@ -422,64 +442,77 @@ export async function restoreSnapshot(handle: SnapshotHandle): Promise<RestoreRe
   if (handle.excludeFile) {
     const { path: file, content } = handle.excludeFile;
     try {
-      const now = await readFile(file).then(b => b.toString("base64"), err => { if (missing(err)) return null; throw err; });
+      const now = await readFile(file, { signal }).then(b => b.toString("base64"), err => { if (missing(err)) return null; throw err; });
       if (now !== content) {
         if (content === null) await rm(file, { force: true });
-        else await writeFile(file, Buffer.from(content, "base64"));
+        else await writeFile(file, Buffer.from(content, "base64"), { signal });
         report.restored.push("info/exclude");
       }
-    } catch (err) { report.failed.push({ path: "info/exclude", error: (err as Error).message }); }
+    } catch (err) {
+      if (signal.aborted) throw signal.reason;
+      report.failed.push({ path: "info/exclude", error: (err as Error).message });
+    }
   }
-  const current = (await files(root)).regular;
+  const current = (await files(root, signal)).regular;
   // check-ignore respects tracked files. A newly ignored baseline path must not be overwritten.
-  const ignored = new Set(handle.manifest.length ? (await git(root, ["check-ignore", "-z", "--stdin"], undefined,
+  const ignored = new Set(handle.manifest.length ? (await git(root, ["check-ignore", "-z", "--stdin"], signal,
     handle.manifest.map(entry => entry.path).join("\0") + "\0", [0, 1])).toString("utf8").split("\0") : []);
   for (const file of current.filter(file => !baseline.has(file) && !isUnderSpecial(file, specials))) await remove(file);
   for (let i = 0; i < handle.manifest.length; i++) {
+    signal.throwIfAborted();
     if (ignoreDone.has(i)) continue;
     const entry = handle.manifest[i];
     try {
       if (ignored.has(entry.path)) throw new SnapshotError("snapshot_unsupported", "Baseline path is now ignored; left untouched.");
-      if (await restoreEntry(root, handle, i)) report.restored.push(entry.path);
-    } catch (err) { report.failed.push({ path: entry.path, error: (err as Error).message }); }
+      if (await restoreEntry(root, handle, i, signal)) report.restored.push(entry.path);
+    } catch (err) {
+      if (signal.aborted) throw signal.reason;
+      report.failed.push({ path: entry.path, error: (err as Error).message });
+    }
   }
   for (const entry of specials) {
+    signal.throwIfAborted();
     try {
-      if (await specialState(root, entry.path, entry.kind) !== entry.state) {
+      if (await specialState(root, entry.path, entry.kind, signal) !== entry.state) {
         report.failed.push({ path: entry.path, error: "Tracked symlink/submodule changed during the run; it was left as is." });
       }
     } catch {
+      if (signal.aborted) throw signal.reason;
       report.failed.push({ path: entry.path, error: "Tracked symlink/submodule changed during the run; it was left as is." });
     }
   }
+  signal.throwIfAborted();
   return report;
 }
 
 /** Files that exist now but not in the baseline (ignored files excluded, so build caches do not show up). */
-export async function createdFiles(handle: SnapshotHandle): Promise<string[]> {
+export async function createdFiles(handle: SnapshotHandle, signal?: AbortSignal): Promise<string[]> {
   const baseline = new Set(handle.manifest.map(entry => entry.path));
   const specials = handle.specialEntries ?? [];
-  const root = await checkout(handle.checkoutRoot);
+  const root = await checkout(handle.checkoutRoot, signal);
   const created: string[] = [];
   // A tracked file deleted before the run is listed by Git but absent: only files that exist now count.
-  for (const file of (await files(root)).regular.filter(file => !baseline.has(file) && !isUnderSpecial(file, specials))) {
+  for (const file of (await files(root, signal)).regular.filter(file => !baseline.has(file) && !isUnderSpecial(file, specials))) {
+    signal?.throwIfAborted();
     try { if ((await statOrMissing(relativePath(root, file.endsWith("/") ? file.slice(0, -1) : file)))) created.push(file); }
     catch { created.push(file); }
   }
   return created;
 }
 
-export async function discardSnapshot(handle: SnapshotHandle): Promise<void> {
-  await rm(handle.directory, { recursive: true, force: true });
+export async function discardSnapshot(handle: SnapshotHandle, signal?: AbortSignal): Promise<void> {
+  // Only private snapshot storage is touched once the checkout is committed.
+  const removal = rm(handle.directory, { recursive: true, force: true });
+  await (signal ? untilAborted(removal, signal) : removal);
 }
 
-export async function headAndIndexIdentity(checkoutRoot: string): Promise<{ head: string; indexHash: string | null }> {
-  const root = await checkout(checkoutRoot);
-  const head = (await git(root, ["rev-parse", "HEAD"])).toString("utf8").trim();
-  const index = (await git(root, ["rev-parse", "--git-path", "index"])).toString("utf8").trim();
-  try { await readFile(path.resolve(root, index)); }
+export async function headAndIndexIdentity(checkoutRoot: string, signal?: AbortSignal): Promise<{ head: string; indexHash: string | null }> {
+  const root = await checkout(checkoutRoot, signal);
+  const head = (await git(root, ["rev-parse", "HEAD"], signal)).toString("utf8").trim();
+  const index = (await git(root, ["rev-parse", "--git-path", "index"], signal)).toString("utf8").trim();
+  try { await readFile(path.resolve(root, index), { signal }); }
   catch (err) { if (missing(err)) return { head, indexHash: null }; throw err; }
   // Hash the staged entries, not the raw index bytes: `git status`, editors and Git tools rewrite the
   // index's stat cache without changing what is staged, which used to refuse restores as "index changed".
-  return { head, indexHash: hash(await git(root, ["ls-files", "--stage", "-z"])) };
+  return { head, indexHash: hash(await git(root, ["ls-files", "--stage", "-z"], signal)) };
 }

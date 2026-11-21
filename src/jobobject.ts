@@ -1,4 +1,5 @@
 // Keep in step with openCodeHelperMcp/src/jobobject.js. Each helper owns exactly one Windows job.
+import { KILL_SETTLE_MS, PROCESS_QUERY_TIMEOUT_MS } from "./waits.js";
 import { ChildProcess, spawn } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
 import { access, mkdir, rename, rm, writeFile } from "node:fs/promises";
@@ -88,7 +89,7 @@ async function buildHelper(): Promise<string> {
     await new Promise<void>((resolve, reject) => {
       const child = spawn(compiler, ["/nologo", "/noconfig", "/target:exe", "/optimize+", "/out:" + staging + ".exe", staging + ".cs"],
         { cwd: directory, stdio: "ignore", windowsHide: true });
-      const timer = setTimeout(() => { try { child.kill(); } catch { /* already gone */ } }, 10_000).unref();
+      const timer = setTimeout(() => { try { child.kill(); } catch { /* already gone */ } }, PROCESS_QUERY_TIMEOUT_MS).unref();
       child.once("error", error => { clearTimeout(timer); reject(error); });
       child.once("exit", code => {
         clearTimeout(timer);
@@ -107,7 +108,7 @@ export interface WindowsJob {
   readonly alive: boolean;
   readonly assigned: boolean;
   assign(child: ChildProcess): void;
-  close(): Promise<void>;
+  close(budgetMs?: number, signal?: AbortSignal): Promise<void>;
 }
 
 let executable: Promise<string | undefined> | undefined;
@@ -139,12 +140,21 @@ function startOwner(file: string) {
   let ended = false;
   let timer: NodeJS.Timeout | undefined;
   const kill = () => { try { child.kill(); } catch { /* already gone */ } };
+  let closeSignal: AbortSignal | undefined;
+  let closeDeadline = Infinity;
+  const forceClose = () => {
+    closeSignal?.removeEventListener("abort", forceClose);
+    clearTimeout(timer);
+    kill();
+    finish();
+  };
   const end = () => {
     ended = true;
     assigned = false;
     pending = undefined;
     queued.length = 0;
     owners.delete(child);
+    closeSignal?.removeEventListener("abort", forceClose);
     clearTimeout(timer);
     ready(false);
     finish();
@@ -191,12 +201,35 @@ function startOwner(file: string) {
       queued.push(root);
       if (!pending) sendNext();
     },
-    close() {
-      if (!ended && !closing) {
-        closing = true;
-        // A wedged helper can be killed independently. Closing its last handle enforces the same limit.
-        timer = setTimeout(() => { kill(); timer = setTimeout(finish, 150); }, 850);
-        if (!pending) child.stdin.end();
+    close(budgetMs = KILL_SETTLE_MS, signal) {
+      if (!ended) {
+        const cap = Math.min(KILL_SETTLE_MS, budgetMs);
+        if (!closing) {
+          closing = true;
+          // A wedged helper can be killed independently. Closing its last handle enforces the same limit.
+          if (signal?.aborted || cap <= 0) forceClose();
+          else {
+            closeSignal = signal;
+            closeDeadline = performance.now() + cap;
+            signal?.addEventListener("abort", forceClose, { once: true });
+            timer = setTimeout(forceClose, cap);
+          }
+          if (!pending) child.stdin.end();
+        } else if (signal?.aborted || cap <= 0) {
+          forceClose();
+        } else {
+          if (signal && signal !== closeSignal) {
+            closeSignal?.removeEventListener("abort", forceClose);
+            closeSignal = signal;
+            signal.addEventListener("abort", forceClose, { once: true });
+          }
+          const nextDeadline = performance.now() + cap;
+          if (nextDeadline < closeDeadline) {
+            closeDeadline = nextDeadline;
+            clearTimeout(timer);
+            timer = setTimeout(forceClose, cap);
+          }
+        }
       }
       return finished;
     },
@@ -212,7 +245,7 @@ export function createWindowsJob(budgetMs: number, signal?: AbortSignal): Promis
     let settled = false;
     let retry: NodeJS.Timeout | undefined;
     const cancel = () => finish();
-    const timer = setTimeout(cancel, Math.min(4_000, budgetMs / 2));
+    const timer = setTimeout(cancel, Math.min(PROCESS_QUERY_TIMEOUT_MS, budgetMs / 2));
     signal?.addEventListener("abort", cancel, { once: true });
 
     function finish(winner?: ReturnType<typeof startOwner>) {

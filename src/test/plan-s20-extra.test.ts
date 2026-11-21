@@ -253,3 +253,27 @@ test("final check: a passing edit is never restored because its hub stop outlast
   assert.equal(lifecycle.phase, "done", JSON.stringify({ wait: lifecycle.waitReason, error: String(lifecycle.error) }));
   assert.equal(lifecycle.verification.restored, false);
 });
+
+test("cancel interrupts post-commit reporting and returns the completed edit", async t => {
+  const root = await checkout(t);
+  let started!: (signal: AbortSignal) => void, finish!: () => void;
+  const reporting = new Promise<AbortSignal>(resolve => { started = resolve; });
+  const gate = new Promise<void>(resolve => { finish = resolve; });
+  const complete = FinalCheckLifecycle.prototype.complete;
+  t.mock.method(FinalCheckLifecycle.prototype, "complete", async function(this: FinalCheckLifecycle, signal: AbortSignal) {
+    await complete.call(this, signal);
+    started(signal);
+    await gate;
+  });
+  const manager = new TaskManager({ traceBase: path.join(base, "traces"), snapshotOptions: { snapshotBase: path.join(base, "snapshots") },
+    runOptions: { checkoutLockDirectory: path.join(base, "locks") }, runners: { edits: async () => ({ text: "done", durationMs: 0 }) } });
+  t.after(() => manager.shutdown());
+  const { taskId } = manager.start({ mode: "edits", cwd: root, provider: "p", model: "m", prompt: "edit", codeMap: false,
+    verify: { none: true, reason: "Post-commit cancellation fixture" } });
+  const signal = await reporting;
+  const cancelled = manager.cancel(taskId);
+  try { assert.equal(signal.aborted, true); } finally { finish(); }
+  const result = await cancelled;
+  assert.equal(result.state, "done");
+  assert.equal(result.verification?.restored, false);
+});

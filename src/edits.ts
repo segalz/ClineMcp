@@ -5,7 +5,7 @@ import { withCodeMap, codeMapCommandLineLength } from "./codemap.js";
 import { FinalCheckLifecycle, verificationSchema, type VerifySpec, type FinalVerification } from "./finalcheck.js";
 import { ownsCheckoutLock } from "./checkoutlock.js";
 import { VerificationError } from "./verify.js";
-import { KILL_SETTLE_MS } from "./waits.js";
+import { DIFF_STAT_TIMEOUT_MS, boundedSignal } from "./waits.js";
 import {
   defaultKillTree,
   ClineRunError,
@@ -115,6 +115,7 @@ export function runGit(
   timeoutMs = GIT_TIMEOUT_MS,
   options?: { trim?: "both" | "end" }
 ): Promise<string> {
+  signal?.throwIfAborted();
   return new Promise((resolve, reject) => {
     let stdout = "";
     let stderr = "";
@@ -130,15 +131,14 @@ export function runGit(
       finished = true;
       clearTimeout(timer);
       signal?.removeEventListener("abort", onAbort);
-      // Windows: kill the whole tree (worktree add runs its checkout in a child git). Elsewhere git is not a
-      // group leader, so a plain kill of the process is what is available.
+      // Also stop the read-only root directly when taskkill cannot enumerate its tree.
       try {
         if (process.platform === "win32" && typeof child.pid === "number") defaultKillTree(child.pid, "SIGKILL", "win32");
-        else child.kill();
+        child.kill();
       } catch { /* already gone */ }
-      // Reject only once Git has really exited (or after KILL_SETTLE_MS), so the caller's cleanup does not race it.
-      const giveUp = setTimeout(() => reject(new Error(message)), KILL_SETTLE_MS);
-      child.once("close", () => { clearTimeout(giveUp); reject(new Error(message)); });
+      // All edit inspection commands are read-only. No caller needs to wait for inherited pipes.
+      child.stdout.destroy(); child.stderr.destroy();
+      reject(new Error(message));
     };
     const timer = setTimeout(() => stop(`git ${args[0]} timed out after ${Math.round(timeoutMs / 1000)} s`), timeoutMs);
     timer.unref?.();
@@ -170,11 +170,12 @@ export function truncateGitDiff(diff: string): string {
 export async function collectEditsGitReport(
   root: string,
   headBefore?: string,
-  labelSuffix = "verified edits"
+  labelSuffix = "verified edits", parent?: AbortSignal
 ): Promise<{ gitDiff: string; status: string; headBefore?: string; headAfter?: string; warnings: string[] }> {
+  const signal = boundedSignal(POST_RUN_GIT_BUDGET_MS, parent);
   const warnings: string[] = [];
   const report = async (args: string[], label: string, options?: { trim?: "both" | "end" }): Promise<string | undefined> => {
-    try { return await runGit(root, args, undefined, GIT_TIMEOUT_MS, options); }
+    try { return await runGit(root, args, signal, GIT_TIMEOUT_MS, options); }
     catch (error) { warnings.push(`git ${label} failed after ${labelSuffix}: ${(error as Error)?.message ?? String(error)}`); return undefined; }
   };
   const gitDiff = truncateGitDiff((await report(["diff", "--binary", "--no-ext-diff", "HEAD"], "diff")) ?? "");
@@ -207,13 +208,19 @@ export async function applyClineEdits(
     await lifecycle.execute(signal ?? new AbortController().signal);
     if (lifecycle.phase !== "done") {
       const reason = lifecycle.waitReason;
-      if (lifecycle.lock) {
-        try { lifecycle.evidence.gitDiff = truncateGitDiff(await runGit(lifecycle.root, ["diff", "--binary", "--no-ext-diff", "HEAD"])); }
+      if (lifecycle.lock && !signal?.aborted) {
+        try { lifecycle.evidence.gitDiff = truncateGitDiff(await runGit(lifecycle.root, ["diff", "--binary", "--no-ext-diff", "HEAD"], signal, DIFF_STAT_TIMEOUT_MS)); }
         catch { /* Recovery evidence must survive an inspection failure. */ }
       }
       // Nothing to keep when the request was refused before its snapshot (e.g. a check that cannot start).
-      if (input.keepOnFailure && lifecycle.snapshot && !signal?.aborted && lifecycle.waitReason !== "head_changed") await lifecycle.keep();
-      else await lifecycle.restore();
+      if (input.keepOnFailure && lifecycle.snapshot && !signal?.aborted && lifecycle.waitReason !== "head_changed") {
+        try { await lifecycle.keep(signal); }
+        catch (error) {
+          if (!signal?.aborted) throw error;
+          await lifecycle.restore();
+          lifecycle.error = new ClineRunError("cancelled", "The edit was cancelled while keeping the changes.");
+        }
+      } else if (!lifecycle.cancelled && reason !== "head_changed") await lifecycle.restore();
       const error = lifecycle.error instanceof ClineRunError ? lifecycle.error
         // A check refused up front (plan S4): no run happened, so say what is wrong with the check itself.
         : lifecycle.error instanceof VerificationError
@@ -231,7 +238,7 @@ export async function applyClineEdits(
     }
     const headBefore = lifecycle.identity!.head;
     // The edits passed and are kept: a failing report-only Git call must not turn that into an error.
-    const { gitDiff, status, headAfter, warnings: gitWarnings } = await collectEditsGitReport(lifecycle.root, headBefore, "verified edits");
+    const { gitDiff, status, headAfter, warnings: gitWarnings } = await collectEditsGitReport(lifecycle.root, headBefore, "verified edits", signal);
     const warnings = [...(lifecycle.result!.warnings ?? []), ...lifecycle.hubWarnings, ...gitWarnings];
     const created = lifecycle.createdFiles;
     if (created?.length) warnings.push(`The edit created ${created.length} new file(s): ${created.slice(0, 20).join(", ")}${created.length > 20 ? ", ..." : ""}. Check each belongs to the task.`);

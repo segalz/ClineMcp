@@ -2,6 +2,7 @@ import { spawn } from "node:child_process";
 import { lstat, readFile, realpath } from "node:fs/promises";
 import path from "node:path";
 import { killCodeMapTree } from "./codemap-kill.js";
+import { SETTLE_MARGIN_MS } from "./waits.js";
 import {
   defaultKillTree, resolveClineEntry, windowsCommandLineLength, WINDOWS_COMMAND_LINE_LIMIT, MAX_TOTAL_TEXT_CHARACTERS,
   ClineRunError, type CodeMapSource, type AskClineInput, type ClineInvocationOptions
@@ -14,7 +15,10 @@ const MAX_BYTES = 512 * 1024;
 // after-bridges, 2026-11-21). The caller's deadlineMs still bounds it.
 const TIME_BUDGET_MS = 5_000;
 const CODEINDEX_TIME_BUDGET_MS = 10_000;
-const KILL_BUDGET_MS = 1_500;
+const KILL_BUDGET_MS = 5_000;
+// On tight budgets preserve the original codeindex allocation. With spare time, grow both
+// reserves up to their full caps, without letting termination consume the regex share.
+const MIN_RESERVE_MS = 1_500;
 const SKIP_DIRS = new Set(["node_modules", "dist", "build", "out", "vendor", ".git"]);
 const PER_FILE_IO_ERRORS = new Set(["ENOENT", "ENOTDIR", "EACCES", "EPERM", "EBUSY", "ELOOP", "EISDIR"]);
 const BINARY_EXTENSION = /\.(?:png|jpe?g|gif|webp|ico|pdf|zip|gz|7z|rar|exe|dll|so|dylib|woff2?|ttf|eot|mp[34]|wav|ogg|wasm|class|pyc|db|sqlite)$/i;
@@ -217,8 +221,10 @@ function codeindexMap(cli: string, root: string, prompt: string, budget: number,
     const unschedule = timing?.clearTimeout ?? clearTimeout;
     // Reserve a regex scan and a short process-termination window inside the same bound.
     const remaining = Math.max(0, deadline - now());
-    const duration = Math.floor(Math.min(CODEINDEX_TIME_BUDGET_MS,
-      remaining - Math.min(TIME_BUDGET_MS, remaining / 4) - Math.min(KILL_BUDGET_MS, remaining / 3)));
+    const regexReserve = Math.min(MIN_RESERVE_MS, remaining / 4);
+    const killReserve = Math.min(MIN_RESERVE_MS, remaining / 3);
+    const duration = Math.floor(Math.min(CODEINDEX_TIME_BUDGET_MS, remaining - regexReserve - killReserve));
+    const fallbackReserve = Math.min(TIME_BUDGET_MS, Math.max(regexReserve, (remaining - duration) / 2));
     if (duration <= 0 || signal?.aborted) return resolve(undefined);
     const child = spawn(process.execPath, [cli, "map", "--root", root, "--json", "--budget", String(budget),
       "--deadline-ms", String(duration)], {
@@ -238,7 +244,11 @@ function codeindexMap(cli: string, root: string, prompt: string, budget: number,
       if (finished || stopping) return;
       stopping = true;
       unschedule(timer);
-      void killCodeMapTree(child, Math.max(0, Math.min(KILL_BUDGET_MS, deadline - now()))).then(() => finish());
+      // On cancellation there is no regex fallback; give tree termination up to the settle margin.
+      const killGrace = signal?.aborted
+        ? Math.min(KILL_BUDGET_MS, SETTLE_MARGIN_MS)
+        : Math.max(0, Math.min(KILL_BUDGET_MS, deadline - now() - fallbackReserve));
+      void killCodeMapTree(child, killGrace, signal).then(() => finish());
     };
     const timer = schedule(stop, duration);
     signal?.addEventListener("abort", stop, { once: true });

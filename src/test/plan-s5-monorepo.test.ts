@@ -99,11 +99,11 @@ test("S5: an async edit task runs Cline in the subfolder and holds the lock of t
   assert.equal(view.state, "done", JSON.stringify(view));
 });
 
-function cwdCapturingFake(seen: string[]): Partial<ClineInvocationOptions> {
+function cwdCapturingFake(seen: string[], base: string): Partial<ClineInvocationOptions> {
   return {
     promptPreamble: "", maxAttempts: 1, recordStatus: false, respectQuotaLock: false,
     deps: {
-      entryPath: "mock/cline", access: async () => {},
+      providerSettingsPath: path.join(base, "providers.json"), entryPath: "mock/cline", access: async () => {},
       spawn: ((_executable: string, args: string[]) => {
         seen.push(args[args.indexOf("--cwd") + 1]);
         const child = new EventEmitter() as any;
@@ -123,7 +123,7 @@ test("S5: ask_cline_workspace runs in the same subfolder of its worktree", async
   const f = await monorepo(t);
   const seen: string[] = [];
   const result = await askClineWorkspace({ cwd: f.app, prompt: "Inspect", codeMap: false, provider: "cline", model: "m" },
-    undefined, cwdCapturingFake(seen));
+    undefined, cwdCapturingFake(seen, f.base));
   assert.match(result.text ?? "", /review done/);
   assert.equal(seen.length, 1);
   assert.match(seen[0].replaceAll("\\", "/"), /\/review-[^/]+\/packages\/app$/, seen[0]);
@@ -136,7 +136,7 @@ test("S5: an uncommitted subfolder runs at the worktree root and says so", async
   await mkdir(fresh, { recursive: true });
   const seen: string[] = [];
   const result = await askClineWorkspace({ cwd: fresh, prompt: "Inspect", codeMap: false, provider: "cline", model: "m" },
-    undefined, cwdCapturingFake(seen));
+    undefined, cwdCapturingFake(seen, f.base));
   assert.match(seen[0].replaceAll("\\", "/"), /\/review-[^/]+$/, seen[0]);
   assert.ok(result.warnings?.some(w => w.includes("does not exist at HEAD")), JSON.stringify(result.warnings));
 });

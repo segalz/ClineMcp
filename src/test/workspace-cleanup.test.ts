@@ -37,6 +37,7 @@ function lockingFake(answer: string) {
     promptPreamble: "", maxAttempts: 1, recordStatus: false, respectQuotaLock: false,
     checkoutLockDirectory: path.join(root, "locks"),
     deps: {
+      providerSettingsPath: path.join(root, "providers.json"),
       entryPath: "mock/cline", access: async () => {},
       spawn: ((_executable: string, args: string[]) => {
         const worktree = args[args.indexOf("--cwd") + 1];

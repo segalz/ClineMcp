@@ -1,3 +1,4 @@
+import { RESTORE_BUDGET_MS, boundedSignal, settlementBudget } from "./waits.js";
 import { z } from "zod";
 import path from "node:path";
 import { realpath } from "node:fs/promises";
@@ -7,7 +8,8 @@ import { resolveVerificationCommand, runVerification, VerificationError, type Ve
 import { ClineRunError, DedicatedHubSession, redactSecrets, guardOptionsSchema, type ClineResponse } from "./runner.js";
 import type { GuardOptions } from "./guard.js";
 
-/** Extra margin reserved alongside the final check's timeout so each run leaves time to verify. */
+/** Extra margin reserved alongside the final check's timeout so each run leaves time to verify.
+ * `runVerification` settles within `verify.timeoutSeconds + SETTLE_MARGIN_MS` (4 s), fitting inside this 10 s reserve. */
 export const VERIFY_RESERVE_MARGIN_MS = 10_000;
 
 const VERIFY_COMMAND_HELP = "Program for the final check, run without a shell. It must already be runnable before the edit "
@@ -148,13 +150,13 @@ export class FinalCheckLifecycle {
       ...(this.question ? { question: this.question } : {}),
       ...(this.snapshot ? { snapshotDirectory: this.snapshot.directory } : {}) };
   }
-  private async unchanged(wait = this.wait.bind(this)): Promise<boolean> {
+  private async unchanged(signal: AbortSignal, wait = this.wait.bind(this)): Promise<boolean> {
     if (!this.identity) return true;
     try {
-      const current = await headAndIndexIdentity(this.root);
+      const current = await headAndIndexIdentity(this.root, signal);
       if (current.head === this.identity.head && current.indexHash === this.identity.indexHash) return true;
       this.evidence = { ...this.evidence, before: this.identity, after: current };
-    } catch (error) { this.evidence.identityError = redactSecrets(String(error)); }
+    } catch (error) { signal.throwIfAborted(); this.evidence.identityError = redactSecrets(String(error)); }
     wait("head_changed", new ClineRunError("edits_inspection_failed", "HEAD/index changed or could not be inspected; no reset or restoration performed."));
     return false;
   }
@@ -175,6 +177,7 @@ export class FinalCheckLifecycle {
     const now = this.deps.now ?? (() => performance.now());
     const started = now();
     const remaining = (this.input.timeoutSeconds ?? 600) * 1000 - this.activeMs;
+    const cleanupBudget = settlementBudget(remaining, signal, now);
     const controller = new AbortController();
     const abort = () => controller.abort();
     signal.addEventListener("abort", abort, { once: true });
@@ -186,15 +189,26 @@ export class FinalCheckLifecycle {
       if (expired || controller.signal.aborted) throw new ClineRunError("budget_exceeded", "Overall active-time budget exhausted.");
     };
     const stopHub = async () => {
-      await hub.stop();
+      await hub.stop(cleanupBudget);
       if (hub.unconfirmedStop) throw hub.unconfirmedStop;
       check();
     };
     // After a passing check (or a verify-none answer) the edit is committed: a slow hub stop or the overall deadline
     // must never restore it. An unconfirmed stop only keeps the snapshot and blocks further runs (plan S20, final check).
-    const stopHubAfterPass = async () => {
-      await hub.stop();
+    const finishAfterPass = async () => {
+      await hub.stop(cleanupBudget);
       if (hub.unconfirmedStop) this.recordUnconfirmedKill(hub.unconfirmedStop.processesStillAlive, true);
+      // The hub can change the checkout until it stops. The final identity guard shares the
+      // settlement deadline, and an inconclusive guard retains the recovery snapshot.
+      const guardSignal = AbortSignal.any([signal, cleanupBudget.signal]);
+      try { if (!await this.unchanged(guardSignal, wait)) return; }
+      catch (error) {
+        if (signal.aborted) throw error;
+        wait("head_changed", new ClineRunError("edits_inspection_failed", "Final checkout identity could not be confirmed before the deadline."));
+        return;
+      }
+      if (signal.aborted) throw new ClineRunError("cancelled", "The edit lifecycle was cancelled.");
+      await this.complete(boundedSignal(RESTORE_BUDGET_MS, guardSignal));
     };
     try {
       check();
@@ -204,7 +218,7 @@ export class FinalCheckLifecycle {
         if (workDir === undefined) throw new ClineRunError("workspace_not_git", "The requested cwd is not inside its Git checkout.");
         this.workDir = workDir;
         this.lock = ownsCheckoutLock(this.deps.checkoutLock, this.root) ? this.deps.checkoutLock
-          : await acquire(this.root, { lockDirectory: this.deps.lockDirectory });
+          : await acquire(this.root, { lockDirectory: this.deps.lockDirectory, signal: controller.signal });
         this.releaseOwnLock = this.lock !== this.deps.checkoutLock;
       }
       // A check that cannot even start makes the run pointless: refuse before the snapshot and any launch.
@@ -220,7 +234,7 @@ export class FinalCheckLifecycle {
       }
       if (!this.snapshot) {
         this.phase = "snapshot";
-        this.identity = await headAndIndexIdentity(this.root); check();
+        this.identity = await headAndIndexIdentity(this.root, controller.signal); check();
         this.snapshot = await takeSnapshot(this.root, { ...this.deps.snapshotOptions, signal: controller.signal }); check();
       }
       let repair = this.launches > 0;
@@ -231,7 +245,7 @@ export class FinalCheckLifecycle {
       const verifyReserveMs = "none" in this.input.verify ? 0 : (this.input.verify.timeoutSeconds ?? 60) * 1000 + VERIFY_RESERVE_MARGIN_MS;
       while (true) {
         check();
-        if (!await this.unchanged(wait)) return;
+        if (!await this.unchanged(controller.signal, wait)) return;
         check();
         const calls = (this.input.guard?.maxToolCalls ?? 150) - this.totalToolCalls;
         const tokens = (this.input.guard?.maxInputTokens ?? 1_500_000) - this.budgetInputTokens;
@@ -265,7 +279,7 @@ export class FinalCheckLifecycle {
         if (typeof metrics?.cost === "number") this.cost += metrics.cost;
         this.durationMs += metrics?.durationMs ?? 0;
         check();
-        if (!await this.unchanged(wait)) return;
+        if (!await this.unchanged(controller.signal, wait)) return;
         check();
         if (failure) {
           const reason: EditWaitReason = failure instanceof ClineRunError
@@ -281,10 +295,7 @@ export class FinalCheckLifecycle {
         if (this.question) { wait("cline_question"); return; }
         if ("none" in this.input.verify) {
           // An explicit opt-out answer is the commit point, like a passing check.
-          await stopHubAfterPass();
-          if (!await this.unchanged(wait)) return;
-          if (signal.aborted) throw new ClineRunError("cancelled", "The edit lifecycle was cancelled.");
-          await this.complete(); return;
+          await finishAfterPass(); return;
         }
         // A run that may have started a process (a command tool, or a run without a guard report) must not leave
         // it running during the check: stop the hub and its job, which kills those processes, as before S16. The
@@ -293,7 +304,8 @@ export class FinalCheckLifecycle {
         this.phase = "verify";
         const verifyStarted = now();
         let verified: VerificationResult & { error?: string };
-        try { verified = await (this.deps.verify ?? runVerification)(this.input.verify, this.workDir, controller.signal); }
+        try { verified = await (this.deps.verify ?? runVerification)(this.input.verify, this.workDir, controller.signal,
+          { remainingMs: Math.max(0, remaining - (now() - started)) }); }
         catch (error) {
           if (!(error instanceof VerificationError)) throw error;
           const message = redactSecrets(error.message);
@@ -308,14 +320,10 @@ export class FinalCheckLifecycle {
         this.verification.attempts.push({ ...verified, run: this.launches });
         this.verification.passed = verified.passed;
         if (verified.passed) {
-          await stopHubAfterPass();
-          if (!await this.unchanged(wait)) return;
-          // Only a caller cancel before this point restores a passing edit, never the deadline (README commit point).
-          if (signal.aborted) throw new ClineRunError("cancelled", "The edit lifecycle was cancelled.");
-          await this.complete(); return;
+          await finishAfterPass(); return;
         }
         check();
-        if (!await this.unchanged(wait)) return;
+        if (!await this.unchanged(controller.signal, wait)) return;
         check();
         if (this.killUnconfirmed || verified.error || manual || this.automaticFixes >= (this.input.maxFixRuns ?? 2)) {
           wait("verify_failed", verified.error ? new VerificationError("verification_launch_failed", verified.error) : undefined); return;
@@ -327,7 +335,7 @@ export class FinalCheckLifecycle {
       if (!signal.aborted) wait(expired ? "budget" : "cline_error", error);
     } finally {
       try {
-        await hub.stop();
+        await hub.stop(cleanupBudget);
         this.hubWarnings.push(...hub.warnings);
         if (hub.unconfirmedStop) {
           this.recordUnconfirmedKill(hub.unconfirmedStop.processesStillAlive, true);
@@ -341,31 +349,36 @@ export class FinalCheckLifecycle {
           this.cancelled = true; this.error = new ClineRunError("cancelled", "The edit lifecycle was cancelled."); await this.restore();
         } else if (pendingWait) this.wait(pendingWait.reason, pendingWait.error);
       } finally {
+        cleanupBudget.dispose();
         clearTimeout(timer); signal.removeEventListener("abort", abort); this.activeMs += now() - started;
       }
     }
   }
   async restore(): Promise<boolean> {
+    const signal = boundedSignal(RESTORE_BUDGET_MS);
     if (this.snapshot) {
-      if (!await this.unchanged()) return false;
-      this.phase = "restore";
       try {
-        const report = await restoreSnapshot(this.snapshot); this.evidence.restore = report;
+        if (!await this.unchanged(signal)) return false;
+        this.phase = "restore";
+        const report = await restoreSnapshot(this.snapshot, signal); this.evidence.restore = report;
         if (report.failed.length) { this.wait("cline_error", new Error("Baseline restoration incomplete.")); return false; }
         this.verification.restored = true;
       } catch (error) { this.wait("cline_error", error); return false; }
     }
-    await this.complete(); return true;
+    await this.complete(signal); return true;
   }
-  async keep(): Promise<void> {
+  async keep(parent?: AbortSignal): Promise<void> {
+    const signal = boundedSignal(RESTORE_BUDGET_MS, parent);
+    const unchanged = await this.unchanged(signal);
+    signal.throwIfAborted();
     this.verification.kept = true;
-    if (!await this.unchanged()) {
+    if (!unchanged) {
       // Keeping is allowed to end the task, but an identity refusal must retain recovery bytes.
       this.phase = "done"; this.waitReason = undefined; this.question = undefined; return;
     }
-    await this.complete();
+    await this.complete(signal);
   }
-  async complete(): Promise<void> {
+  async complete(signal: AbortSignal): Promise<void> {
     // Completion is the commit point; cancellation after this phase waits for disposal.
     this.phase = "done"; this.waitReason = undefined; this.question = undefined;
     // Verified edits must never be restored because the recovery folder could not be deleted.
@@ -375,9 +388,11 @@ export class FinalCheckLifecycle {
     delete this.evidence.snapshotDirectory;
     if (snapshot) {
       // Report every new file the edit left behind (a stray debug script, too); a report failure changes nothing.
-      try { const created = await createdFiles(snapshot); if (created.length) this.createdFiles = created; }
-      catch { /* report-only */ }
-      try { await discardSnapshot(snapshot); }
+      if (!this.verification.restored) {
+        try { const created = await createdFiles(snapshot, signal); if (created.length) this.createdFiles = created; }
+        catch { /* report-only */ }
+      }
+      try { await discardSnapshot(snapshot, signal); }
       catch (error) { (this.evidence as Record<string, unknown>).snapshotCleanupError = `${snapshot.directory}: ${(error as Error)?.message ?? String(error)}`; }
     }
   }
