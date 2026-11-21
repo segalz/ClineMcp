@@ -103,16 +103,17 @@ The free bridges and `pick` are what this plan fixes, so they do not route or wr
 
 Quota on 2026-11-21:
 - AGY Gemini Models: 96% weekly. Argon: 100%. AGY Claude/GPT: 0% until 2026-11-25.
-- Codex: 4% weekly until 2026-11-25.
+- Codex: 4% weekly. Owner 2026-11-21: use Codex fully; when its quota runs out, tell the owner and they reset it.
 - Claude-self: reset on 2026-11-21. 1% of the weekly limit used, 8% of the 5-hour window.
 
-So the Gemini writers have quota, Claude reviews, and Codex is kept for one last pass after 2026-11-25.
+So every strong model has quota. Codex `gpt-6.2-astra` (the strongest, AA 62) writes the hard items. Gemini writes the rest. Codex and Opus review across families.
 
 | Difficulty | Items | Writer | Reviewer |
 |---|---|---|---|
-| 4 | P4 (shared limit patterns, per-model lock, `AVAILABILITY_ERRORS`), C2 (large-file Cline edits) | AGY `gemini-4-argon-high`; one repo per call, tight design | Claude Opus (subagent, high) |
-| 3 | P1 (write freshness), P2 (cold-start discovery), P6 (seeding vs infrastructure errors, old failures), P8 (external-score matching), D1 (snapshot sweep, both bridges), D3 (flaky tests), D4 (agent-intern upgrade) | AGY `gemini-4-neon-xhigh`, backup `gemini-4-hydrogen-xhigh` | Claude Opus (subagent, high); at the end one pass over all of P (Opus, or Codex after 2026-11-25) |
-| 1-2 | P3 (read the Cline ladder), P5 (tokens into `log_run`), P7 (remove GLM), B3 (static lists), D6 (stray folders) | AGY `gemini-4-hydrogen-xhigh`, or Claude by hand when it is a few lines | Claude reads the diff (with AGY Neon when Claude wrote it) |
+| 4 | P4 (shared limit patterns, per-model lock, `AVAILABILITY_ERRORS`), C2 (large-file Cline edits) | Codex `gpt-6.2-astra` xhigh, `workspace-write`; backup AGY `gemini-4-argon-high` | Claude Opus (subagent, high) |
+| 3 | P1 (write freshness), P2 (cold-start discovery), P6 (seeding vs infrastructure errors, old failures), P8 (external-score matching), D1 (snapshot sweep, both bridges), D3 (flaky tests), D4 (agent-intern upgrade) | AGY `gemini-4-neon-xhigh`, backup `gemini-4-hydrogen-xhigh` | Codex `gpt-6.2-astra` high, read-only; Opus while Codex waits for a reset |
+| 1-2 | P3 (read the Cline ladder), P5 (tokens into `log_run`), P7 (remove GLM), B3 (static lists), D6 (stray folders) | AGY `gemini-4-hydrogen-xhigh`, or Claude by hand when it is a few lines | Claude reads the diff (AGY Neon when Claude wrote it) |
+| Final pass over all of P | - | - | Opus high plus AGY Argon high (two families) |
 | 1 (text) | A1-A8 (rules, memory, docs branches) | Claude | The owner approves CLAUDE.md and the merges |
 | Runs | B1, B2, B4, C1, C3, C4 (re-seed, measure, check routing) | Claude runs them | - (after P and A8; these are where the free bridges and `pick` come back) |
 
@@ -120,7 +121,7 @@ Order inside P: P7, P3 and P5 first (easy), then P6, P1 and P2, then P4. P1 is n
 
 ## Open questions for the owner
 
-1. A2: drop the "Codex off" note, or keep Codex for hard work only?
+1. A2: the owner lifted "Codex off" for this plan on 2026-11-21. Does the CLAUDE.md note go for good?
 2. P1: should a recent successful real run (`log_run`) keep a model's write trust fresh, or only seed runs?
 3. B4: should `ui`/`general` writes also prefer the free bridges?
 4. D4: upgrade agent-intern now or leave it?
