@@ -139,3 +139,19 @@ Per question, A1 is higher on h01, h02 and h10, lower on h04 and h07, and equal 
   - `analyze_code` waits for its whole budget when the `opencode/*` quota is exhausted, because
     OpenCode retries internally instead of failing fast;
   - a 429 from Nvidia fails the run without trying a fallback model.
+
+## Re-run on the fixed bridges (finish-all F9, 2026-11-22)
+
+The OpenCode half was run again on the fixed bridges (`stage13-pilot/runhard4.sh`, outputs in `outH4/`). It used Nvidia `nemotron-3-ultra-550b-a55b`, 10 hard questions × 3 reps × 2 arms, and 2 parallel lanes.
+
+| Arm | Correct / runs | Failed runs | Avg time | Avg input tokens | Avg tool calls |
+|---|---|---|---|---|---|
+| A0 regex | 25.4 / 30 (0.85) | 1 | 42.9 s | 151,401 | 6.1 |
+| A1 codeindex v2 | 24.2 / 30 (0.81) | 0 | 42.7 s | 125,460 | 5.8 |
+
+**Reading:**
+- Every run completed, except one A0 error. That is 59/60, against 52/60 valid before the bridge fixes.
+- Accuracy is equal within noise: 0.81 vs 0.85, a difference of about one question over 30 runs.
+- codeindex again saves tokens: 17% fewer input tokens, at the same time.
+- The two bridge gaps recorded above (waiting out the budget on an exhausted quota; a 429 without fallback) were fixed in the fix plan (S8, S13) and did not occur.
+- Conclusion for Stage 13: keep the codeindex map on both bridges (equal accuracy, fewer tokens). This item is closed.
