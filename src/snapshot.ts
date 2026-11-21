@@ -358,6 +358,7 @@ export async function takeSnapshot(checkoutRoot: string, opts: SnapshotOptions =
 }
 
 const NOT_ATTEMPTED_DEADLINE = "not attempted (restore deadline)";
+const CREATED_SCAN_NOT_RUN_DEADLINE = "not attempted (restore deadline): created-files scan did not run";
 
 /** Restore one baseline file in place; true when it had to be rewritten. Always finishes the started file cleanly. */
 async function restoreEntry(root: string, handle: SnapshotHandle, i: number): Promise<boolean> {
@@ -413,8 +414,8 @@ export async function restoreSnapshot(handle: SnapshotHandle, parent?: AbortSign
       processedSpecials.add(i);
       report.failed.push({ path: specials[i].path, error: NOT_ATTEMPTED_DEADLINE });
     }
-    if (!currentScanned && report.failed.length === 0) {
-      report.failed.push({ path: ".", error: NOT_ATTEMPTED_DEADLINE });
+    if (!currentScanned) {
+      report.failed.push({ path: ".", error: CREATED_SCAN_NOT_RUN_DEADLINE });
     }
     return report;
   };

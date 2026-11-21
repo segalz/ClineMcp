@@ -208,6 +208,7 @@ export async function applyClineEdits(
     await lifecycle.execute(signal ?? new AbortController().signal);
     if (lifecycle.phase !== "done") {
       const reason = lifecycle.waitReason;
+      const priorError = lifecycle.error;
       if (lifecycle.lock && !signal?.aborted) {
         try { lifecycle.evidence.gitDiff = truncateGitDiff(await runGit(lifecycle.root, ["diff", "--binary", "--no-ext-diff", "HEAD"], signal, DIFF_STAT_TIMEOUT_MS)); }
         catch { /* Recovery evidence must survive an inspection failure. */ }
@@ -228,11 +229,19 @@ export async function applyClineEdits(
           lifecycle.error = new ClineRunError("cancelled", "The edit was cancelled while keeping the changes.");
         }
       } else if (!lifecycle.cancelled && reason !== "head_changed" && !lifecycle.killUnconfirmed) await lifecycle.restore();
-      const error = lifecycle.error instanceof ClineRunError ? lifecycle.error
+      const restoreReport = lifecycle.evidence.restore as { failed?: unknown[] } | undefined;
+      const restoreIncomplete = Array.isArray(restoreReport?.failed) && restoreReport.failed.length > 0;
+      const sourceError = restoreIncomplete && !(lifecycle.error instanceof ClineRunError) ? priorError : lifecycle.error;
+      const error = sourceError instanceof ClineRunError ? sourceError
         // A check refused up front (plan S4): no run happened, so say what is wrong with the check itself.
-        : lifecycle.error instanceof VerificationError
-          ? new ClineRunError("launch_failed", `The final check cannot start (${lifecycle.error.kind}): ${lifecycle.error.message}`, { attempts: 0 })
-          : new ClineRunError("edits_inspection_failed", `Edit failed: ${reason ?? "verification failed"}.`);
+        : sourceError instanceof VerificationError
+          ? new ClineRunError("launch_failed", `The final check cannot start (${sourceError.kind}): ${sourceError.message}`, { attempts: 0 })
+          : lifecycle.cancelled
+            ? new ClineRunError("cancelled", "The Cline request was cancelled.")
+            : new ClineRunError("edits_inspection_failed", `Edit failed: ${reason ?? "verification failed"}.`);
+      if (restoreIncomplete) {
+        error.message = `${error.message} Baseline restoration is incomplete (recovery snapshot retained).`;
+      }
       Object.assign(error, { verification: lifecycle.verification, evidence: lifecycle.evidence,
         codeMapSource: lifecycle.codeMapSource,
         usage: lifecycle.usage, cost: lifecycle.cost, durationMs: lifecycle.durationMs });

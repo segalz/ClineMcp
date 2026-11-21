@@ -239,9 +239,14 @@ export async function runVerification(spec: VerificationCommand, cwd: string, si
       const confirmKill = (pid: number): Promise<TreeKillResult> => {
         if (job) {
           return (async () => {
-            const confirmed = (await job.close(budget.remaining(), budget.signal)) === true || job.confirmed === true;
-            if (confirmed) return { confirmed: true, alive: [] };
-            return confirmWithTable(pid);
+            // A child spawned before job assignment lands can live outside the job: always check the process table too.
+            const jobDrained = (await job.close(budget.remaining(), budget.signal).catch(() => false)) === true || job.confirmed === true;
+            const table = await confirmWithTable(pid);
+            if (table.confirmed) return table;
+            if (table.unverified && table.alive.length === 0 && jobDrained && !pipesHeldOpen) {
+              return { confirmed: true, alive: [] };
+            }
+            return table;
           })();
         }
         return confirmWithTable(pid);

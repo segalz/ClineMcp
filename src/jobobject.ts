@@ -144,13 +144,15 @@ function startOwner(file: string) {
   let pending: ChildProcess | undefined;
   const queued = [] as ChildProcess[];
   let assigned = false;
-  let lastAssigned = false;
+  let assignedCount = 0;
+  let missedAssignment = false;
   let drained = false;
   let confirmed = false;
   let closing = false;
   let exited = false;
   let ended = false;
   let timer: NodeJS.Timeout | undefined;
+  const canConfirm = () => drained && assignedCount > 0 && !missedAssignment && !pending && queued.length === 0;
   const kill = () => {
     try {
       if (!ended && child.exitCode === null && child.signalCode === null) child.ref();
@@ -162,12 +164,15 @@ function startOwner(file: string) {
   let closeSignal: AbortSignal | undefined;
   let closeDeadline = Infinity;
   const forceClose = () => {
+    if (pending || queued.length > 0) missedAssignment = true;
     closeSignal?.removeEventListener("abort", forceClose);
     clearTimeout(timer);
     kill();
+    confirmed = canConfirm();
     finish(confirmed);
   };
   const end = () => {
+    if (pending || queued.length > 0) missedAssignment = true;
     exited = true;
     ended = true;
     assigned = false;
@@ -176,7 +181,7 @@ function startOwner(file: string) {
     owners.delete(child);
     closeSignal?.removeEventListener("abort", forceClose);
     clearTimeout(timer);
-    confirmed = lastAssigned && drained;
+    confirmed = canConfirm();
     ready(false);
     finish(confirmed);
   };
@@ -191,10 +196,12 @@ function startOwner(file: string) {
   const sendNext = () => {
     while (queued.length) {
       const root = queued.shift()!;
-      if (!rootIsLive(root)) continue;
+      if (!rootIsLive(root)) {
+        missedAssignment = true;
+        continue;
+      }
       pending = root;
       assigned = false;
-      lastAssigned = false;
       child.stdin.write(root.pid + "\n");
       return;
     }
@@ -211,13 +218,14 @@ function startOwner(file: string) {
     }
     if (line === "assigned" || line === "skipped") {
       assigned = line === "assigned";
-      lastAssigned = assigned;
+      if (assigned) assignedCount++;
+      else missedAssignment = true;
       pending = undefined;
       sendNext();
     }
     if (line === "drained") {
       drained = true;
-      confirmed = lastAssigned;
+      confirmed = canConfirm();
     }
   });
   child.unref();
@@ -228,7 +236,11 @@ function startOwner(file: string) {
     get assigned() { return assigned; },
     get confirmed() { return confirmed; },
     assign(root) {
-      if (!job.alive || !(root instanceof ChildProcess) || !root.pid || !rootIsLive(root)) return;
+      if (!(root instanceof ChildProcess) || !root.pid) return;
+      if (!job.alive || !rootIsLive(root)) {
+        if (!ended) missedAssignment = true;
+        return;
+      }
       queued.push(root);
       if (!pending) sendNext();
     },
@@ -244,8 +256,8 @@ function startOwner(file: string) {
             closeDeadline = performance.now() + cap;
             signal?.addEventListener("abort", forceClose, { once: true });
             timer = setTimeout(forceClose, cap);
+            if (!pending) sendNext();
           }
-          if (!pending) child.stdin.end();
         } else if (signal?.aborted || cap <= 0) {
           forceClose();
         } else {

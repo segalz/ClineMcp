@@ -845,11 +845,12 @@ export class DedicatedHubSession {
     };
     try {
       if (this.jobs.stopped) await closeJob();
+      const jobDrainedBeforeHubStop = jobConfirmed;
       // Only the launched CLI can have started the daemon.
       const result = this.launched ? await this.hub?.stop(budget) : undefined;
       if (result && !result.confirmed) {
         if (!jobConfirmed) await closeJob();
-        if (!jobConfirmed) {
+        if (!jobConfirmed || (jobDrainedBeforeHubStop && result.alive.length > 0)) {
           const message = "The dedicated Cline hub could not be confirmed stopped.";
           this.unconfirmedStop = new ClineRunError("edits_inspection_failed", message,
             { processesStillAlive: result.alive, killUnverified: true });
@@ -1295,7 +1296,7 @@ async function runClineCore(input: AskClineInput, signal: AbortSignal | undefine
                 }
               };
               const isRootAlive = () => !exitSeen && child.exitCode === null && child.signalCode === null;
-              const runTableConfirm = () => {
+              const runTableConfirm = (): Promise<TreeKillResult> => {
                 const confirmCap = Math.min(
                   deps.settlementDeadlineMs !== undefined ? budget.remaining() : budget.confirmRemaining(),
                   deps.settlementDeadlineMs ?? TREE_KILL_CONFIRM_MS
@@ -1311,20 +1312,21 @@ async function runClineCore(input: AskClineInput, signal: AbortSignal | undefine
                   rootExitedMs: () => exitSeenAt,
                   firstPollMs: platform === "win32" ? undefined : (deps.killGracePeriodMs ?? deps.closeGracePeriodMs ?? 500),
                   platform
-                }), confirmSignal);
+                }), confirmSignal).catch(() => ({ confirmed: false, alive: isRootAlive() ? [pid] : [], unverified: true }));
               };
-              // Job Object first: terminate the job and confirm ActiveProcesses == 0 without PowerShell.
-              const confirmedResult: TreeKillResult = { confirmed: true, alive: [] };
-              const confirm: Promise<TreeKillResult> = closeStoppedJob
-                ? closeStoppedJob().then(
-                    (ok) => (ok === true || job?.confirmed === true) ? confirmedResult : runTableConfirm(),
-                    () => runTableConfirm()
-                  )
-                : runTableConfirm();
-              confirm.then(
-                ({ confirmed, alive, unverified }) => settleAfterKill(confirmed ? undefined : alive, unverified),
-                () => settleAfterKill(isRootAlive() ? [pid] : [], true)
-              );
+              // Terminate the job first, then still check the process table for children spawned before assignment.
+              const confirm: Promise<TreeKillResult> = (async () => {
+                const jobDrained = closeStoppedJob
+                  ? (await closeStoppedJob().catch(() => false)) === true || job?.confirmed === true
+                  : false;
+                const table = await runTableConfirm();
+                if (table.confirmed) return table;
+                if (table.unverified && table.alive.length === 0 && jobDrained) {
+                  return { confirmed: true, alive: [] };
+                }
+                return table;
+              })();
+              confirm.then(({ confirmed, alive, unverified }) => settleAfterKill(confirmed ? undefined : alive, unverified));
               return;
             }
 
@@ -1452,13 +1454,12 @@ async function runClineCore(input: AskClineInput, signal: AbortSignal | undefine
                   }), confirmSignal)
                     .then((result) => result, () => ({ confirmed: false, alive: [] as number[], unverified: true }));
                 };
-                const confirmedResult: TreeKillResult = { confirmed: true, alive: [] };
-                const confirm: Promise<TreeKillResult> = job && !ownsHub
-                  ? job.close(budget.remaining(), budget.signal).then(
-                      (ok) => (ok === true || job.confirmed === true) ? confirmedResult : runTableConfirm(),
-                      () => runTableConfirm()
-                    )
-                  : runTableConfirm();
+                // Pipes stayed open after root exit (sign of a live descendant, possibly outside the job):
+                // close the job first, then require the process-table check; a drained job alone cannot confirm.
+                const confirm: Promise<TreeKillResult> = (async () => {
+                  if (job && !ownsHub) await job.close(budget.remaining(), budget.signal).catch(() => false);
+                  return runTableConfirm();
+                })();
                 confirm.then(({ confirmed, alive, unverified }) => settleExit(confirmed ? undefined : alive, unverified));
                 return;
               }

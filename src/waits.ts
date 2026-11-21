@@ -3,7 +3,7 @@
  *
  * Invariant:
  * - A timed-out or cancelled run or check settles within its budget + `SETTLE_MARGIN_MS`,
- *   or + `KILL_CONFIRM_MARGIN_MS` when a kill must be confirmed without a Windows Job Object.
+ *   or + `KILL_CONFIRM_MARGIN_MS` when process-table kill confirmation runs.
  * - Every internal wait is bounded by `min(its cap, the owning operation's remaining budget)`.
  * - A cancellation stops waiting promptly and shortens even a settlement wait already in progress.
  *   Note: cancelling an edit task can take up to `RESTORE_BUDGET_MS` because `tasks.cancel`
@@ -21,7 +21,7 @@ export const PROCESS_QUERY_TIMEOUT_MS = 20_000;
 export const PROCESS_TABLE_TIMEOUT_MS = 15_000;
 /** Two complete Windows process-table reads plus 2 s of slack to poll and reap. */
 export const TREE_KILL_CONFIRM_MS = 2 * PROCESS_TABLE_TIMEOUT_MS + 2_000;
-/** Margin used ONLY when confirming a kill after timeout/cancel without a Windows Job Object (one full 15 s read + 1 s polling). */
+/** Margin used for process-table kill confirmation after timeout/cancel (one full 15 s read + 1 s polling). */
 export const KILL_CONFIRM_MARGIN_MS = PROCESS_TABLE_TIMEOUT_MS + 1_000;
 /** Short settle cap after a kill (also exceeds the Windows job owner's 2 s drain). */
 export const KILL_SETTLE_MS = 5_000;
@@ -48,7 +48,7 @@ export function boundedSignal(ms: number, parent?: AbortSignal): AbortSignal {
 /**
  * One clock for confirmation, job drain and hub stop. Cancellation shortens even a wait already in progress.
  * Exposes `remaining()`/`signal` (`SETTLE_MARGIN_MS`) for normal settlement and `confirmRemaining()`/`confirmSignal`
- * (`KILL_CONFIRM_MARGIN_MS`) solely for confirming a kill when no Windows Job Object is available.
+ * (`KILL_CONFIRM_MARGIN_MS`) for process-table kill confirmation.
  */
 export function settlementBudget(workMs: number, cancel?: AbortSignal, now = () => performance.now()) {
   const workDeadline = now() + Math.max(0, workMs);

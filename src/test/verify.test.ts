@@ -4,7 +4,7 @@ import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { resolveVerificationCommand, runVerification, VerificationError } from "../verify.js";
-import { SETTLE_MARGIN_MS } from "../waits.js";
+import { KILL_CONFIRM_MARGIN_MS } from "../waits.js";
 
 async function fixture(t: test.TestContext) {
   const root = await mkdtemp(path.join(os.tmpdir(), "cline-verify-test-"));
@@ -30,7 +30,7 @@ test("timeout and abort stop verification without a passing result", async t => 
   const result = await runVerification(node("setInterval(() => {}, 1000)", 1), root);
   // Include scheduler jitter in this real-child check; the fake clock checks the exact margin.
   assert.equal(result.timedOut, true); assert.equal(result.passed, false);
-  assert.ok(result.durationMs < 1_000 + SETTLE_MARGIN_MS + 500, String(result.durationMs));
+  assert.ok(result.durationMs < 1_000 + KILL_CONFIRM_MARGIN_MS + 500, String(result.durationMs));
   const controller = new AbortController();
   const pending = runVerification(node("setInterval(() => {}, 1000)"), root, controller.signal);
   setTimeout(() => controller.abort(), 200);

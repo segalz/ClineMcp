@@ -225,7 +225,7 @@ test("createdFiles and restoreSnapshot honor AbortSignal and the 90 s RESTORE_BU
   t.mock.timers.tick(RESTORE_BUDGET_MS - 50_000);
   const report = await restoring;
   assert.equal(kills, 1);
-  assert.deepEqual(report.failed, [{ path: ".", error: "not attempted (restore deadline)" }]);
+  assert.deepEqual(report.failed, [{ path: ".", error: "not attempted (restore deadline): created-files scan did not run" }]);
 });
 
 test("checkoutlock acquire honors signal abort and deadlineMs across stale-lock reclamation", async t => {
@@ -387,7 +387,7 @@ test("slow 12 s process-table read confirms a timed-out check when no Job Object
   assert.equal(result.killUnverified, undefined);
 });
 
-test("Windows Job Object confirms a timed-out check and run without any process-table read", async t => {
+test("Windows Job Object still runs process-table confirmation and confirms an unreadable table when no pipes are held open", async t => {
   t.mock.timers.enable({ apis: ["Date", "setTimeout"], now: 1_000 });
   let tableCalls = 0;
   let verifyStarted!: () => void;
@@ -427,7 +427,7 @@ test("Windows Job Object confirms a timed-out check and run without any process-
   t.mock.timers.tick(1_000);
   const result = await verified;
   assert.equal(closed, true);
-  assert.equal(tableCalls, 0, "Job Object confirmation must skip PowerShell confirmTreeDead");
+  assert.equal(tableCalls, 1, "drained Job Object must still run confirmTreeDead");
   assert.equal(result.timedOut, true);
   assert.equal(result.killConfirmed, undefined);
   assert.equal(result.killUnverified, undefined);
@@ -462,7 +462,7 @@ test("Windows Job Object confirms a timed-out check and run without any process-
   t.mock.timers.tick(1_000);
   await rejected;
   assert.equal(closed, true);
-  assert.equal(tableCalls, 0, "runner with assigned Job Object must not call confirmTreeDead");
+  assert.equal(tableCalls, 2, "runner with drained Job Object must still run confirmTreeDead");
 });
 
 test("real Windows Job Object helper confirms ActiveProcesses == 0 on close", { skip: process.platform !== "win32" }, async t => {
@@ -811,4 +811,551 @@ test("combined runner confirmation and dedicated hub stop share one settlement b
   t.mock.timers.tick(SETTLE_MARGIN_MS - 1_500);
   await rejected;
   assert.equal(Date.now() - 1_000, 1_000 + SETTLE_MARGIN_MS);
+});
+
+// ---- Drained Job Object is not proof alone + three small fixes (fail on HEAD 69185cc) ----
+
+test("a child alive outside a drained Job Object is NOT confirmed in verify or runner, and triggers no auto-restore", async t => {
+  const base = await mkdtemp(path.join(os.tmpdir(), "job-escape-"));
+  t.after(() => rm(base, { recursive: true, force: true, maxRetries: 5 }));
+  const root = path.join(base, "repo"), snapshots = path.join(base, "snapshots"), locks = path.join(base, "locks");
+  await mkdir(root);
+  await writeFile(path.join(root, "a.txt"), "baseline");
+
+  const drainedJob = (): WindowsJob => {
+    let alive = true, assigned = false, confirmed = false;
+    return {
+      get alive() { return alive; },
+      get assigned() { return assigned; },
+      get confirmed() { return confirmed; },
+      assign() { assigned = true; },
+      async close() { alive = false; assigned = false; confirmed = true; return true; }
+    };
+  };
+
+  // 1. runVerification timeout: drained job + live descendant in table => NOT confirmed.
+  {
+    t.mock.timers.enable({ apis: ["Date", "setTimeout"], now: 1_000 });
+    let started!: () => void;
+    const launched = new Promise<void>(resolve => { started = resolve; });
+    let verifyProc!: ReturnType<typeof child>;
+    mockSpawn(t, file => {
+      const p = child();
+      if (file === process.execPath) { verifyProc = p; started(); return Object.assign(p, { pid: 12345 }); }
+      return p;
+    });
+    let tableCalls = 0;
+    const job = drainedJob();
+    const origClose = job.close.bind(job);
+    job.close = async () => {
+      const ok = await origClose();
+      queueMicrotask(() => { (verifyProc as any).exitCode = 1; verifyProc.emit("exit", 1, null); verifyProc.emit("close", 1, null); });
+      return ok;
+    };
+    const pending = runVerification({ command: process.execPath, timeoutSeconds: 1 }, process.cwd(), undefined, {
+      now: Date.now,
+      createWindowsJob: async () => job,
+      confirmTreeDead: async () => { tableCalls++; return { confirmed: false, alive: [9001] }; }
+    });
+    await launched;
+    t.mock.timers.tick(1_000);
+    const result = await pending;
+    assert.equal(tableCalls, 1, "confirmTreeDead must still run after a drained job");
+    assert.equal(result.passed, false);
+    assert.equal(result.killConfirmed, false);
+    assert.deepEqual(result.stillAlive, [9001]);
+    t.mock.timers.reset();
+  }
+
+  // 2. runVerification pipesHeldOpen: root exits 0, drained job + live descendant => NOT confirmed, no auto-restore in lifecycle.
+  {
+    t.mock.timers.enable({ apis: ["Date", "setTimeout"], now: 1_000 });
+    let started!: () => void;
+    const launched = new Promise<void>(resolve => { started = resolve; });
+    let verifyProc!: ReturnType<typeof child>;
+    mockSpawn(t, file => {
+      const p = child();
+      if (file === process.execPath) { verifyProc = p; started(); return Object.assign(p, { pid: 12346 }); }
+      return p;
+    });
+    let tableCalls = 0;
+    const pending = runVerification({ command: process.execPath, timeoutSeconds: 10 }, process.cwd(), undefined, {
+      now: Date.now,
+      createWindowsJob: async () => drainedJob(),
+      confirmTreeDead: async () => { tableCalls++; return { confirmed: false, alive: [9002] }; }
+    });
+    await launched;
+    // Root exits cleanly, but a child outside the job keeps pipes open (no close event).
+    (verifyProc as any).exitCode = 0;
+    verifyProc.emit("exit", 0, null);
+    t.mock.timers.tick(500);
+    const result = await pending;
+    assert.equal(tableCalls, 1, "pipesHeldOpen must still run confirmTreeDead after a drained job");
+    assert.equal(result.passed, false);
+    assert.equal(result.killConfirmed, false);
+    assert.deepEqual(result.stillAlive, [9002]);
+    t.mock.timers.reset();
+  }
+
+  // 3. Sync applyClineEdits with drained job + live descendant in runner (timeout and exit-with-held-pipes): NOT confirmed, NO auto-restore.
+  const prevSnapDir = process.env.CLINE_MCP_SNAPSHOT_DIR;
+  process.env.CLINE_MCP_SNAPSHOT_DIR = snapshots;
+  t.after(() => { if (prevSnapDir === undefined) delete process.env.CLINE_MCP_SNAPSHOT_DIR; else process.env.CLINE_MCP_SNAPSHOT_DIR = prevSnapDir; });
+
+  const gitStub = t.mock.method(childProcess, "spawn", (_file: string, args: string[]) => {
+    const proc = child();
+    const cmd = args[2], arg = args[3];
+    let out = "";
+    if (cmd === "rev-parse") out = arg === "--show-toplevel" ? root : arg === "--git-path" ? ".git/info/exclude" : "a".repeat(40);
+    else if (cmd === "ls-files" && arg === "--stage") out = "";
+    else if (cmd === "ls-files" && args.includes("--ignored")) out = "";
+    else if (cmd === "ls-files") out = "a.txt\0";
+    queueMicrotask(() => { proc.stdout.end(out); proc.emit("close", 0); });
+    return proc;
+  });
+  syncBuiltinESMExports();
+  t.after(() => { gitStub.mock.restore(); syncBuiltinESMExports(); });
+
+  for (const mode of ["timeout", "pipesHeldOpen"] as const) {
+    await writeFile(path.join(root, "a.txt"), "baseline");
+    const alivePid = mode === "timeout" ? 9003 : 9004;
+    let tableCalls = 0;
+    await assert.rejects(
+      applyClineEdits(
+        { prompt: "Edit", cwd: root, provider: "p", model: "m", codeMap: false, verify: { none: true, reason: `Escaped child ${mode} fixture` } },
+        undefined,
+        {
+          checkoutLockDirectory: locks, recordStatus: false, respectQuotaLock: false,
+          deps: {
+            platform: "win32", entryPath: "mock/cline", providerSettingsPath: path.join(base, "providers.json"),
+            access: async () => {}, acquireSettingsMutex: async () => async () => {},
+            totalBudgetMs: 2_000, timeoutMs: mode === "timeout" ? 40 : 2_000,
+            closeGracePeriodMs: 25, settlementDeadlineMs: 200,
+            createWindowsJob: async () => drainedJob(),
+            killTree: () => {},
+            confirmTreeDead: async () => { tableCalls++; return { confirmed: false, alive: [alivePid] }; },
+            spawn: (() => {
+              const proc = Object.assign(new childProcess.ChildProcess(), { pid: 4242, stdout: new PassThrough(), stderr: new PassThrough() });
+              void writeFile(path.join(root, "a.txt"), `edited-${mode}`).then(() => {
+                if (mode === "pipesHeldOpen") {
+                  (proc.stdout as PassThrough).write('{"type":"run_result","finishReason":"completed","text":"done"}\n');
+                  (proc as any).exitCode = 0;
+                  proc.emit("exit", 0, null);
+                  // Deliberately do NOT emit "close" — simulates an escaped child holding pipes open.
+                }
+              });
+              return proc;
+            }) as typeof childProcess.spawn
+          }
+        }
+      ),
+      (err: any) => {
+        assert.equal(err.verification?.restored, false, `${mode}: must NOT auto-restore`);
+        assert.deepEqual(err.evidence?.processesStillAlive, [alivePid]);
+        assert.ok(typeof err.evidence?.snapshotDirectory === "string" && existsSync(err.evidence.snapshotDirectory));
+        return true;
+      }
+    );
+    assert.equal(tableCalls, 1, `${mode}: runner must run confirmTreeDead after drained job`);
+    assert.equal(await readFile(path.join(root, "a.txt"), "utf8"), `edited-${mode}`, `${mode}: file must stay unrestored`);
+  }
+});
+
+test("drained Job Object + unreadable process table: confirmed without pipesHeldOpen, unconfirmed with pipesHeldOpen", async t => {
+  const drainedJob = (): WindowsJob => {
+    let alive = true, assigned = false, confirmed = false;
+    return {
+      get alive() { return alive; },
+      get assigned() { return assigned; },
+      get confirmed() { return confirmed; },
+      assign() { assigned = true; },
+      async close() { alive = false; assigned = false; confirmed = true; return true; }
+    };
+  };
+
+  // 1. runVerification: timeout (pipesHeldOpen = false) + drained job + unreadable table => confirmed.
+  {
+    t.mock.timers.enable({ apis: ["Date", "setTimeout"], now: 1_000 });
+    let started!: () => void;
+    const launched = new Promise<void>(resolve => { started = resolve; });
+    let verifyProc!: ReturnType<typeof child>;
+    mockSpawn(t, file => {
+      const p = child();
+      if (file === process.execPath) { verifyProc = p; started(); return Object.assign(p, { pid: 12345 }); }
+      return p;
+    });
+    let tableCalls = 0;
+    const job = drainedJob();
+    const origClose = job.close.bind(job);
+    job.close = async () => {
+      const ok = await origClose();
+      queueMicrotask(() => { (verifyProc as any).exitCode = 1; verifyProc.emit("exit", 1, null); verifyProc.emit("close", 1, null); });
+      return ok;
+    };
+    const pending = runVerification({ command: process.execPath, timeoutSeconds: 1 }, process.cwd(), undefined, {
+      now: Date.now,
+      createWindowsJob: async () => job,
+      confirmTreeDead: async () => { tableCalls++; return { confirmed: false, alive: [], unverified: true }; }
+    });
+    await launched;
+    t.mock.timers.tick(1_000);
+    const result = await pending;
+    assert.equal(tableCalls, 1);
+    assert.equal(result.timedOut, true);
+    assert.equal(result.killConfirmed, undefined);
+    assert.equal(result.killUnverified, undefined);
+    t.mock.timers.reset();
+  }
+
+  // 2. runVerification: pipesHeldOpen = true + drained job + unreadable table => unconfirmed (unverified: true).
+  {
+    t.mock.timers.enable({ apis: ["Date", "setTimeout"], now: 1_000 });
+    let started!: () => void;
+    const launched = new Promise<void>(resolve => { started = resolve; });
+    let verifyProc!: ReturnType<typeof child>;
+    mockSpawn(t, file => {
+      const p = child();
+      if (file === process.execPath) { verifyProc = p; started(); return Object.assign(p, { pid: 12346 }); }
+      return p;
+    });
+    let tableCalls = 0;
+    const pending = runVerification({ command: process.execPath, timeoutSeconds: 10 }, process.cwd(), undefined, {
+      now: Date.now,
+      createWindowsJob: async () => drainedJob(),
+      confirmTreeDead: async () => { tableCalls++; return { confirmed: false, alive: [], unverified: true }; }
+    });
+    await launched;
+    (verifyProc as any).exitCode = 0;
+    verifyProc.emit("exit", 0, null);
+    t.mock.timers.tick(500);
+    const result = await pending;
+    assert.equal(tableCalls, 1);
+    assert.equal(result.passed, false);
+    assert.equal(result.killConfirmed, false);
+    assert.equal(result.killUnverified, true);
+    t.mock.timers.reset();
+  }
+
+  // 3. runner: exit-with-held-pipes + drained job + unreadable table => unconfirmed (no auto-restore).
+  {
+    const base = await mkdtemp(path.join(os.tmpdir(), "runner-unreadable-pipes-"));
+    t.after(() => rm(base, { recursive: true, force: true, maxRetries: 5 }));
+    const root = path.join(base, "repo"), snapshots = path.join(base, "snapshots"), locks = path.join(base, "locks");
+    await mkdir(root);
+    await writeFile(path.join(root, "a.txt"), "baseline");
+    const prevSnapDir = process.env.CLINE_MCP_SNAPSHOT_DIR;
+    process.env.CLINE_MCP_SNAPSHOT_DIR = snapshots;
+    t.after(() => { if (prevSnapDir === undefined) delete process.env.CLINE_MCP_SNAPSHOT_DIR; else process.env.CLINE_MCP_SNAPSHOT_DIR = prevSnapDir; });
+    const gitStub = t.mock.method(childProcess, "spawn", (_file: string, args: string[]) => {
+      const proc = child();
+      const cmd = args[2], arg = args[3];
+      let out = "";
+      if (cmd === "rev-parse") out = arg === "--show-toplevel" ? root : arg === "--git-path" ? ".git/info/exclude" : "a".repeat(40);
+      else if (cmd === "ls-files" && arg === "--stage") out = "";
+      else if (cmd === "ls-files" && args.includes("--ignored")) out = "";
+      else if (cmd === "ls-files") out = "a.txt\0";
+      queueMicrotask(() => { proc.stdout.end(out); proc.emit("close", 0); });
+      return proc;
+    });
+    syncBuiltinESMExports();
+    t.after(() => { gitStub.mock.restore(); syncBuiltinESMExports(); });
+
+    let tableCalls = 0;
+    await assert.rejects(
+      applyClineEdits(
+        { prompt: "Edit", cwd: root, provider: "p", model: "m", codeMap: false, verify: { none: true, reason: "Unreadable table pipesHeldOpen fixture" } },
+        undefined,
+        {
+          checkoutLockDirectory: locks, recordStatus: false, respectQuotaLock: false,
+          deps: {
+            platform: "win32", entryPath: "mock/cline", providerSettingsPath: path.join(base, "providers.json"),
+            access: async () => {}, acquireSettingsMutex: async () => async () => {},
+            totalBudgetMs: 2_000, timeoutMs: 2_000, closeGracePeriodMs: 25, settlementDeadlineMs: 200,
+            createWindowsJob: async () => drainedJob(),
+            killTree: () => {},
+            confirmTreeDead: async () => { tableCalls++; return { confirmed: false, alive: [], unverified: true }; },
+            spawn: (() => {
+              const proc = Object.assign(new childProcess.ChildProcess(), { pid: 4243, stdout: new PassThrough(), stderr: new PassThrough() });
+              void writeFile(path.join(root, "a.txt"), "edited-unreadable").then(() => {
+                (proc.stdout as PassThrough).write('{"type":"run_result","finishReason":"completed","text":"done"}\n');
+                (proc as any).exitCode = 0;
+                proc.emit("exit", 0, null);
+              });
+              return proc;
+            }) as typeof childProcess.spawn
+          }
+        }
+      ),
+      (err: any) => {
+        assert.equal(err.verification?.restored, false);
+        assert.equal(err.evidence?.killUnverified, true);
+        assert.ok(typeof err.evidence?.snapshotDirectory === "string" && existsSync(err.evidence.snapshotDirectory));
+        return true;
+      }
+    );
+    assert.equal(tableCalls, 1);
+    assert.equal(await readFile(path.join(root, "a.txt"), "utf8"), "edited-unreadable");
+  }
+});
+
+test("jobobject close() resolves false if any queued root was never sent or assigned", { skip: process.platform !== "win32" }, async t => {
+  // Ensure helper binary exists once, then stub owner.exe so we can control protocol replies deterministically.
+  const warmup = await createWindowsJob(15_000);
+  await warmup?.close();
+
+  const makeFakeRoot = (pid: number) => Object.assign(new childProcess.ChildProcess(), { pid, exitCode: null as number | null, signalCode: null as NodeJS.Signals | null });
+
+  const runOwnerScenario = async (scenario: "queued-exited" | "first-skipped-second-assigned" | "assign-already-dead" | "all-assigned") => {
+    let helper!: ReturnType<typeof child>;
+    let receivedLines: string[] = [];
+    const stub = t.mock.method(childProcess, "spawn", ((file: string) => {
+      assert.equal(path.basename(file), "owner.exe");
+      const proc = child();
+      helper = Object.assign(proc, { unref: () => {}, ref: () => {} });
+      let buf = "";
+      let stdinEnded = false;
+      const emitDrainedAndExit = () => {
+        proc.stdout.write("drained\n");
+        proc.stdout.end();
+        (proc as any).exitCode = 0;
+        proc.emit("exit", 0, null);
+        proc.emit("close", 0, null);
+      };
+      proc.stdin.on("data", (chunk: Buffer) => {
+        buf += chunk.toString("utf8");
+        const parts = buf.split(/\r?\n/);
+        buf = parts.pop()!;
+        for (const line of parts) {
+          if (!line) continue;
+          receivedLines.push(line);
+          if (/^\d+$/.test(line)) {
+            if (scenario === "queued-exited" && receivedLines.length === 1) {
+              // Delay replying to root1 until the caller queues root2 and root2 exits.
+              continue;
+            }
+            proc.stdout.write("opened\n");
+          } else if (line === "assign" || line === "skip") {
+            const reply = (scenario === "first-skipped-second-assigned" && receivedLines.filter(l => l === "assign" || l === "skip").length === 1)
+              ? "skipped" : (line === "assign" ? "assigned" : "skipped");
+            proc.stdout.write(reply + "\n");
+          }
+        }
+      });
+      proc.stdin.on("end", () => {
+        stdinEnded = true;
+        emitDrainedAndExit();
+      });
+      queueMicrotask(() => proc.stdout.write("ready\n"));
+      return Object.assign(helper, { emitOpened: () => proc.stdout.write("opened\n"), stdinEnded: () => stdinEnded });
+    }) as unknown as typeof childProcess.spawn);
+    syncBuiltinESMExports();
+    try {
+      const job = await createWindowsJob(15_000);
+      assert.ok(job);
+      if (scenario === "queued-exited") {
+        const root1 = makeFakeRoot(1001);
+        const root2 = makeFakeRoot(1002);
+        job.assign(root1);
+        job.assign(root2); // stays in `queued` while root1 is pending
+        (root2 as any).exitCode = 0; // root2 exits before sendNext() can send it
+        (helper as any).emitOpened();
+        const confirmed = await job.close();
+        assert.equal(confirmed, false, "queued root2 was never sent/assigned: close() must resolve false");
+        assert.equal(job.confirmed, false);
+      } else if (scenario === "first-skipped-second-assigned") {
+        const root1 = makeFakeRoot(2001);
+        const root2 = makeFakeRoot(2002);
+        job.assign(root1);
+        await new Promise(r => setTimeout(r, 10));
+        job.assign(root2);
+        await new Promise(r => setTimeout(r, 10));
+        assert.equal(job.assigned, true);
+        const confirmed = await job.close();
+        assert.equal(confirmed, false, "root1 was skipped even though root2 succeeded: close() must resolve false");
+        assert.equal(job.confirmed, false);
+      } else if (scenario === "assign-already-dead") {
+        const root1 = makeFakeRoot(3001);
+        const deadRoot2 = makeFakeRoot(3002);
+        (deadRoot2 as any).exitCode = 0;
+        job.assign(root1);
+        await new Promise(r => setTimeout(r, 10));
+        assert.equal(job.assigned, true);
+        job.assign(deadRoot2);
+        const confirmed = await job.close();
+        assert.equal(confirmed, false, "deadRoot2 was never assigned: close() must resolve false");
+        assert.equal(job.confirmed, false);
+      } else {
+        const root1 = makeFakeRoot(4001);
+        const root2 = makeFakeRoot(4002);
+        job.assign(root1);
+        job.assign(root2);
+        const confirmed = await job.close();
+        assert.equal(confirmed, true, "all queued roots assigned and drained: close() must resolve true");
+        assert.equal(job.confirmed, true);
+      }
+    } finally {
+      stub.mock.restore();
+      syncBuiltinESMExports();
+    }
+  };
+
+  await runOwnerScenario("queued-exited");
+  await runOwnerScenario("first-skipped-second-assigned");
+  await runOwnerScenario("assign-already-dead");
+  await runOwnerScenario("all-assigned");
+});
+
+test("sync applyClineEdits after a partial restore keeps original failure reason (budget/cancel/verify) and notes incomplete restore", async t => {
+  const base = await mkdtemp(path.join(os.tmpdir(), "sync-partial-restore-msg-"));
+  t.after(() => rm(base, { recursive: true, force: true, maxRetries: 5 }));
+  const root = path.join(base, "repo"), snapshots = path.join(base, "snapshots"), locks = path.join(base, "locks");
+  await mkdir(root);
+  const prevSnapDir = process.env.CLINE_MCP_SNAPSHOT_DIR;
+  process.env.CLINE_MCP_SNAPSHOT_DIR = snapshots;
+  t.after(() => { if (prevSnapDir === undefined) delete process.env.CLINE_MCP_SNAPSHOT_DIR; else process.env.CLINE_MCP_SNAPSHOT_DIR = prevSnapDir; });
+
+  const breakBForPartialRestore = async () => {
+    await writeFile(path.join(root, "a.txt"), "edited");
+    await rm(path.join(root, "b.txt"), { recursive: true, force: true });
+    await mkdir(path.join(root, "b.txt"));
+    await writeFile(path.join(root, "b.txt", "nested.txt"), "blocks rmdir so restoreEntry fails");
+  };
+
+  const combinedStub = t.mock.method(childProcess, "spawn", (file: string, args: string[]) => {
+    const proc = child();
+    if (file === process.execPath) {
+      queueMicrotask(() => { (proc as any).exitCode = 1; proc.emit("exit", 1, null); proc.emit("close", 1, null); });
+      return Object.assign(proc, { pid: 5555 });
+    }
+    if (path.basename(file) === "owner.exe") {
+      let buf = "";
+      proc.stdin.on("data", (chunk: Buffer) => {
+        buf += chunk.toString("utf8");
+        const parts = buf.split(/\r?\n/);
+        buf = parts.pop()!;
+        for (const line of parts) {
+          if (/^\d+$/.test(line)) proc.stdout.write("opened\n");
+          else if (line === "assign") proc.stdout.write("assigned\n");
+          else if (line === "skip") proc.stdout.write("skipped\n");
+        }
+      });
+      proc.stdin.on("end", () => {
+        proc.stdout.write("drained\n");
+        proc.stdout.end();
+        (proc as any).exitCode = 0;
+        proc.emit("exit", 0, null);
+        proc.emit("close", 0, null);
+      });
+      queueMicrotask(() => proc.stdout.write("ready\n"));
+      return Object.assign(proc, { unref: () => {}, ref: () => {} });
+    }
+    const cmd = args[2], arg = args[3];
+    let out = "";
+    if (cmd === "rev-parse") out = arg === "--show-toplevel" ? root : arg === "--git-path" ? ".git/info/exclude" : "a".repeat(40);
+    else if (cmd === "ls-files" && arg === "--stage") out = "";
+    else if (cmd === "ls-files" && args.includes("--ignored")) out = "";
+    else if (cmd === "ls-files") out = "a.txt\0b.txt\0";
+    else if (cmd === "check-ignore") out = "";
+    queueMicrotask(() => { proc.stdout.end(out); proc.emit("close", 0); });
+    return proc;
+  });
+  syncBuiltinESMExports();
+  t.after(() => { combinedStub.mock.restore(); syncBuiltinESMExports(); });
+
+  for (const mode of ["verify", "budget", "cancel"] as const) {
+    await rm(path.join(root, "b.txt"), { recursive: true, force: true });
+    await writeFile(path.join(root, "a.txt"), "base-a");
+    await writeFile(path.join(root, "b.txt"), "base-b");
+    const controller = new AbortController();
+    const verifySpec = mode === "verify"
+      ? { command: process.execPath, args: ["-e", "process.exit(1)"] }
+      : { none: true as const, reason: `Partial restore ${mode} fixture` };
+
+    await assert.rejects(
+      applyClineEdits(
+        { prompt: "Edit", cwd: root, provider: "p", model: "m", codeMap: false, maxFixRuns: 0, verify: verifySpec },
+        controller.signal,
+        {
+          checkoutLockDirectory: locks, recordStatus: false, respectQuotaLock: false,
+          deps: {
+            platform: "win32", entryPath: "mock/cline", providerSettingsPath: path.join(base, "providers.json"),
+            access: async () => {}, acquireSettingsMutex: async () => async () => {},
+            totalBudgetMs: mode === "budget" ? 40 : 10_000,
+            timeoutMs: mode === "budget" ? 40 : 10_000,
+            settlementDeadlineMs: 100,
+            createWindowsJob: async () => undefined,
+            killTree: () => {},
+            confirmTreeDead: async () => ({ confirmed: true, alive: [] }),
+            spawn: (() => {
+              const proc = Object.assign(child(), { pid: 4444 });
+              void breakBForPartialRestore().then(() => {
+                if (mode === "verify") {
+                  proc.stdout.write('{"type":"run_result","finishReason":"completed","text":"done"}\n');
+                  (proc as any).exitCode = 0;
+                  proc.emit("exit", 0, null);
+                  proc.emit("close", 0, null);
+                } else if (mode === "cancel") {
+                  controller.abort();
+                  (proc as any).exitCode = 1;
+                  proc.emit("exit", 1, null);
+                  proc.emit("close", 1, null);
+                }
+                // For mode === "budget", leave proc running until timeoutMs fires.
+              });
+              return proc;
+            }) as unknown as typeof childProcess.spawn
+          }
+        }
+      ),
+      (err: unknown) => {
+        assert.ok(err instanceof ClineRunError, `expected ClineRunError, got ${String(err)}`);
+        assert.doesNotMatch(err.message, /Edit failed:\s*cline_error/i, `${mode}: must not degrade to generic cline_error: ${err.message}`);
+        assert.match(err.message, /incomplete/i, `${mode}: must mention incomplete restore: ${err.message}`);
+        if (mode === "verify") assert.match(err.message, /verif/i, `${mode}: must preserve verify reason: ${err.message}`);
+        if (mode === "budget") assert.match(err.message, /timed out|budget/i, `${mode}: must preserve budget/timeout reason: ${err.message}`);
+        if (mode === "cancel") {
+          assert.equal(err.kind, "cancelled");
+          assert.match(err.message, /cancel/i, `${mode}: must preserve cancel reason: ${err.message}`);
+        }
+        const report = (err as any).evidence?.restore as { failed?: Array<{ path: string }> } | undefined;
+        assert.ok(report?.failed?.some(f => f.path === "b.txt"), `${mode}: evidence.restore must list b.txt`);
+        return true;
+      }
+    );
+  }
+});
+
+test("snapshot finishPartial adds an explicit failed entry when the deadline hits before the created-files scan ran, even with non-empty manifest", async t => {
+  const dir = await mkdtemp(path.join(os.tmpdir(), "snap-no-created-scan-"));
+  t.after(() => rm(dir, { recursive: true, force: true, maxRetries: 5 }));
+  const handle = {
+    checkoutRoot: dir,
+    directory: path.join(dir, "store"),
+    manifest: [{ path: "a.txt", size: 4, sha256: "0".repeat(64) }]
+  };
+  let lsFilesStarted!: () => void;
+  const lsFilesRunning = new Promise<void>(resolve => { lsFilesStarted = resolve; });
+  mockSpawn(t, (_file, args) => {
+    const proc = child();
+    if (args.includes("--show-toplevel")) {
+      queueMicrotask(() => { proc.stdout.end(dir); proc.emit("close", 0); });
+    } else {
+      // Stall during the created-files scan (ls-files --stage / regular) until RESTORE_BUDGET_MS expires.
+      lsFilesStarted();
+    }
+    return proc;
+  });
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  const restoring = restoreSnapshot(handle);
+  await lsFilesRunning;
+  t.mock.timers.tick(RESTORE_BUDGET_MS);
+  const report = await restoring;
+  assert.ok(
+    report.failed.some(f => f.path === "a.txt" && /not attempted/i.test(f.error)),
+    `manifest file should be marked not attempted: ${JSON.stringify(report.failed)}`
+  );
+  assert.ok(
+    report.failed.some(f => /created-files scan did not run/i.test(f.error)),
+    `must include explicit failed entry saying created-files scan did not run: ${JSON.stringify(report.failed)}`
+  );
 });
