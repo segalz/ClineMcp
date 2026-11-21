@@ -439,6 +439,8 @@ export interface Task {
 export interface LogRunHint {
   ok: boolean; error_kind?: "timeout" | "quota" | "crash"; retry_after_s?: number; error_text?: string; duration_s: number;
   input_tokens?: number; output_tokens?: number; cached_input_tokens?: number; reasoning_tokens?: number;
+  /** True for a checked edit (mode "edits"); model-picker renews write freshness only from passing ones. */
+  write?: boolean;
 }
 
 const HINT_TOKEN_FIELDS: Array<[keyof LogRunHint, string[]]> = [
@@ -533,7 +535,8 @@ export function hintFor(task: Task): LogRunHint | null {
   if (tokens.input_tokens === undefined && typeof spent === "number" && Number.isSafeInteger(spent) && spent > 0) {
     tokens.input_tokens = spent;
   }
-  return { ...hint, ...tokens };
+  // A checked edit tells model-picker so a passing one keeps the model's write trust fresh (plan P1).
+  return { ...hint, ...tokens, ...(task.mode === "edits" ? { write: true } : {}) };
 }
 
 function outcomeHint(task: Task): LogRunHint | null {

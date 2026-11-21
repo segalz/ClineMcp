@@ -446,6 +446,9 @@ test("tasks: hintFor carries the run's token counts in log_run field names", () 
   const bare = { ...base, state: "done", result: { text: "ok", durationMs: 5000, usage: { inputTokens: -1, outputTokens: 1.5 } } } as unknown as Task;
   assert.deepEqual(hintFor(bare), { ok: true, duration_s: 5 });
   assert.deepEqual(hintTokens(undefined), {});
+  // A checked edit is marked write so model-picker can renew write freshness (plan P1); ask runs are not.
+  const edit = { ...base, mode: "edits", state: "done", result: { text: "ok", durationMs: 5000 } } as unknown as Task;
+  assert.deepEqual(hintFor(edit), { ok: true, duration_s: 5, write: true });
   // A provider that reports the cache read apart from the input: the full input is input + read.
   assert.deepEqual(hintTokens({ inputTokens: 1000, cacheReadTokens: 8000, outputTokens: 50 }),
     { input_tokens: 9000, cached_input_tokens: 8000, output_tokens: 50 });
