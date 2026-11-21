@@ -153,7 +153,33 @@ All work is on branch `fix/after-bridges` in each repo. That branch is stacked o
   - Left as documented limits:
     - on an unknown Codex id, `log_run` may run `codex login status` and the app-server once (up to about 40 s, error path only);
     - two processes writing `agy-discovery.json` can race (the last writer wins).
-- **Next:** the Codex re-check of P2, then P1 (needs the owner's answer to open question 2), then P4.
+- **2026-11-21, P2 done.** The Codex re-check found one more issue: the probe's own time had been overwritten by the file's. Fixed by Claude in model-picker 6a3221e (`discovered_at`).
+- **2026-11-21, W (new): waits that follow the budget, in both bridges. Done.**
+  - **Cause.** The owner asked that the 16 load failures be fixed rather than noted.
+    - Under load, real bridge code gave up on work that was only slow:
+      - a snapshot Git call had a fixed 10 s cap;
+      - the Windows process-table read had 4 s, so kills stayed unconfirmed;
+      - the code map had 1.5 s.
+    - The test helper `git-test-serial` also polled every 25 ms. That started about 160 PowerShell processes a second and choked the machine.
+  - **Fix.** Every internal wait is `min(cap, remaining budget)`, and a cancel stops promptly. A timed-out or cancelled run or check settles within its budget plus 4 s, or plus 16 s when the kill is confirmed through the process table.
+  - **Job Object.** The job reports when it is empty (ActiveProcesses == 0). An empty job alone is not proof: the process table is still checked.
+  - **Restore.**
+    - An unconfirmed kill never triggers an automatic restore.
+    - A restore that hits its 90 s cap returns a partial report and keeps the snapshot.
+  - **Commits.**
+    - ClineMcp b067f22, 2f78bf0, 69185cc, b93932d. Started by Codex (its quota ran out), finished by Neon xhigh, three Opus review rounds, accepted.
+    - openCodeHelperMcp 48f9c24, 4070501, 0c23ead: Neon mirror, Opus accepted, plus the catalog-budget fix by Claude.
+  - **Suites at node's default concurrency.**
+    - Cline: 559 pass, 0 fail, in 9.5 min (was 19 failures in 19 min).
+    - OpenCode: 328 pass, 0 fail.
+  - **Accepted limits:**
+    - a clean check whose pipes closed while a job was active skips the table scan (as before);
+    - the hub stop uses the job drain when the list cannot be read;
+    - edit cancel can take up to the restore budget.
+  - **Later (layers 1 and 3 from the owner's question).**
+    - A machine-wide queue for heavy bridge runs.
+    - A "busy" status that `pick` reads.
+- **Next:** P1 (needs the owner's answer to open question 2), then P4 (Codex), then A8 merge, rebuild, restart, and the live proof (pick → bridge → log_run on both bridges).
 - **D3 finding, 2026-11-21.**
   - The full ClineMcp suite at node's default concurrency (15 files at once on this machine) failed 16 tests twice. Every failing file passes alone, and the whole suite passes with `--test-concurrency=4`.
   - From now on, run it as `node --test --test-concurrency=4 dist/test/*.test.js`.
