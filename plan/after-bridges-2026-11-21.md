@@ -44,7 +44,7 @@ comes first, or every later measurement and rule change is wasted.
 | A2 | "TEMPORARY: Codex is off" | CLAUDE.md "Delegation routing". Codex was used all through the fix plan with the owner's OK. Owner decides (its weekly quota is at 4%). |
 | A3 | Stale model names | CLAUDE.md example `opencode/glm-5.3-flash-free`; CLAUDE.md lines ~116-121 and ~281-291 name `gemini-3.8-flash`, Argon and `grok-4.6` as defaults; `stage14-plan.md:44` uses the retired `cline-free/solar-mini4`. |
 | A4 | Stale `verify` rule | CLAUDE.md: "npm/npx work. On OpenCode, other .cmd/.bat commands are refused". Both bridges now resolve pnpm/yarn/npx and `node_modules/.bin` tools (bare or explicit path), refuse a missing command before any model use, and run the check in the requested folder. |
-| A5 | New behaviours callers must know | Commit point (passing check plus identity re-read; a cancel before it restores); after an unconfirmed kill `retry` is refused (restore/keep), snapshot kept; first run reserves the check's time (verify timeout + 10 s); async edits return `gitDiff`/`status`/`headAfter` (may be absent); `createdFiles` warnings; clean tracked symlinks/submodules allowed; `analyze_code` moves to the next model on a loop trip; warm OpenCode server for repeated reads; progress heartbeat every 15 s. Also `antigravity_ask(plan=True)` for read-only AGY. |
+| A5 | New behaviours callers must know (CLAUDE.md and `SUPERVISOR.md`) | Commit point (passing check plus identity re-read; a cancel before it restores); after an unconfirmed kill `retry` is refused (restore/keep), snapshot kept; first run reserves the check's time (verify timeout + 10 s); async edits return `gitDiff`/`status`/`headAfter` (may be absent); `createdFiles` warnings; clean tracked symlinks/submodules allowed; `analyze_code` moves to the next model on a loop trip; warm OpenCode server for repeated reads; progress heartbeat every 15 s. Also `antigravity_ask(plan=True)` for read-only AGY. |
 | A6 | Contradictions in rules and memory | `bridge-failures-are-bugs.md` ("stop and diagnose before fallback") vs CLAUDE.md's fallback route; `free-bridges-limits.md` (`keepOnFailure=true`, glm as the reliable writer) vs CLAUDE.md (default false); `project-next-steps.md` "Codex writes, AGY reviews"; `free-model-providers.md` cites closed open item 6; CLAUDE.md says `claude-self` cannot be probed (it is probed now, `probes.py:1830-1844`) and says to use the old `fallback` after a quota failure (conflicts with `server.py:126`); `SUPERVISOR.md:53` says `codex_ask` has no `effort`. Resolve each. |
 | A7 | Memory index | `project-next-steps.md` and `MEMORY.md` point to this plan. |
 | A8 | Finish the documentation branches, then merge, rebuild, restart | Before merging: ClineMcp `168beed` misses `cline_start`; openCodeHelperMcp `9856907` keeps the retired GLM in `ANALYZE_DESCRIPTION`; model-picker `68c411a` put `analyze_code` guidance into `write_note`, which `pick` shows only for writes (move it); say "commit point = passing check plus identity re-read". Then merge to `main` in all three repos, switch back to `main`, `npm run build` (ClineMcp runs `dist/`), restart. |
@@ -96,6 +96,18 @@ comes first, or every later measurement and rule change is wasted.
 4. **B1, B2, B3, B4**: re-seed, then check on a cold server that `pick` sends S/M writes to the free bridges and `log_run` accepts every id with tokens.
 5. **C1, C3, C4**: one real task per bridge; refresh `free-bridges-limits.md`.
 6. **Later**: P8/B6, C2, D1-D6.
+
+## Who fixes what (proposal, waiting for the owner's OK)
+
+Quota on 2026-11-21 decides it: Gemini and Argon are full, while Codex (4%) and Claude (3%) are kept for the final check only.
+
+| Part | Writer | Reviewer | How |
+|---|---|---|---|
+| P1-P7 (model-picker and bridge code) | AGY `gemini-4-neon-xhigh`, backup `gemini-4-hydrogen-xhigh` | The free bridges (`analyze_code` on Nvidia models, `ask_cline_workspace`): another family, and a real-use test of the bridges | One scoped step at a time, each with a failing test first; on a work branch per repo, never `main`; the model-picker suite (148 tests) must pass |
+| A8 (docs branches) | Claude (short text fixes) | Same free-bridge review | Merge, rebuild and restart only with the owner's OK |
+| A1-A7 (rules and memory) | Claude drafts | The owner approves CLAUDE.md | Memory files are updated directly; CLAUDE.md only after approval |
+| B1-B4, C1-C4 | Claude runs and measures | - | After P and A8; seeding only on demand |
+| Final check of P | Opus or Codex, if quota allows | - | One pass before merging |
 
 ## Open questions for the owner
 
