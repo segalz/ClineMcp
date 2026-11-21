@@ -196,7 +196,11 @@ All work is on branch `fix/after-bridges` in each repo. That branch is stacked o
     - `apply_opencode_edits` with `laguna`: 44.4 s, 46k tokens.
   - All four runs were logged with tokens, and the edits with `write=true`.
   - P1 live: `laguna`'s write score went from 0.613 to 1.047 (state from unknown to available) after its passing edit was logged.
-- **Next:** owner approval for the merge to `main` (three repos) and for the CLAUDE.md changes; then B1 re-seed, C1 real-size task, D items.
+- **2026-11-21, owner approved both.**
+  - `main` was fast-forwarded to `fix/after-bridges` and pushed in all three repos: ClineMcp 4ff4c2e, openCodeHelperMcp 8f7c8b3, model-picker 918281a. This is the code that ran the live check.
+  - CLAUDE.md has the 9 changes from `plan/claude-md-changes-2026-11-21.md` (backup `CLAUDE.md.bak-2026-11-21`).
+  - At the owner's request, the same changes went into Codex's `~/.codex/AGENTS.md` (backup `AGENTS.md.bak-2026-11-21`, synced 2026-11-21).
+- **Next (not started):** B1 re-seed, C1 real-size task, C3/C4, the D items, and later layers 1 and 3 (machine-wide queue, "busy" status for `pick`).
 - **D3 finding, 2026-11-21.**
   - The full ClineMcp suite at node's default concurrency (15 files at once on this machine) failed 16 tests twice. Every failing file passes alone, and the whole suite passes with `--test-concurrency=4`.
   - From now on, run it as `node --test --test-concurrency=4 dist/test/*.test.js`.
