@@ -142,6 +142,18 @@ All work is on branch `fix/after-bridges` in each repo. That branch is stacked o
     - A failed ask/workspace run reports the guard's input count.
   - Reviewed by Neon xhigh: "accept with fixes"; the fixes are applied.
   - CLAUDE.md token line: A-phase, owner approval.
+- **2026-11-21, P6 done** (model-picker 7848f8b, b9a5443, 73f79c4).
+  - Written by Neon; Codex review "accept with fixes"; the fixes were made by Claude and re-checked by Codex. Suite: 3705 passed.
+  - Seeding: an infrastructure failure leaves `write_ok` as it was. A real failing check is skill evidence, even when its output mentions 429.
+  - Learning: a model's seed runs count only within 24 h of its latest seed session.
+  - `skill_score` reads in one SQLite snapshot; a new seed index exists.
+- **2026-11-21, P2 written, final re-check pending** (model-picker 635b8b6, 701745d).
+  - Written by Neon. Codex review "accept with fixes"; Neon fixed findings 1, 2 and the low finding. Suite: 3726 passed.
+  - The Codex re-check of 701745d was cut off by Codex's usage limit. Owner rule: stop until the owner resets Codex.
+  - Left as documented limits:
+    - on an unknown Codex id, `log_run` may run `codex login status` and the app-server once (up to about 40 s, error path only);
+    - two processes writing `agy-discovery.json` can race (the last writer wins).
+- **Next:** the Codex re-check of P2, then P1 (needs the owner's answer to open question 2), then P4.
 - **D3 finding, 2026-11-21.**
   - The full ClineMcp suite at node's default concurrency (15 files at once on this machine) failed 16 tests twice. Every failing file passes alone, and the whole suite passes with `--test-concurrency=4`.
   - From now on, run it as `node --test --test-concurrency=4 dist/test/*.test.js`.
