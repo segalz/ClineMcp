@@ -346,7 +346,15 @@ export class FinalCheckLifecycle {
           }
         }
         if (signal.aborted && this.phase !== "done") {
-          this.cancelled = true; this.error = new ClineRunError("cancelled", "The edit lifecycle was cancelled."); await this.restore();
+          const cancelError = new ClineRunError("cancelled", "The edit lifecycle was cancelled.");
+          if (this.killUnconfirmed) {
+            // Never restore automatically while a surviving process may still write: end waiting with
+            // unconfirmed-kill evidence so the caller can decide (retry refused; restore/keep offered).
+            this.question = undefined;
+            this.wait("cline_error", cancelError);
+          } else {
+            this.cancelled = true; this.error = cancelError; await this.restore();
+          }
         } else if (pendingWait) this.wait(pendingWait.reason, pendingWait.error);
       } finally {
         cleanupBudget.dispose();

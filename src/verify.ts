@@ -232,10 +232,20 @@ export async function runVerification(spec: VerificationCommand, cwd: string, si
       let pipesHeldOpen = false;
       let exitedAt: number | undefined;
       const rootAlive = () => exitedAt === undefined && child.exitCode === null && child.signalCode === null;
-      const confirmKill = (pid: number) => untilAborted((deps.confirmTreeDead ?? confirmTreeDead)(pid, {
-        capMs: Math.min(TREE_KILL_CONFIRM_MS, budget.remaining()), now, signal: budget.signal,
+      const confirmWithTable = (pid: number) => untilAborted((deps.confirmTreeDead ?? confirmTreeDead)(pid, {
+        capMs: Math.min(TREE_KILL_CONFIRM_MS, budget.confirmRemaining()), now, signal: budget.confirmSignal,
         killRoot: () => defaultKillTree(pid), isRootAlive: rootAlive, rootStartedMs, rootExitedMs: () => exitedAt
-      }), budget.signal).catch(() => ({ confirmed: false, alive: rootAlive() ? [pid] : [], unverified: true }));
+      }), budget.confirmSignal).catch(() => ({ confirmed: false, alive: rootAlive() ? [pid] : [], unverified: true }));
+      const confirmKill = (pid: number): Promise<TreeKillResult> => {
+        if (job) {
+          return (async () => {
+            const confirmed = (await job.close(budget.remaining(), budget.signal)) === true || job.confirmed === true;
+            if (confirmed) return { confirmed: true, alive: [] };
+            return confirmWithTable(pid);
+          })();
+        }
+        return confirmWithTable(pid);
+      };
       const destroyPipes = () => { child.stdout.destroy(); child.stderr.destroy(); };
       const forceStop = () => {
         if (rootAlive()) { try { child.kill("SIGKILL"); } catch { /* confirmation reports the failure */ } }
@@ -248,12 +258,12 @@ export async function runVerification(spec: VerificationCommand, cwd: string, si
         clearTimeout(timer);
         clearTimeout(exitGrace);
         if (pid) confirm = confirmKill(pid);
+        else void closeJob();
         // Settle even if an inherited pipe or OS kill failure prevents a close event.
         killDeadline = setTimeout(forceStop, Math.min(KILL_SETTLE_MS, budget.remaining()));
         budget.signal.addEventListener("abort", forceStop, { once: true });
         // After exit the root PID may already belong to another process.
         if (pid && rootAlive()) defaultKillTree(pid);
-        void closeJob();
       };
       const timer = setTimeout(() => { timedOut = true; stop(); }, remaining());
       const abort = () => {
@@ -300,16 +310,17 @@ export async function runVerification(spec: VerificationCommand, cwd: string, si
         if (done || stopped || !pid) return;
         clearTimeout(timer);
         // A child outside the job can keep the pipes open after the root exits.
+        // Give exitGrace its full window inside the settle margin even if the check exited right at its work deadline.
         exitGrace = setTimeout(() => {
           pipesHeldOpen = true;
           confirm = confirmKill(pid);
           finish(code, sig);
           destroyPipes();
-        }, Math.min(EXIT_GRACE_MS, remaining()));
+        }, Math.min(EXIT_GRACE_MS, budget.remaining()));
       });
       child.once("close", (code, sig) => {
         // Closed pipes do not prove all descendants exited. Without an assigned job, await the tree check.
-        if (!done && !confirm && !jobWasAssigned && !job?.assigned && pid) confirm = confirmKill(pid);
+        if (!done && !stopped && !confirm && !jobWasAssigned && !job?.assigned && pid) confirm = confirmWithTable(pid);
         if (stopped) finish(null, "SIGKILL");
         else finish(code, sig);
       });

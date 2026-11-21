@@ -178,17 +178,24 @@ export async function confirmTreeDead(rootPid: number, opts: ConfirmTreeDeadOpti
   let tableRead = false;
   let snapshotDone = false;
   const pollReserve = Math.min(pollMs, capMs / 10);
+  const twoFullReads = capMs - pollReserve >= 2 * PROCESS_TABLE_TIMEOUT_MS;
   const readTable = async () => {
     for (let attempt = 0; attempt < 2 && !tableRead; attempt++) {
-      // Share a shortened caller cap between the remaining attempts, too.
-      const readMs = Math.min(PROCESS_TABLE_TIMEOUT_MS, Math.floor((remaining() - pollReserve) / (2 - attempt)));
-      if (readMs <= 0) break;
+      const available = Math.floor(remaining() - pollReserve);
+      if (available <= 0) break;
+      // Never split a cap smaller than two full reads into two halved reads: give the read everything left.
+      const readMs = Math.min(PROCESS_TABLE_TIMEOUT_MS, available);
+      const startedAt = now();
       const table = await listTable(readMs, opts.signal).catch(() => null);
-      if (!table) continue;
-      tableRead = true;
-      for (const pid of treeDescendants(rootPid, table, { rootStartedMs: opts.rootStartedMs, rootExitedMs: opts.rootExitedMs?.() })) {
-        known.add(pid);
+      if (table) {
+        tableRead = true;
+        for (const pid of treeDescendants(rootPid, table, { rootStartedMs: opts.rootStartedMs, rootExitedMs: opts.rootExitedMs?.() })) {
+          known.add(pid);
+        }
+        break;
       }
+      // Without room for two full reads, retry only when the first read failed fast (not on timeout).
+      if (!twoFullReads && now() - startedAt >= readMs) break;
     }
     snapshotDone = true;
   };

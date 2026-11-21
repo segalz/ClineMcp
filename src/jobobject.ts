@@ -64,13 +64,18 @@ class JobOwner {
                 }
                 Console.WriteLine(assigned ? "assigned" : "skipped");
             }
+            bool confirmed = false;
             if (TerminateJobObject(job, 1)) {
                 Accounting info;
                 int started = Environment.TickCount;
-                while (unchecked(Environment.TickCount - started) < 2000
-                        && QueryInformationJobObject(job, 1, out info, Marshal.SizeOf(typeof(Accounting)), IntPtr.Zero)
-                        && info.ActiveProcesses != 0) Thread.Sleep(5);
+                while (QueryInformationJobObject(job, 1, out info, Marshal.SizeOf(typeof(Accounting)), IntPtr.Zero)) {
+                    if (info.ActiveProcesses == 0) { confirmed = true; break; }
+                    if (unchecked(Environment.TickCount - started) >= 2000) break;
+                    Thread.Sleep(5);
+                }
             }
+            Console.WriteLine(confirmed ? "drained" : "active");
+            Console.Out.Flush();
         } finally { CloseHandle(job); }
     }
 }`;
@@ -107,8 +112,11 @@ async function buildHelper(): Promise<string> {
 export interface WindowsJob {
   readonly alive: boolean;
   readonly assigned: boolean;
+  /** True once `close()` terminated an assigned job and QueryInformationJobObject reported ActiveProcesses == 0. */
+  readonly confirmed?: boolean;
   assign(child: ChildProcess): void;
-  close(budgetMs?: number, signal?: AbortSignal): Promise<void>;
+  /** Closes the job (terminating all members). Resolves true when an assigned job drained to 0 active processes. */
+  close(budgetMs?: number, signal?: AbortSignal): Promise<boolean | void>;
 }
 
 let executable: Promise<string | undefined> | undefined;
@@ -131,24 +139,36 @@ function startOwner(file: string) {
   owners.add(child);
   let ready!: (ok: boolean) => void;
   const started = new Promise<boolean>(resolve => { ready = resolve; });
-  let finish!: () => void;
-  const finished = new Promise<void>(resolve => { finish = resolve; });
+  let finish!: (confirmed: boolean) => void;
+  const finished = new Promise<boolean>(resolve => { finish = resolve; });
   let pending: ChildProcess | undefined;
   const queued = [] as ChildProcess[];
   let assigned = false;
+  let lastAssigned = false;
+  let drained = false;
+  let confirmed = false;
   let closing = false;
+  let exited = false;
   let ended = false;
   let timer: NodeJS.Timeout | undefined;
-  const kill = () => { try { child.kill(); } catch { /* already gone */ } };
+  const kill = () => {
+    try {
+      if (!ended && child.exitCode === null && child.signalCode === null) child.ref();
+      child.kill();
+    } catch {
+      try { child.unref(); } catch { /* already gone */ }
+    }
+  };
   let closeSignal: AbortSignal | undefined;
   let closeDeadline = Infinity;
   const forceClose = () => {
     closeSignal?.removeEventListener("abort", forceClose);
     clearTimeout(timer);
     kill();
-    finish();
+    finish(confirmed);
   };
   const end = () => {
+    exited = true;
     ended = true;
     assigned = false;
     pending = undefined;
@@ -156,11 +176,15 @@ function startOwner(file: string) {
     owners.delete(child);
     closeSignal?.removeEventListener("abort", forceClose);
     clearTimeout(timer);
+    confirmed = lastAssigned && drained;
     ready(false);
-    finish();
+    finish(confirmed);
   };
   child.once("error", end);
-  child.once("exit", end);
+  // Mark exited immediately on `exit` so `alive` turns false for callers waiting on exit (e.g. broken stdout),
+  // while waiting for `close` before `end()` so the final "drained"/"active" stdout line is always read first.
+  child.once("exit", () => { exited = true; assigned = false; owners.delete(child); if (!closing) end(); });
+  child.once("close", end);
   child.stdin.on("error", kill);
   child.stdout.on("error", kill);
   const rootIsLive = (root: ChildProcess) => root.exitCode === null && root.signalCode === null;
@@ -170,6 +194,7 @@ function startOwner(file: string) {
       if (!rootIsLive(root)) continue;
       pending = root;
       assigned = false;
+      lastAssigned = false;
       child.stdin.write(root.pid + "\n");
       return;
     }
@@ -186,16 +211,22 @@ function startOwner(file: string) {
     }
     if (line === "assigned" || line === "skipped") {
       assigned = line === "assigned";
+      lastAssigned = assigned;
       pending = undefined;
       sendNext();
+    }
+    if (line === "drained") {
+      drained = true;
+      confirmed = lastAssigned;
     }
   });
   child.unref();
   (child.stdin as typeof child.stdin & { unref?(): void }).unref?.();
   (child.stdout as typeof child.stdout & { unref?(): void }).unref?.();
   const job: WindowsJob = {
-    get alive() { return !ended && !closing; },
+    get alive() { return !ended && !exited && !closing; },
     get assigned() { return assigned; },
+    get confirmed() { return confirmed; },
     assign(root) {
       if (!job.alive || !(root instanceof ChildProcess) || !root.pid || !rootIsLive(root)) return;
       queued.push(root);

@@ -357,22 +357,23 @@ export async function takeSnapshot(checkoutRoot: string, opts: SnapshotOptions =
   } catch (err) { await rm(directory, { recursive: true, force: true }); throw err; }
 }
 
-/** Restore one baseline file in place; true when it had to be rewritten. */
-async function restoreEntry(root: string, handle: SnapshotHandle, i: number, signal: AbortSignal): Promise<boolean> {
+const NOT_ATTEMPTED_DEADLINE = "not attempted (restore deadline)";
+
+/** Restore one baseline file in place; true when it had to be rewritten. Always finishes the started file cleanly. */
+async function restoreEntry(root: string, handle: SnapshotHandle, i: number): Promise<boolean> {
   const entry = handle.manifest[i];
-  const bytes = await readFile(path.join(handle.directory, String(i)), { signal });
+  const bytes = await readFile(path.join(handle.directory, String(i)));
   if (bytes.length !== entry.size || hash(bytes) !== entry.sha256) throw new SnapshotError("snapshot_invalid", "Snapshot bytes failed integrity check.");
   const stat = await safeFile(root, entry.path);
   const absolute = relativePath(root, entry.path);
-  if (stat?.isFile() && hash(await readFile(absolute, { signal })) === entry.sha256) return false;
+  if (stat?.isFile() && hash(await readFile(absolute)) === entry.sha256) return false;
   if (stat?.isDirectory()) await rmdir(absolute); // Only an empty replacement directory is safe to remove.
   else if (stat && !stat.isFile()) throw new SnapshotError("snapshot_unsupported", "Baseline path is no longer a regular file.");
   await mkdir(path.dirname(absolute), { recursive: true });
   // Replace instead of writing through a hard link to another (possibly ignored) path.
   const temporary = path.join(path.dirname(absolute), `.cline-restore-${randomUUID()}`);
   try {
-    await writeFile(temporary, bytes, { flag: "wx", signal });
-    signal.throwIfAborted();
+    await writeFile(temporary, bytes, { flag: "wx" });
     await rename(temporary, absolute);
   } finally { await rm(temporary, { force: true }); }
   return true;
@@ -382,19 +383,56 @@ const isIgnoreFile = (file: string) => file === ".gitignore" || file.endsWith("/
 
 export async function restoreSnapshot(handle: SnapshotHandle, parent?: AbortSignal): Promise<RestoreReport> {
   const signal = boundedSignal(RESTORE_BUDGET_MS, parent);
-  const root = await checkout(handle.checkoutRoot, signal);
   const report: RestoreReport = { restored: [], removed: [], failed: [] };
   const baseline = new Set(handle.manifest.map(entry => entry.path));
   const specials = handle.specialEntries ?? [];
+  const processedManifest = new Set<number>();
+  const processedSpecials = new Set<number>();
+  let excludeHandled = !handle.excludeFile;
+  let pendingRemovals: string[] = [];
+  const processedRemovals = new Set<string>();
+  let currentScanned = false;
+
+  const finishPartial = (): RestoreReport => {
+    if (!excludeHandled) {
+      excludeHandled = true;
+      report.failed.push({ path: "info/exclude", error: NOT_ATTEMPTED_DEADLINE });
+    }
+    for (const file of pendingRemovals) {
+      if (processedRemovals.has(file)) continue;
+      processedRemovals.add(file);
+      report.failed.push({ path: file, error: NOT_ATTEMPTED_DEADLINE });
+    }
+    for (let i = 0; i < handle.manifest.length; i++) {
+      if (processedManifest.has(i)) continue;
+      processedManifest.add(i);
+      report.failed.push({ path: handle.manifest[i].path, error: NOT_ATTEMPTED_DEADLINE });
+    }
+    for (let i = 0; i < specials.length; i++) {
+      if (processedSpecials.has(i)) continue;
+      processedSpecials.add(i);
+      report.failed.push({ path: specials[i].path, error: NOT_ATTEMPTED_DEADLINE });
+    }
+    if (!currentScanned && report.failed.length === 0) {
+      report.failed.push({ path: ".", error: NOT_ATTEMPTED_DEADLINE });
+    }
+    return report;
+  };
+
+  if (signal.aborted) return finishPartial();
+  let root: string;
+  try { root = await checkout(handle.checkoutRoot, signal); }
+  catch (err) { if (signal.aborted) return finishPartial(); throw err; }
+
   const prune = async (dir: string) => {
     while (dir !== root) {
-      signal.throwIfAborted();
+      if (signal.aborted) break;
       try { await rmdir(dir); } catch { break; } // Never recursively remove directories or ignored content.
       dir = path.dirname(dir);
     }
   };
   const remove = async (file: string) => {
-    signal.throwIfAborted();
+    processedRemovals.add(file);
     try {
       const stat = await safeFile(root, file);
       if (!stat) return;
@@ -404,84 +442,112 @@ export async function restoreSnapshot(handle: SnapshotHandle, parent?: AbortSign
       report.removed.push(file);
       await prune(path.dirname(absolute));
     } catch (err) {
-      if (signal.aborted) throw signal.reason;
       report.failed.push({ path: file, error: (err as Error).message });
     }
   };
   // Ignore rules first: a rule the model added must not hide its new files from removal,
   // and must not make a baseline file look "newly ignored" and stay changed.
-  const ignoreDone = new Set<number>();
   for (let i = 0; i < handle.manifest.length; i++) {
-    signal.throwIfAborted();
     if (!isIgnoreFile(handle.manifest[i].path)) continue;
-    ignoreDone.add(i);
-    try { if (await restoreEntry(root, handle, i, signal)) report.restored.push(handle.manifest[i].path); }
-    catch (err) {
-      if (signal.aborted) throw signal.reason;
-      report.failed.push({ path: handle.manifest[i].path, error: (err as Error).message });
-    }
+    if (signal.aborted) return finishPartial();
+    processedManifest.add(i);
+    try { if (await restoreEntry(root, handle, i)) report.restored.push(handle.manifest[i].path); }
+    catch (err) { report.failed.push({ path: handle.manifest[i].path, error: (err as Error).message }); }
   }
   if (handle.ignoredEntries) {
     // Remove .gitignore files the model created: visible ones, and self-ignoring ones found through
     // ignored entries that did not exist at snapshot time. Repeat for nested ones, a bounded number of times.
     const known = new Set(handle.ignoredEntries);
     for (let round = 0; round < 5; round++) {
-      const candidates = new Set((await files(root, signal)).regular.filter(file => isIgnoreFile(file) && !baseline.has(file) && !isUnderSpecial(file, specials)));
-      for (const entry of await ignoredEntries(root, signal)) {
-        signal.throwIfAborted();
+      if (signal.aborted) return finishPartial();
+      let regular: string[];
+      let currentIgnored: string[];
+      try {
+        regular = (await files(root, signal)).regular;
+        currentIgnored = await ignoredEntries(root, signal);
+      } catch (err) {
+        if (signal.aborted) return finishPartial();
+        throw err;
+      }
+      const candidates = new Set(regular.filter(file => isIgnoreFile(file) && !baseline.has(file) && !isUnderSpecial(file, specials)));
+      for (const entry of currentIgnored) {
+        if (signal.aborted) return finishPartial();
         if (known.has(entry)) continue;
         const file = entry.endsWith("/") ? `${entry}.gitignore` : entry;
         if (isIgnoreFile(file) && !baseline.has(file) && !isUnderSpecial(file, specials) && await statOrMissing(relativePath(root, file)).catch(() => undefined)) candidates.add(file);
       }
       if (!candidates.size) break;
+      pendingRemovals = [...candidates];
       const before = report.removed.length;
-      for (const file of candidates) await remove(file);
+      for (const file of pendingRemovals) {
+        if (signal.aborted) return finishPartial();
+        await remove(file);
+      }
+      pendingRemovals = [];
       if (report.removed.length === before) break;
     }
   }
   if (handle.excludeFile) {
+    if (signal.aborted) return finishPartial();
+    excludeHandled = true;
     const { path: file, content } = handle.excludeFile;
     try {
-      const now = await readFile(file, { signal }).then(b => b.toString("base64"), err => { if (missing(err)) return null; throw err; });
+      const now = await readFile(file).then(b => b.toString("base64"), err => { if (missing(err)) return null; throw err; });
       if (now !== content) {
         if (content === null) await rm(file, { force: true });
-        else await writeFile(file, Buffer.from(content, "base64"), { signal });
+        else await writeFile(file, Buffer.from(content, "base64"));
         report.restored.push("info/exclude");
       }
     } catch (err) {
-      if (signal.aborted) throw signal.reason;
       report.failed.push({ path: "info/exclude", error: (err as Error).message });
     }
   }
-  const current = (await files(root, signal)).regular;
-  // check-ignore respects tracked files. A newly ignored baseline path must not be overwritten.
-  const ignored = new Set(handle.manifest.length ? (await git(root, ["check-ignore", "-z", "--stdin"], signal,
-    handle.manifest.map(entry => entry.path).join("\0") + "\0", [0, 1])).toString("utf8").split("\0") : []);
-  for (const file of current.filter(file => !baseline.has(file) && !isUnderSpecial(file, specials))) await remove(file);
+  if (signal.aborted) return finishPartial();
+  let current: string[];
+  let ignored: Set<string>;
+  try {
+    current = (await files(root, signal)).regular;
+    // check-ignore respects tracked files. A newly ignored baseline path must not be overwritten.
+    ignored = new Set(handle.manifest.length ? (await git(root, ["check-ignore", "-z", "--stdin"], signal,
+      handle.manifest.map(entry => entry.path).join("\0") + "\0", [0, 1])).toString("utf8").split("\0") : []);
+  } catch (err) {
+    if (signal.aborted) return finishPartial();
+    throw err;
+  }
+  currentScanned = true;
+  pendingRemovals = current.filter(file => !baseline.has(file) && !isUnderSpecial(file, specials));
+  for (const file of pendingRemovals) {
+    if (signal.aborted) return finishPartial();
+    await remove(file);
+  }
   for (let i = 0; i < handle.manifest.length; i++) {
-    signal.throwIfAborted();
-    if (ignoreDone.has(i)) continue;
+    if (processedManifest.has(i)) continue;
+    if (signal.aborted) return finishPartial();
+    processedManifest.add(i);
     const entry = handle.manifest[i];
     try {
       if (ignored.has(entry.path)) throw new SnapshotError("snapshot_unsupported", "Baseline path is now ignored; left untouched.");
-      if (await restoreEntry(root, handle, i, signal)) report.restored.push(entry.path);
+      if (await restoreEntry(root, handle, i)) report.restored.push(entry.path);
     } catch (err) {
-      if (signal.aborted) throw signal.reason;
       report.failed.push({ path: entry.path, error: (err as Error).message });
     }
   }
-  for (const entry of specials) {
-    signal.throwIfAborted();
+  for (let i = 0; i < specials.length; i++) {
+    if (signal.aborted) return finishPartial();
+    processedSpecials.add(i);
+    const entry = specials[i];
     try {
       if (await specialState(root, entry.path, entry.kind, signal) !== entry.state) {
         report.failed.push({ path: entry.path, error: "Tracked symlink/submodule changed during the run; it was left as is." });
       }
     } catch {
-      if (signal.aborted) throw signal.reason;
+      if (signal.aborted) {
+        report.failed.push({ path: entry.path, error: NOT_ATTEMPTED_DEADLINE });
+        return finishPartial();
+      }
       report.failed.push({ path: entry.path, error: "Tracked symlink/submodule changed during the run; it was left as is." });
     }
   }
-  signal.throwIfAborted();
   return report;
 }
 

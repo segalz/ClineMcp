@@ -107,6 +107,8 @@ test("S3: a timed-out run settles only after the whole CLI tree is dead, even wh
       acquireSettingsMutex: async () => async () => {},
       // The budget ends with the deadline, as in a real edit run that used all of its time.
       timeoutMs, totalBudgetMs: timeoutMs,
+      // Exercise the non-job process-tree retry path (Job Object confirmation is covered separately).
+      createWindowsJob: async () => undefined,
       // The first kill attempt does nothing (a child that survives it); later attempts are real.
       killTree: (pid, signal) => { if (killCalls++ === 0) return; defaultKillTree(pid, signal); }
     }

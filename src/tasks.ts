@@ -810,15 +810,18 @@ export class TaskManager {
     let nextError: unknown;
     let gitReport: { gitDiff: string; status: string; headBefore?: string; headAfter?: string; warnings: string[] } | undefined;
     task.settled = (async () => {
-      if (action === "restore" || action === "cancel") await lifecycle.restore();
+      if (action === "restore") await lifecycle.restore();
+      else if (action === "cancel") { if (!lifecycle.killUnconfirmed) await lifecycle.restore(); }
       else if (action === "keep") {
         try { await lifecycle.keep(task.controller.signal); }
         catch (error) { if (!task.controller.signal.aborted) throw error; }
       } else await lifecycle.execute(task.controller.signal, action === "retry" ? message : undefined);
       // Cancelling report-only work after the commit point preserves the completed edit.
       const cancelled = action === "cancel" || lifecycle.cancelled || (task.controller.signal.aborted && lifecycle.phase !== "done");
-      if (cancelled && action !== "cancel" && action !== "restore" && !lifecycle.cancelled && !lifecycle.verification.restored) await lifecycle.restore();
-      if (cancelled) {
+      if (cancelled && action !== "cancel" && action !== "restore" && !lifecycle.cancelled && !lifecycle.verification.restored && !lifecycle.killUnconfirmed) {
+        await lifecycle.restore();
+      }
+      if (cancelled && (!lifecycle.killUnconfirmed || action === "cancel")) {
         nextState = "cancelled"; nextError = new ClineRunError("cancelled", "The task was cancelled.");
       } else if (lifecycle.phase === "waiting") {
         nextState = lifecycle.lock ? "input_required" : "failed"; nextError = lifecycle.error;

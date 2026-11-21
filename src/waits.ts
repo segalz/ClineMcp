@@ -2,14 +2,18 @@
  * Internal wait caps and budget helpers.
  *
  * Invariant:
- * - A timed-out or cancelled run or check settles no later than its budget plus `SETTLE_MARGIN_MS`.
+ * - A timed-out or cancelled run or check settles within its budget + `SETTLE_MARGIN_MS`,
+ *   or + `KILL_CONFIRM_MARGIN_MS` when a kill must be confirmed without a Windows Job Object.
  * - Every internal wait is bounded by `min(its cap, the owning operation's remaining budget)`.
  * - A cancellation stops waiting promptly and shortens even a settlement wait already in progress.
+ *   Note: cancelling an edit task can take up to `RESTORE_BUDGET_MS` because `tasks.cancel`
+ *   awaits `task.settled` while baseline restoration runs.
  */
 
 /** Per-call cap for read-only snapshot Git work; bounded earlier by the owning operation's signal. */
 export const SNAPSHOT_GIT_TIMEOUT_MS = 60_000;
-/** Includes the identity guard, restoration, and final inventory. Below the 120 s shutdown cap. */
+/** Includes the identity guard, restoration, and final inventory. Below the 120 s shutdown cap.
+ * Cancelling an edit task can take up to this long because `tasks.cancel` awaits `task.settled` (including restore). */
 export const RESTORE_BUDGET_MS = 90_000;
 /** One PowerShell process-start / hub-stop / job-owner wait cap; bounded by the caller's budget. */
 export const PROCESS_QUERY_TIMEOUT_MS = 20_000;
@@ -17,9 +21,11 @@ export const PROCESS_QUERY_TIMEOUT_MS = 20_000;
 export const PROCESS_TABLE_TIMEOUT_MS = 15_000;
 /** Two complete Windows process-table reads plus 2 s of slack to poll and reap. */
 export const TREE_KILL_CONFIRM_MS = 2 * PROCESS_TABLE_TIMEOUT_MS + 2_000;
+/** Margin used ONLY when confirming a kill after timeout/cancel without a Windows Job Object (one full 15 s read + 1 s polling). */
+export const KILL_CONFIRM_MARGIN_MS = PROCESS_TABLE_TIMEOUT_MS + 1_000;
 /** Short settle cap after a kill (also exceeds the Windows job owner's 2 s drain). */
 export const KILL_SETTLE_MS = 5_000;
-/** Runs/checks share one grace window after budget exhaustion or cancellation (tasks.cancel waits 5 s). */
+/** Runs/checks share one grace window after budget exhaustion or cancellation (tasks.cancel waits 5 s for ask/workspace). */
 export const SETTLE_MARGIN_MS = 4_000;
 /** Optional `git diff --stat` display awaited by `cline_send`; omitted on timeout. */
 export const DIFF_STAT_TIMEOUT_MS = 5_000;
@@ -39,14 +45,23 @@ export function boundedSignal(ms: number, parent?: AbortSignal): AbortSignal {
   return parent ? AbortSignal.any([parent, timeout.signal]) : timeout.signal;
 }
 
-/** One clock for confirmation, job drain and hub stop. Cancellation shortens even a wait already in progress. */
+/**
+ * One clock for confirmation, job drain and hub stop. Cancellation shortens even a wait already in progress.
+ * Exposes `remaining()`/`signal` (`SETTLE_MARGIN_MS`) for normal settlement and `confirmRemaining()`/`confirmSignal`
+ * (`KILL_CONFIRM_MARGIN_MS`) solely for confirming a kill when no Windows Job Object is available.
+ */
 export function settlementBudget(workMs: number, cancel?: AbortSignal, now = () => performance.now()) {
   const workDeadline = now() + Math.max(0, workMs);
   let deadline = workDeadline + SETTLE_MARGIN_MS;
+  let confirmDeadline = workDeadline + KILL_CONFIRM_MARGIN_MS;
   const controller = new AbortController();
+  const confirmController = new AbortController();
   const remaining = () => Math.max(0, deadline - now());
+  const confirmRemaining = () => Math.max(0, confirmDeadline - now());
   const expire = () => controller.abort();
+  const expireConfirm = () => confirmController.abort();
   let timer: ReturnType<typeof setTimeout> | undefined;
+  let confirmTimer: ReturnType<typeof setTimeout> | undefined;
   const arm = () => {
     clearTimeout(timer);
     const ms = remaining();
@@ -55,9 +70,18 @@ export function settlementBudget(workMs: number, cancel?: AbortSignal, now = () 
       timer = setTimeout(expire, Math.min(ms, MAX_TIMER_MS));
       timer.unref?.();
     }
+    clearTimeout(confirmTimer);
+    const confirmMs = confirmRemaining();
+    if (confirmMs <= 0) expireConfirm();
+    else {
+      confirmTimer = setTimeout(expireConfirm, Math.min(confirmMs, MAX_TIMER_MS));
+      confirmTimer.unref?.();
+    }
   };
   const onCancel = () => {
-    deadline = Math.min(deadline, now() + SETTLE_MARGIN_MS);
+    const current = now();
+    deadline = Math.min(deadline, current + SETTLE_MARGIN_MS);
+    confirmDeadline = Math.min(confirmDeadline, current + KILL_CONFIRM_MARGIN_MS);
     arm();
   };
   if (cancel?.aborted) onCancel();
@@ -66,11 +90,15 @@ export function settlementBudget(workMs: number, cancel?: AbortSignal, now = () 
     cancel?.addEventListener("abort", onCancel, { once: true });
   }
   return {
+    now,
     workDeadline,
     remaining,
     signal: controller.signal,
+    confirmRemaining,
+    confirmSignal: confirmController.signal,
     dispose() {
       clearTimeout(timer);
+      clearTimeout(confirmTimer);
       cancel?.removeEventListener("abort", onCancel);
     }
   };

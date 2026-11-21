@@ -216,11 +216,18 @@ export async function applyClineEdits(
       if (input.keepOnFailure && lifecycle.snapshot && !signal?.aborted && lifecycle.waitReason !== "head_changed") {
         try { await lifecycle.keep(signal); }
         catch (error) {
-          if (!signal?.aborted) throw error;
-          await lifecycle.restore();
+          if (!signal?.aborted) {
+            const keepError = error instanceof ClineRunError ? error
+              : new ClineRunError("edits_inspection_failed", `Edit failed while keeping changes: ${error instanceof Error ? error.message : String(error)}`);
+            Object.assign(keepError, { verification: lifecycle.verification, evidence: lifecycle.evidence,
+              codeMapSource: lifecycle.codeMapSource,
+              usage: lifecycle.usage, cost: lifecycle.cost, durationMs: lifecycle.durationMs });
+            throw keepError;
+          }
+          if (!lifecycle.killUnconfirmed) await lifecycle.restore();
           lifecycle.error = new ClineRunError("cancelled", "The edit was cancelled while keeping the changes.");
         }
-      } else if (!lifecycle.cancelled && reason !== "head_changed") await lifecycle.restore();
+      } else if (!lifecycle.cancelled && reason !== "head_changed" && !lifecycle.killUnconfirmed) await lifecycle.restore();
       const error = lifecycle.error instanceof ClineRunError ? lifecycle.error
         // A check refused up front (plan S4): no run happened, so say what is wrong with the check itself.
         : lifecycle.error instanceof VerificationError

@@ -1,7 +1,7 @@
 import { setTimeout as delay } from "node:timers/promises";
 import { ChildProcess, spawn } from "node:child_process";
 import { hubDaemonPidsOnPort, listClineProcesses } from "./procs.js";
-import { PROCESS_QUERY_TIMEOUT_MS, PROCESS_TABLE_TIMEOUT_MS, TREE_KILL_CONFIRM_MS, settlementBudget, untilAborted, type SettlementBudget } from "./waits.js";
+import { KILL_SETTLE_MS, PROCESS_QUERY_TIMEOUT_MS, PROCESS_TABLE_TIMEOUT_MS, TREE_KILL_CONFIRM_MS, settlementBudget, untilAborted, type SettlementBudget } from "./waits.js";
 import { killWindowsTree } from "./codemap-kill.js";
 import { confirmTreeDead, type TreeKillResult } from "./proctree.js";
 import { createWindowsJob, type WindowsJob } from "./jobobject.js";
@@ -715,8 +715,9 @@ export function loopbackPortListening(port: number, timeoutMs = 1_500, signal?: 
 
 /** Stop a detected hub and fall back to a Windows process scan if the stop fails or the port stays open. */
 export async function stopDedicatedHub(port: number, deps: HubStopDeps, budget?: SettlementBudget): Promise<TreeKillResult | void> {
-  const deadline = performance.now() + 60_000;
-  const remaining = (cap: number) => Math.max(0, Math.min(cap, deadline - performance.now(), budget?.remaining() ?? Infinity));
+  const now = budget?.now ?? (() => performance.now());
+  const deadline = now() + 60_000;
+  const remaining = (cap: number) => Math.max(0, Math.min(cap, deadline - now(), budget?.remaining() ?? Infinity));
   const check = () => { if (!remaining(Infinity) || budget?.signal.aborted) throw new Error("Hub stop deadline expired."); };
   const bounded = <T>(work: Promise<T>): Promise<T> => budget ? untilAborted(work, budget.signal) : work;
   const isListening = async () => {
@@ -829,20 +830,36 @@ export class DedicatedHubSession {
 
   async stop(budget?: SettlementBudget): Promise<void> {
     const job = this.jobs.current;
+    const isConfirmed = (j?: WindowsJob) => j?.confirmed === true;
+    let jobConfirmed = isConfirmed(job);
+    const closeJob = async (): Promise<boolean> => {
+      if (!job) return false;
+      if (isConfirmed(job)) { jobConfirmed = true; return true; }
+      const cap = budget
+        ? (job.assigned ? Math.min(KILL_SETTLE_MS, Math.max(budget.remaining(), budget.confirmRemaining())) : budget.remaining())
+        : KILL_SETTLE_MS;
+      const closeSignal = budget ? (job.assigned ? budget.confirmSignal : budget.signal) : undefined;
+      const ok = await job.close(cap, closeSignal);
+      if (ok === true || isConfirmed(job)) jobConfirmed = true;
+      return jobConfirmed;
+    };
     try {
-      if (this.jobs.stopped) await job?.close(budget?.remaining(), budget?.signal);
+      if (this.jobs.stopped) await closeJob();
       // Only the launched CLI can have started the daemon.
       const result = this.launched ? await this.hub?.stop(budget) : undefined;
       if (result && !result.confirmed) {
-        const message = "The dedicated Cline hub could not be confirmed stopped.";
-        this.unconfirmedStop = new ClineRunError("edits_inspection_failed", message,
-          { processesStillAlive: result.alive, killUnverified: true });
-        this.warnings.push(message);
+        if (!jobConfirmed) await closeJob();
+        if (!jobConfirmed) {
+          const message = "The dedicated Cline hub could not be confirmed stopped.";
+          this.unconfirmedStop = new ClineRunError("edits_inspection_failed", message,
+            { processesStillAlive: result.alive, killUnverified: true });
+          this.warnings.push(message);
+        }
       }
     } catch (error) {
       this.warnings.push(redactSecrets(`Failed to stop the dedicated Cline hub: ${error instanceof Error ? error.message : String(error)}`));
     } finally {
-      await job?.close(budget?.remaining(), budget?.signal);
+      await closeJob();
       this.jobs.current = undefined;
       this.jobs.stopped = false;
       this.hub = undefined;
@@ -1199,7 +1216,7 @@ async function runClineCore(input: AskClineInput, signal: AbortSignal | undefine
           let exitCode: number | null = null;
           let exitSignal: NodeJS.Signals | null = null;
           let spawnError: any;
-          let closeStoppedJob: (() => Promise<void>) | undefined;
+          let closeStoppedJob: (() => Promise<boolean | void>) | undefined;
 
           const clampGrace = (ms: number) => Math.min(ms, getRemainingBudgetMs(), budget.remaining());
           const cleanup = () => {
@@ -1261,9 +1278,6 @@ async function runClineCore(input: AskClineInput, signal: AbortSignal | undefine
                   else defaultKillTree(pid, "SIGKILL", platform);
                 } finally { void closeStoppedJob?.(); }
               };
-              // A final hub stop closes the job before S3 and before the hub's discovery cleanup.
-              // Other jobs give taskkill the live root and close on root exit or the first S3 retry.
-              if (ownsHub || exitSeen) void closeStoppedJob?.();
               const settleAfterKill = (stillAlive?: number[], unverified?: boolean) => {
                 if (settled) return;
                 try {
@@ -1281,17 +1295,33 @@ async function runClineCore(input: AskClineInput, signal: AbortSignal | undefine
                 }
               };
               const isRootAlive = () => !exitSeen && child.exitCode === null && child.signalCode === null;
-              untilAborted((deps.confirmTreeDead ?? confirmTreeDead)(pid, {
-                capMs: Math.min(budget.remaining(), deps.settlementDeadlineMs ?? TREE_KILL_CONFIRM_MS),
-                now: nowFn,
-                signal: budget.signal,
-                killRoot,
-                isRootAlive,
-                rootStartedMs,
-                rootExitedMs: () => exitSeenAt,
-                firstPollMs: platform === "win32" ? undefined : (deps.killGracePeriodMs ?? deps.closeGracePeriodMs ?? 500),
-                platform
-              }), budget.signal).then(
+              const runTableConfirm = () => {
+                const confirmCap = Math.min(
+                  deps.settlementDeadlineMs !== undefined ? budget.remaining() : budget.confirmRemaining(),
+                  deps.settlementDeadlineMs ?? TREE_KILL_CONFIRM_MS
+                );
+                const confirmSignal = deps.settlementDeadlineMs !== undefined ? budget.signal : budget.confirmSignal;
+                return untilAborted((deps.confirmTreeDead ?? confirmTreeDead)(pid, {
+                  capMs: confirmCap,
+                  now: nowFn,
+                  signal: confirmSignal,
+                  killRoot,
+                  isRootAlive,
+                  rootStartedMs,
+                  rootExitedMs: () => exitSeenAt,
+                  firstPollMs: platform === "win32" ? undefined : (deps.killGracePeriodMs ?? deps.closeGracePeriodMs ?? 500),
+                  platform
+                }), confirmSignal);
+              };
+              // Job Object first: terminate the job and confirm ActiveProcesses == 0 without PowerShell.
+              const confirmedResult: TreeKillResult = { confirmed: true, alive: [] };
+              const confirm: Promise<TreeKillResult> = closeStoppedJob
+                ? closeStoppedJob().then(
+                    (ok) => (ok === true || job?.confirmed === true) ? confirmedResult : runTableConfirm(),
+                    () => runTableConfirm()
+                  )
+                : runTableConfirm();
+              confirm.then(
                 ({ confirmed, alive, unverified }) => settleAfterKill(confirmed ? undefined : alive, unverified),
                 () => settleAfterKill(isRootAlive() ? [pid] : [], true)
               );
@@ -1409,10 +1439,27 @@ async function runClineCore(input: AskClineInput, signal: AbortSignal | undefine
               const pid = child.pid;
               if (hasRealPid && platform === "win32" && typeof pid === "number" && !terminating) {
                 terminating = true;
-                untilAborted((deps.confirmTreeDead ?? confirmTreeDead)(pid, { capMs: Math.min(budget.remaining(), deps.settlementDeadlineMs ?? TREE_KILL_CONFIRM_MS),
-                  now: nowFn, signal: budget.signal, killRoot: () => {}, isRootAlive: () => false, rootStartedMs, rootExitedMs: () => exitSeenAt, platform }), budget.signal)
-                  .then((result) => result, () => ({ confirmed: false, alive: [] as number[], unverified: true }))
-                  .then(({ confirmed, alive, unverified }) => settleExit(confirmed ? undefined : alive, unverified));
+                const runTableConfirm = (): Promise<TreeKillResult> => {
+                  const confirmCap = Math.min(
+                    deps.settlementDeadlineMs !== undefined ? budget.remaining() : budget.confirmRemaining(),
+                    deps.settlementDeadlineMs ?? TREE_KILL_CONFIRM_MS
+                  );
+                  const confirmSignal = deps.settlementDeadlineMs !== undefined ? budget.signal : budget.confirmSignal;
+                  return untilAborted((deps.confirmTreeDead ?? confirmTreeDead)(pid, {
+                    capMs: confirmCap,
+                    now: nowFn, signal: confirmSignal, killRoot: () => {}, isRootAlive: () => false,
+                    rootStartedMs, rootExitedMs: () => exitSeenAt, platform
+                  }), confirmSignal)
+                    .then((result) => result, () => ({ confirmed: false, alive: [] as number[], unverified: true }));
+                };
+                const confirmedResult: TreeKillResult = { confirmed: true, alive: [] };
+                const confirm: Promise<TreeKillResult> = job && !ownsHub
+                  ? job.close(budget.remaining(), budget.signal).then(
+                      (ok) => (ok === true || job.confirmed === true) ? confirmedResult : runTableConfirm(),
+                      () => runTableConfirm()
+                    )
+                  : runTableConfirm();
+                confirm.then(({ confirmed, alive, unverified }) => settleExit(confirmed ? undefined : alive, unverified));
                 return;
               }
               settleExit();
