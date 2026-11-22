@@ -55,8 +55,15 @@ Rule from earlier work: the reviewer is always from a different family than the 
   - ClineMcp and openCodeHelperMcp were fast-forwarded to `main` (8c68773, d5fea09).
   - model-picker got a merge commit d70991b with F7; it had no conflicts and its suite passed 3807.
 - **F11 bookkeeping done.** `open-items.md` rows 9-14 are closed (none left open), the after-bridges plan is marked closed, and memory is updated.
+- **Live check after the owner's restart (2026-11-22, 15:20): passed.**
+  - `codex_status` showed agent-intern v0.40.0.
+  - Four MCP calls issued in one message ran one after another, because Claude Code serializes them, so a script started four bridge processes in parallel instead (2 Cline, 2 OpenCode, 2 slots).
+  - The heavy-run state reached `2 active, 1 queued`, and `pick(needs_write)` then returned Codex with the warning `bridges busy: 2 active, 1 queued`. Each waiter started when a slot freed, and all 4 edits passed their checks.
+  - **Bug found and fixed along the way (openCodeHelperMcp `fix/catalog-fallback` a192912, not merged):** under load, one helper's `opencode models --verbose` failed once. The catalog then fell back silently to the name rule, which drops every `nvidia/*` model, cached that for 10 minutes, and refused a valid edit.
+    - The fix retries the verbose listing once, marks a fallback list `degraded` and caches it for only 30 s, and re-lists when a required model is missing.
+    - The failing tests were written first. Cline wrote the fix (Lightning ran out of budget; super-vl passed first try), and Claude reviewed it. The suite passed 352/0, and the re-run live check passed 4/4.
 - **Left:**
-  1. One restart by the owner (loads F10 and agent-intern 0.40).
+  1. ~~One restart by the owner~~ done.
   2. A live check: 4 parallel edits across both bridges with 2 slots, plus `pick(needs_write)` showing the busy warning, plus `codex_status` v0.40.0.
   3. The F5 `opencode/*` edit track when its quota is back.
 - **F3 decided (owner, 2026-11-22):** `ui` and `general` writes stay with AGY. The free bonus stays on coding, debugging and testing. No code change; the decision is written into CLAUDE.md wording (F2).
