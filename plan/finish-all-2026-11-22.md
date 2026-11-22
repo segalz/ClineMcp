@@ -38,6 +38,14 @@ Rule from earlier work: the reviewer is always from a different family than the 
   - The F8 fix was merged to ClineMcp `main` (50b45c2) and pushed.
   - F2 was applied to `~/.claude/CLAUDE.md` and `~/.codex/AGENTS.md`; backups are `.bak-2026-11-22`. **F2 done.**
   - F6 was approved later and fast-forward merged: fork `main` 13d073a (0.40.0), pushed. After the owner restarts, `codex_status` should show v0.40.0.
+- **F10 code done; the live check waits for merge plus restart.** Codex ran out at 07:00 (resets 11:21). On the owner's suggestion, AGY `gemini-4-neon-xhigh` took over as writer, with Opus as reviewer. All branches are `feat/heavy-queue`, pushed.
+  - Step A, Cline: written by Codex, then 4 Opus rounds fixed by AGY. The final round was approved; the full suite passes 581/0.
+  - Step C, model-picker: started by Codex and finished by AGY. Opus approved it, and Claude fixed its two notes. 3797 passed.
+  - Step B, OpenCode: written by AGY. Opus approved it, and AGY fixed its two notes. 349 passed.
+  - Owner-level decisions:
+    - after `killUnverified`, the checkout lock is never auto-healed (only an explicit restore/keep or a restart), but the slot is freed at once;
+    - survivors-only leases heal on a 30 s re-check, and the lock is freed only after disposal.
+  - Two load-flaky code-map tests were fixed in both bridges.
 - **F3 decided (owner, 2026-11-22):** `ui` and `general` writes stay with AGY. The free bonus stays on coding, debugging and testing. No code change; the decision is written into CLAUDE.md wording (F2).
 
 ## Order
