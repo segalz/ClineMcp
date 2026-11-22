@@ -26,30 +26,74 @@ import { ClineRunError } from "./runner.js";
 
 export interface QueuePosition { position: number; total: number }
 
-/** Tickets owned by this process whose removal failed; retried under admission.lock and never allowed to block waiters. */
-const failedTickets = new Map<string, { dir: string; name: string; token: string }>();
+/** How often this process retries unlinking tickets whose removal failed, even if no caller polls again. */
+export const FAILED_TICKET_RETRY_INTERVAL_MS = 1_000;
 
-function releaseTicket(dir: string, name: string, token: string): boolean {
-  const file = path.join(dir, "queue", name);
-  const ok = fileLease(file, token)();
-  if (ok) failedTickets.delete(file);
-  else failedTickets.set(file, { dir, name, token });
-  return ok;
+/** Tickets owned by this process whose removal failed; retried both on an unref'd interval and under admission.lock. */
+const failedTickets = new Map<string, { dir: string; name: string; token: string; slots: number }>();
+let failedTicketRetryMs = FAILED_TICKET_RETRY_INTERVAL_MS;
+let failedTicketTimer: ReturnType<typeof setInterval> | undefined;
+let failedTicketExitListener: (() => void) | undefined;
+
+/** Test seam for background failed-ticket retry cadence (call with no args to restore the default). */
+export function setFailedTicketRetryIntervalMs(ms = FAILED_TICKET_RETRY_INTERVAL_MS): void {
+  failedTicketRetryMs = Math.max(1, ms);
 }
 
-function retryFailedTickets(dir: string): boolean {
+function stopFailedTicketRetry(): void {
+  if (failedTicketTimer) {
+    clearInterval(failedTicketTimer);
+    failedTicketTimer = undefined;
+  }
+  if (failedTicketExitListener) {
+    process.off("exit", failedTicketExitListener);
+    failedTicketExitListener = undefined;
+  }
+}
+
+function retryFailedTickets(onlyDir?: string): boolean {
   let removed = false;
+  const touchedDirs = new Map<string, number>();
   for (const [file, entry] of [...failedTickets]) {
-    if (entry.dir !== dir) {
+    if (onlyDir && entry.dir !== onlyDir) {
       if (!existsSync(entry.dir)) failedTickets.delete(file);
       continue;
     }
-    if (fileLease(file, entry.token)()) {
+    if (!existsSync(entry.dir) || fileLease(file, entry.token)()) {
       failedTickets.delete(file);
       removed = true;
+      if (existsSync(entry.dir)) touchedDirs.set(entry.dir, entry.slots);
     }
   }
+  if (!onlyDir) {
+    for (const [dir, slots] of touchedDirs) updateState(dir, slots);
+  }
+  if (failedTickets.size === 0) stopFailedTicketRetry();
   return removed;
+}
+
+function ensureFailedTicketRetry(): void {
+  if (failedTicketTimer || failedTickets.size === 0) return;
+  const stop = () => stopFailedTicketRetry();
+  failedTicketExitListener = stop;
+  process.once("exit", stop);
+  failedTicketTimer = setInterval(() => {
+    retryFailedTickets();
+  }, failedTicketRetryMs);
+  failedTicketTimer.unref?.();
+}
+
+function releaseTicket(dir: string, name: string, token: string, slots: number): boolean {
+  const file = path.join(dir, "queue", name);
+  const ok = fileLease(file, token)();
+  if (ok) {
+    failedTickets.delete(file);
+    if (failedTickets.size === 0) stopFailedTicketRetry();
+  } else {
+    failedTickets.set(file, { dir, name, token, slots });
+    ensureFailedTicketRetry();
+  }
+  return ok;
 }
 
 const ticketPattern = /^(\d+)-\d+-[\da-f-]+\.json$/i;
@@ -143,7 +187,7 @@ export async function acquireHeavySlot(root: string, waitMs: () => number, signa
             const owner = fileLease(file, token);
             try {
               publishHolder(file, { ...metadata, started_at: new Date().toISOString() });
-              if (ticket && releaseTicket(dir, ticket, token)) ticket = undefined;
+              if (ticket && releaseTicket(dir, ticket, token, slots)) ticket = undefined;
               updateState(dir, slots);
               const releaseSlot = Object.assign((): boolean => {
                 const ok = owner();
@@ -181,7 +225,7 @@ export async function acquireHeavySlot(root: string, waitMs: () => number, signa
     if (deadline.aborted) throw busy();
     throw err;
   } finally {
-    if (ticket) { releaseTicket(dir, ticket, token); updateState(dir, slots); }
+    if (ticket) { releaseTicket(dir, ticket, token, slots); updateState(dir, slots); }
     onQueue?.();
   }
 }

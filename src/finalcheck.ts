@@ -139,6 +139,8 @@ export class FinalCheckLifecycle {
   /** New, non-ignored files present when the edit finished (absent when there are none). */
   createdFiles?: string[];
   private releaseOwnLock = false;
+  private disposed = false;
+  private survivorsCleared = false;
   private survivorObservedAt?: string;
   private survivorTimer?: ReturnType<typeof setInterval>;
   private survivorExitListener?: () => void;
@@ -147,7 +149,7 @@ export class FinalCheckLifecycle {
   get hasSlot(): boolean { return this.slot !== undefined; }
   /** True when releasing retained leases requires an asynchronous OS process-start check. */
   get hasSlowRelease(): boolean {
-    return this.killUnconfirmed && !this.evidence.killUnverified && Boolean(this.lock || this.slot);
+    return this.killUnconfirmed && !this.evidence.killUnverified && !this.survivorsCleared && Boolean(this.lock || this.slot);
   }
   private recordCleanupNote(note: string): void {
     const clean = redactSecrets(note);
@@ -174,16 +176,16 @@ export class FinalCheckLifecycle {
     }
   }
   private startSurvivorCheck(): void {
-    if (this.survivorTimer || this.evidence.killUnverified) return;
+    if (this.survivorTimer || this.evidence.killUnverified || this.survivorsCleared) return;
     const survivors = (this.evidence.processesStillAlive as number[] | undefined) ?? [];
-    if (survivors.length === 0 || (!this.lock && !this.slot)) return;
+    if (survivors.length === 0 || (!this.slot && (!this.disposed || !this.lock))) return;
     const intervalMs = Math.max(1, this.deps.survivorCheckIntervalMs ?? SURVIVOR_RECHECK_INTERVAL_MS);
     const stop = () => this.stopSurvivorCheck();
     this.survivorExitListener = stop;
     process.once("exit", stop);
     this.survivorTimer = setInterval(() => {
       if (this.survivorCheckInFlight) return;
-      if (this.evidence.killUnverified || (!this.lock && !this.slot)) {
+      if (this.evidence.killUnverified || (!this.slot && (!this.disposed || !this.lock))) {
         this.stopSurvivorCheck();
         return;
       }
@@ -191,8 +193,11 @@ export class FinalCheckLifecycle {
       void this.recheckSurvivors().then(allDead => {
         if (!this.survivorTimer || this.evidence.killUnverified) return;
         if (allDead) {
+          this.survivorsCleared = true;
           this.stopSurvivorCheck();
-          this.releaseNow(true);
+          // Never free the checkout lock before the lifecycle reaches its release/disposal point.
+          if (this.disposed) this.releaseNow(true);
+          else this.releaseSlotNow(true);
         }
       }).finally(() => {
         this.survivorCheckInFlight = false;
@@ -203,6 +208,7 @@ export class FinalCheckLifecycle {
   private recordUnconfirmedKill(pids: number[] = [], unverified?: boolean): void {
     const previous = this.evidence.processesStillAlive as number[] | undefined;
     this.evidence.processesStillAlive = [...new Set([...(previous ?? []), ...pids])];
+    this.survivorsCleared = false;
     if (unverified) this.evidence.killUnverified = true;
     this.survivorObservedAt = new Date().toISOString();
     // Persist evidence as soon as the process stop is known, including after a passing check.
@@ -520,6 +526,7 @@ export class FinalCheckLifecycle {
     await this.finishExplicitDisposition(signal, releaseUnverifiedLock);
   }
   private async finishExplicitDisposition(signal: AbortSignal, releaseUnverifiedLock: boolean): Promise<void> {
+    this.disposed = true;
     this.stopSurvivorCheck();
     if (!this.killUnconfirmed) return;
     if (this.evidence.killUnverified) {
@@ -528,8 +535,12 @@ export class FinalCheckLifecycle {
       return;
     }
     if (!this.lock && !this.slot) return;
-    if (await this.recheckSurvivors(signal)) this.releaseNow(true);
-    else if (this.releaseOwnLock) this.releaseLease(this.lock, "checkout lock", false);
+    if (this.survivorsCleared || await this.recheckSurvivors(signal)) {
+      this.survivorsCleared = true;
+      this.releaseNow(true);
+    } else if (this.releaseOwnLock) {
+      this.releaseLease(this.lock, "checkout lock", false);
+    }
   }
   async complete(signal: AbortSignal): Promise<void> {
     // Completion is the commit point; cancellation after this phase waits for disposal.
@@ -605,9 +616,14 @@ export class FinalCheckLifecycle {
       return;
     }
     if (!this.slot) return;
-    if (await this.recheckSurvivors(signal)) this.releaseSlotNow(true);
+    if (this.survivorsCleared || await this.recheckSurvivors(signal)) {
+      this.survivorsCleared = true;
+      this.stopSurvivorCheck();
+      this.releaseSlotNow(true);
+    }
   }
   async release(signal?: AbortSignal): Promise<void> {
+    this.disposed = true;
     if (!this.killUnconfirmed) {
       this.stopSurvivorCheck();
       this.releaseNow(false);
@@ -621,12 +637,14 @@ export class FinalCheckLifecycle {
       this.stopSurvivorCheck();
       return;
     }
-    if (await this.recheckSurvivors(signal)) {
+    if (this.survivorsCleared || await this.recheckSurvivors(signal)) {
+      this.survivorsCleared = true;
       this.stopSurvivorCheck();
       this.releaseNow(true);
-    } else if (this.releaseOwnLock) {
+    } else {
       // Mark the checkout lock released-while-retained; the unref'd interval and stale reaper heal once survivors exit.
-      this.releaseLease(this.lock, "checkout lock", false);
+      if (this.releaseOwnLock) this.releaseLease(this.lock, "checkout lock", false);
+      this.startSurvivorCheck();
     }
   }
 }

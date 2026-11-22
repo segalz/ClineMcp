@@ -9,7 +9,7 @@ import { setTimeout as delay } from "node:timers/promises";
 import "./git-test-serial.js";
 import { TEST_WAIT_MS } from "./test-waits.js";
 import { acquire, CheckoutBusyError } from "../checkoutlock.js";
-import { acquireHeavySlot } from "../heavyslots.js";
+import { acquireHeavySlot, setFailedTicketRetryIntervalMs } from "../heavyslots.js";
 import { withProgressHeartbeat } from "../progress.js";
 
 const moduleUrl = new URL("../heavyslots.js", import.meta.url).href;
@@ -222,7 +222,7 @@ test("finding 1b: failed ticket unlink is retried under admission lock and never
   let stuckTicketName = "";
   const stub = t.mock.method(fs, "unlinkSync", (target: fs.PathLike) => {
     const file = String(target);
-    if (blockFailedTicket && file.includes(`${path.sep}queue${path.sep}`) && (!stuckTicketName || file.endsWith(stuckTicketName))) {
+    if (blockFailedTicket && file.includes(`${path.sep}queue${path.sep}`) && file.endsWith(".json") && (!stuckTicketName || file.endsWith(stuckTicketName))) {
       stuckTicketName = path.basename(file);
       throw Object.assign(new Error("injected persistent ticket EBUSY"), { code: "EBUSY" });
     }
@@ -269,6 +269,64 @@ test("finding 1b: failed ticket unlink is retried under admission lock and never
   const fifth = await acquireHeavySlot(dir(), () => TEST_WAIT_MS, signal);
   fifth();
   assert.deepEqual(readdirSync(path.join(dir(), "queue")).filter(n => n.endsWith(".json")), []);
+});
+
+test("finding 1c: background interval retries failed ticket unlink without further polling, unblocks another process, and stops when empty", async t => {
+  process.env.BRIDGE_HEAVY_SLOTS = "1";
+  mkdirSync(dir(), { recursive: true });
+  setFailedTicketRetryIntervalMs(20);
+  t.after(() => setFailedTicketRetryIntervalMs());
+
+  const holder = await acquireHeavySlot(dir(), () => TEST_WAIT_MS, signal);
+  t.after(() => holder());
+
+  const realUnlink = fs.unlinkSync;
+  let failTicket = true;
+  let stuckTicketName = "";
+  let ticketUnlinkCalls = 0;
+  const stub = t.mock.method(fs, "unlinkSync", (target: fs.PathLike) => {
+    const file = String(target);
+    if (file.includes(`${path.sep}queue${path.sep}`) && file.endsWith(".json") && (!stuckTicketName || file.endsWith(stuckTicketName))) {
+      stuckTicketName = path.basename(file);
+      ticketUnlinkCalls++;
+      if (failTicket) throw Object.assign(new Error("injected ticket EBUSY"), { code: "EBUSY" });
+    }
+    return realUnlink(target);
+  });
+  syncBuiltinESMExports();
+  t.after(() => { stub.mock.restore(); syncBuiltinESMExports(); });
+
+  // Waiter queues, aborts, and its ticket unlink fails -> ticket stays on disk, background retry interval starts.
+  const abort1 = new AbortController();
+  await assert.rejects(
+    acquireHeavySlot(dir(), () => TEST_WAIT_MS, abort1.signal, q => { if (q) abort1.abort(); }),
+    { name: "AbortError" }
+  );
+  const ticketPath = path.join(dir(), "queue", stuckTicketName);
+  assert.ok(stuckTicketName && existsSync(ticketPath));
+
+  // Another process queues behind our failed ticket; our process never calls acquireHeavySlot again.
+  const other = await worker(t);
+  other.child.send("go");
+  await other.wait("queued");
+  holder();
+
+  // Wait for background interval to retry while still failing.
+  const callsBefore = ticketUnlinkCalls;
+  await until(() => ticketUnlinkCalls >= callsBefore + 2);
+  assert.ok(existsSync(ticketPath), "ticket stays on disk while unlink still fails");
+
+  // Once unlink recovers, the background interval removes the ticket on its own (no polling in our process),
+  // unblocking the other process, and then stops retrying once the failed-ticket set is empty.
+  failTicket = false;
+  await until(() => !existsSync(ticketPath));
+  await other.wait("acquired");
+  other.child.send("release");
+  await other.exited;
+
+  const callsAfterCleared = ticketUnlinkCalls;
+  await delay(80);
+  assert.equal(ticketUnlinkCalls, callsAfterCleared, "background retry interval must stop once failed-ticket set is empty");
 });
 
 test("finding 2: stale reaper frees an own-pid retained checkout lock and heavy slot once all survivors exit", async t => {

@@ -440,6 +440,7 @@ test("finding 2: killUnverified keeps the checkout lock until explicit restore/k
     });
     t.after(() => lifecycle.release());
     await lifecycle.execute(new AbortController().signal);
+    await lifecycle.release();
 
     await until(async () => checks >= 2, Boolean);
     await assert.rejects(acquire(f.cwd, { lockDirectory: f.locks }), CheckoutBusyError);
@@ -476,6 +477,45 @@ test("finding 2: killUnverified keeps the checkout lock until explicit restore/k
     const checksAfterDisposition = checks;
     await new Promise(r => setTimeout(r, 80));
     assert.equal(checks, checksAfterDisposition, `survivor re-check interval must stop on ${mode}()`);
+  }
+});
+
+test("survivor timer frees only the slot while async task waits in input_required; checkout lock stays held until keep/restore", async t => {
+  process.env.BRIDGE_HEAVY_SLOTS = "1";
+  for (const action of ["keep", "restore"] as const) {
+    const f = await asyncFixture(t, none, { survivorCheckIntervalMs: 20 });
+    process.env.BRIDGE_HEAVY_DIR = path.join(f.base, "heavy");
+    const survivor = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], { stdio: "ignore", windowsHide: true });
+    const exited = once(survivor, "exit");
+    t.after(async () => {
+      if (survivor.exitCode === null && survivor.signalCode === null) survivor.kill();
+      await exited;
+    });
+    await once(survivor, "spawn");
+
+    const task = f.start();
+    const run = await f.launched(1);
+    run.fail(new ClineRunError("timeout", "timed out", { processesStillAlive: [survivor.pid!] }));
+    const waiting = await f.wait(task.taskId, "input_required");
+    assert.deepEqual(waiting.evidence?.processesStillAlive, [survivor.pid!]);
+
+    // While survivor lives, both checkout lock and heavy slot remain held.
+    await assert.rejects(acquire(f.cwd, { lockDirectory: f.locks }), CheckoutBusyError);
+    await assert.rejects(acquireHeavySlot(f.cwd, () => 0, new AbortController().signal), { kind: "machine_busy" });
+
+    // Survivor dies and the timer fires: the slot frees immediately, but the checkout lock stays held until keep/restore!
+    survivor.kill();
+    await exited;
+    await until(async () => !fs.existsSync(path.join(process.env.BRIDGE_HEAVY_DIR!, "slot-1.json")), Boolean);
+    const slot = await acquireHeavySlot(f.cwd, () => TEST_WAIT_MS, new AbortController().signal);
+    slot();
+    await assert.rejects(acquire(f.cwd, { lockDirectory: f.locks }), CheckoutBusyError);
+
+    // Explicit keep or restore finishes disposal and frees the checkout lock immediately without waiting for another tick.
+    await f.manager.send(task.taskId, "", action);
+    await f.wait(task.taskId, "done");
+    const lock = await acquire(f.cwd, { lockDirectory: f.locks });
+    lock();
   }
 });
 

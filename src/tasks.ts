@@ -71,6 +71,8 @@ export interface TaskManagerDeps {
   platform?: NodeJS.Platform;
   snapshotOptions?: SnapshotOptions;
   runVerification?: typeof runVerification;
+  /** Optional test seam forwarded to FinalCheckLifecycle for survivors-only re-check cadence. */
+  survivorCheckIntervalMs?: number;
   /**
    * Marks a bridge call as active (see CliStateManager.beginCall). A task holds one for each run segment
    * (start, or a cline_send resume) and releases it when that segment settles, including when it settles
@@ -940,6 +942,7 @@ export class TaskManager {
         maxFixRuns: input.maxFixRuns, guard: input.guard, timeoutSeconds: input.timeoutSeconds ?? DEFAULT_TASK_TIMEOUT_SECONDS }, {
         resolveRoot: editsCheckoutRoot, snapshotOptions: this.deps.snapshotOptions,
         lockDirectory: this.deps.runOptions?.checkoutLockDirectory, verify: this.deps.runVerification,
+        survivorCheckIntervalMs: this.deps.survivorCheckIntervalMs,
         question: parseQuestionFromText,
         fits: prompt => !isPromptTooLarge(prompt, task, getEffectivePreamble("edits", this.deps.runOptions?.promptPreamble ?? ""),
           this.deps.platform ?? process.platform, this.deps.runOptions?.deps),
