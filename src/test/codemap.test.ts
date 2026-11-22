@@ -476,7 +476,10 @@ test("preparation respects the remaining run budget and is charged before Cline 
   await usingCodeindex(echoDeadline, async () => {
     const fake = fakeOptions();
     let tick = 1000;
-    const clockDeps = { ...fake.options.deps, now: () => tick };
+    // The asserted deadlines are computed values; stretch the real kill timer so a slow spawn under
+    // full-suite load cannot fall back to regex (seen 2026-11-22: the 5 s real wait expired).
+    const { setTimeout: slowTimer, clearTimeout: clearSlowTimer } = generousTimers(60_000);
+    const clockDeps = { ...fake.options.deps, now: () => tick, setTimeout: slowTimer, clearTimeout: clearSlowTimer };
     const prepared = await withCodeMap(smallRepo, { prompt: "Inspect", timeoutSeconds: 20, ...selection },
       { ...fake.options, deps: clockDeps, onCodeMapSource: () => { tick += 250; } });
     assert.equal(prepared.codeMapSource, "codeindex");

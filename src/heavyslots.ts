@@ -1,0 +1,139 @@
+/**
+ * Shared v1 heavy-run protocol (UTF-8 JSON). All bridges use the same BRIDGE_HEAVY_DIR
+ * and BRIDGE_HEAVY_SLOTS (default 2, 1..8). Under admission.lock, publish tickets in
+ * queue/<epoch-ms>-<pid>-<uuid>.json with ms >= newest ticket ms + 1. Sort by ms then
+ * filename. Only the head may publish slot-<1..N>.json. All publications hard-link a
+ * completely written unique sibling; .tmp files have no authority.
+ *
+ * Locks carry {pid,time,token}; slots and tickets also carry {bridge,kind:"edit",
+ * checkout,started_at}. Times are UTC ISO strings, token is a UUID, checkout is SHA-256
+ * of the UTF-8 canonical root (lowercase on Windows). Retained leases add survivors
+ * (PID array) and survivor_time (observation time). Reclaim only when the owner AND all
+ * survivors are gone or their PID was reused (5 s tolerance). Windows readers query
+ * process existence/start time non-destructively. Unknown identities stay busy.
+ * Admission lock recovery uses checkoutlock's .reap and .reap-claims protocol. Slot
+ * and ticket reapers compare exact dead metadata again under admission.lock. Owners
+ * remove only their own token. state.json {version:1,slots,active:[{bridge,kind,
+ * started_at}],queued,updated_at} is an atomic best-effort hint; readers recount.
+ */
+import { createHash, randomUUID } from "node:crypto";
+import { mkdirSync, readFileSync, readdirSync, renameSync, rmSync, unlinkSync, writeFileSync } from "node:fs";
+import os from "node:os";
+import path from "node:path";
+import { setTimeout as delay } from "node:timers/promises";
+import { canonicalCheckoutPath, CheckoutBusyError, claimFile, deadHolderText, fileLease, publishHolder, type FileLease } from "./checkoutlock.js";
+import { ClineRunError } from "./runner.js";
+
+export interface QueuePosition { position: number; total: number }
+
+const ticketPattern = /^(\d+)-\d+-[\da-f-]+\.json$/i;
+function tickets(dir: string): string[] {
+  return readdirSync(path.join(dir, "queue")).filter(name => ticketPattern.test(name))
+    .sort((a, b) => parseInt(a) - parseInt(b) || (a < b ? -1 : a > b ? 1 : 0));
+}
+function slotFiles(dir: string): string[] {
+  return readdirSync(dir).filter(name => /^slot-[1-8]\.json$/.test(name));
+}
+function contents(file: string): string | undefined {
+  try { return readFileSync(file, "utf8"); }
+  catch (err) { if ((err as NodeJS.ErrnoException).code !== "ENOENT") throw err; }
+}
+
+function updateState(dir: string, slots: number): void {
+  const tmp = path.join(dir, "state." + randomUUID() + ".tmp");
+  try {
+    const active = slotFiles(dir).flatMap(name => {
+      const text = contents(path.join(dir, name));
+      if (text === undefined) return [];
+      const { bridge, kind, started_at } = JSON.parse(text);
+      return [{ bridge, kind, started_at }];
+    });
+    writeFileSync(tmp, JSON.stringify({ version: 1, slots, active, queued: tickets(dir).length,
+      updated_at: new Date().toISOString() }), { flag: "wx", mode: 0o600 });
+    renameSync(tmp, path.join(dir, "state.json"));
+  } catch { /* A reader or a concurrent hint writer can hold state.json open on Windows. */ }
+  finally { try { rmSync(tmp, { force: true }); } catch { /* hint only */ } }
+}
+
+/** Query processes outside the critical section. Reap only unchanged candidates inside it. */
+async function staleCandidates(dir: string, signal: AbortSignal): Promise<Map<string, string>> {
+  const dead = new Map<string, string>();
+  for (const name of [...slotFiles(dir), ...tickets(dir).map(name => path.join("queue", name))]) {
+    signal.throwIfAborted();
+    const file = path.join(dir, name);
+    const text = contents(file);
+    if (text !== undefined && await deadHolderText(text, signal)) dead.set(file, text);
+  }
+  return dead;
+}
+
+export async function acquireHeavySlot(root: string, waitMs: () => number, signal: AbortSignal,
+  onQueue?: (queue?: QueuePosition) => void): Promise<FileLease> {
+  const dir = process.env.BRIDGE_HEAVY_DIR || path.join(os.homedir(), ".cline-mcp", "heavy");
+  const configured = Number(process.env.BRIDGE_HEAVY_SLOTS || 2);
+  const slots = Number.isInteger(configured) ? Math.max(1, Math.min(8, configured)) : 2;
+  mkdirSync(path.join(dir, "queue"), { recursive: true });
+  const token = randomUUID();
+  const time = new Date().toISOString();
+  const metadata = { pid: process.pid, time, token, bridge: "cline", kind: "edit",
+    checkout: createHash("sha256").update(canonicalCheckoutPath(root)).digest("hex"), started_at: time };
+  const admission = path.join(dir, "admission.lock");
+  let ticket: string | undefined;
+  const busy = () => new ClineRunError("machine_busy",
+    `Heavy-run slots busy: ${slotFiles(dir).length} active, ${tickets(dir).length} queued. Retry later or send the edit elsewhere.`,
+    { attempts: 0 });
+  const deadline = AbortSignal.timeout(Math.max(1, Math.ceil(waitMs())));
+  const waiting = AbortSignal.any([signal, deadline]);
+  try {
+    while (true) {
+      waiting.throwIfAborted();
+      const dead = await staleCandidates(dir, waiting);
+      const admissionToken = randomUUID();
+      let admitted = false;
+      try {
+        await claimFile(admission, admissionToken, dir, () => publishHolder(admission, {
+          pid: process.pid, time: new Date().toISOString(), token: admissionToken
+        }), waiting);
+        admitted = true;
+      } catch (error) { if (!(error instanceof CheckoutBusyError)) throw error; }
+      if (admitted) {
+        try {
+          waiting.throwIfAborted();
+          for (const [file, text] of dead) if (contents(file) === text) unlinkSync(file);
+          const queue = tickets(dir);
+          const occupied = slotFiles(dir);
+          const index = Array.from({ length: slots }, (_, i) => i + 1).find(i => !occupied.includes(`slot-${i}.json`));
+          if (waitMs() < 0) throw busy();
+          if (index && occupied.length < slots && (!queue.length || queue[0] === ticket)) {
+            const file = path.join(dir, `slot-${index}.json`);
+            publishHolder(file, { ...metadata, started_at: new Date().toISOString() });
+            const owner = fileLease(file, token);
+            try {
+              if (ticket) { unlinkSync(path.join(dir, "queue", ticket)); ticket = undefined; }
+              updateState(dir, slots);
+              return Object.assign(() => { owner(); updateState(dir, slots); }, { retain: owner.retain });
+            } catch (error) { owner(); throw error; }
+          }
+          if (!ticket) {
+            const stamp = Math.max(Date.now(), queue.length ? parseInt(queue[queue.length - 1]) + 1 : 0);
+            const name = `${stamp}-${process.pid}-${token}.json`;
+            publishHolder(path.join(dir, "queue", name), metadata);
+            ticket = name;
+            queue.push(name);
+            updateState(dir, slots);
+          } else if (dead.size) updateState(dir, slots);
+          onQueue?.({ position: queue.indexOf(ticket) + 1, total: queue.length });
+        } finally { fileLease(admission, admissionToken)(); }
+      }
+      if (waitMs() <= 0) throw busy();
+      await delay(1000, undefined, { signal: waiting });
+    }
+  } catch (err) {
+    signal.throwIfAborted();
+    if (deadline.aborted) throw busy();
+    throw err;
+  } finally {
+    if (ticket) { fileLease(path.join(dir, "queue", ticket), token)(); updateState(dir, slots); }
+    onQueue?.();
+  }
+}

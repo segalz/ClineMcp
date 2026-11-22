@@ -2,7 +2,8 @@ import { RESTORE_BUDGET_MS, boundedSignal, settlementBudget } from "./waits.js";
 import { z } from "zod";
 import path from "node:path";
 import { realpath } from "node:fs/promises";
-import { acquire, ownsCheckoutLock, type CheckoutRelease } from "./checkoutlock.js";
+import { acquire, ownsCheckoutLock, type CheckoutRelease, type FileLease } from "./checkoutlock.js";
+import { acquireHeavySlot, type QueuePosition } from "./heavyslots.js";
 import { takeSnapshot, restoreSnapshot, discardSnapshot, createdFiles, headAndIndexIdentity, type SnapshotHandle, type SnapshotOptions } from "./snapshot.js";
 import { resolveVerificationCommand, runVerification, VerificationError, type VerificationResult } from "./verify.js";
 import { ClineRunError, DedicatedHubSession, redactSecrets, guardOptionsSchema, type ClineResponse } from "./runner.js";
@@ -61,6 +62,7 @@ export interface FinalCheckDeps {
   fits: (prompt: string) => boolean;
   question: (text: string) => { question: string; options?: string[] } | undefined;
   snapshotOptions?: SnapshotOptions; lockDirectory?: string; checkoutLock?: CheckoutRelease;
+  onQueue?: (queue?: QueuePosition) => void;
   verify?: typeof runVerification;
   /** Up-front check that the verify command can start (default: the real resolver; skipped when only `verify` is injected). */
   resolveVerify?: typeof resolveVerificationCommand;
@@ -117,7 +119,9 @@ export class FinalCheckLifecycle {
   workDir: string;
   lock?: CheckoutRelease; snapshot?: SnapshotHandle;
   identity?: Awaited<ReturnType<typeof headAndIndexIdentity>>;
-  phase: "snapshot" | "run" | "verify" | "restore" | "waiting" | "done" = "snapshot";
+  private slot?: FileLease;
+  queue?: QueuePosition;
+  phase: "queued" | "snapshot" | "run" | "verify" | "restore" | "waiting" | "done" = "snapshot";
   waitReason?: EditWaitReason; question?: { question: string; options?: string[] }; error?: unknown;
   evidence: Record<string, unknown> = {}; result?: ClineResponse;
   readonly hubWarnings: string[] = [];
@@ -133,6 +137,9 @@ export class FinalCheckLifecycle {
   private recordUnconfirmedKill(pids: number[] = [], unverified?: boolean): void {
     const previous = this.evidence.processesStillAlive as number[] | undefined;
     this.evidence.processesStillAlive = [...new Set([...(previous ?? []), ...pids])];
+    // Persist evidence as soon as the process stop is known, including after a passing check.
+    const survivors = this.evidence.processesStillAlive as number[];
+    try { this.lock?.retain(survivors); } finally { this.slot?.retain(survivors); }
     if (unverified) this.evidence.killUnverified = true;
     this.evidence.warning = "A surviving process may still change files, including after restoration.";
     if (this.snapshot) this.evidence.snapshotDirectory = this.snapshot.directory;
@@ -219,9 +226,6 @@ export class FinalCheckLifecycle {
         const workDir = await subfolderOf(this.root, this.input.cwd);
         if (workDir === undefined) throw new ClineRunError("workspace_not_git", "The requested cwd is not inside its Git checkout.");
         this.workDir = workDir;
-        this.lock = ownsCheckoutLock(this.deps.checkoutLock, this.root) ? this.deps.checkoutLock
-          : await acquire(this.root, { lockDirectory: this.deps.lockDirectory, signal: controller.signal });
-        this.releaseOwnLock = this.lock !== this.deps.checkoutLock;
       }
       // A check that cannot even start makes the run pointless: refuse before the snapshot and any launch.
       const resolveVerify = this.deps.resolveVerify ?? (this.deps.verify ? undefined : resolveVerificationCommand);
@@ -234,6 +238,25 @@ export class FinalCheckLifecycle {
         }
         check();
       }
+      const verifyReserveMs = "none" in this.input.verify ? 0 : (this.input.verify.timeoutSeconds ?? 60) * 1000 + VERIFY_RESERVE_MARGIN_MS;
+      const available = () => remaining - (now() - started) - verifyReserveMs;
+      const waitMs = () => available() - MIN_FIRST_RUN_SECONDS * 1000;
+      if (waitMs() < 0) {
+        wait("budget", new ClineRunError("budget_exceeded",
+          `Only ${Math.max(0, Math.floor(available() / 1000))} s of the call's budget would be left for Cline after reserving ` +
+          `${Math.round(verifyReserveMs / 1000)} s for the check. Lower verify.timeoutSeconds or raise timeoutSeconds.`, { attempts: 0 }));
+        return;
+      }
+      this.slot ??= await acquireHeavySlot(this.root, waitMs, controller.signal, queue => {
+        this.queue = queue;
+        if (queue) this.phase = "queued";
+        this.deps.onQueue?.(queue);
+      });
+      if (!this.lock) {
+        this.lock = ownsCheckoutLock(this.deps.checkoutLock, this.root) ? this.deps.checkoutLock
+          : await acquire(this.root, { lockDirectory: this.deps.lockDirectory, signal: controller.signal });
+        this.releaseOwnLock = this.lock !== this.deps.checkoutLock;
+      }
       if (!this.snapshot) {
         this.phase = "snapshot";
         this.identity = await headAndIndexIdentity(this.root, controller.signal); check();
@@ -244,7 +267,6 @@ export class FinalCheckLifecycle {
       if (!this.deps.fits(prompt)) throw new ClineRunError("launch_failed", "Edit prompt exceeds prompt limits.");
       this.question = undefined; this.waitReason = undefined; this.error = undefined;
       const manual = guidance !== undefined;
-      const verifyReserveMs = "none" in this.input.verify ? 0 : (this.input.verify.timeoutSeconds ?? 60) * 1000 + VERIFY_RESERVE_MARGIN_MS;
       while (true) {
         check();
         if (!await this.unchanged(controller.signal, wait)) return;
@@ -259,7 +281,7 @@ export class FinalCheckLifecycle {
         }
         // The check's time is reserved up front; refuse a first run left too short to do real work rather than
         // spend the model on a run that can only time out (live use 2026-11-21: verify 240 s of 300 s left 47 s).
-        if (this.launches === 0 && verifyReserveMs > 0 && remainingSeconds < MIN_FIRST_RUN_SECONDS) {
+        if (this.launches === 0 && remainingSeconds < MIN_FIRST_RUN_SECONDS) {
           wait("budget", new ClineRunError("budget_exceeded",
             `Only ${remainingSeconds} s of the call's budget would be left for Cline after reserving ` +
             `${Math.round(verifyReserveMs / 1000)} s for the check. Lower verify.timeoutSeconds or raise timeoutSeconds.`));
@@ -369,6 +391,7 @@ export class FinalCheckLifecycle {
           }
         } else if (pendingWait) this.wait(pendingWait.reason, pendingWait.error);
       } finally {
+        if (!this.lock) this.releaseSlot();
         cleanupBudget.dispose();
         clearTimeout(timer); signal.removeEventListener("abort", abort); this.activeMs += now() - started;
       }
@@ -416,5 +439,13 @@ export class FinalCheckLifecycle {
       catch (error) { (this.evidence as Record<string, unknown>).snapshotCleanupError = `${snapshot.directory}: ${(error as Error)?.message ?? String(error)}`; }
     }
   }
-  release(): void { if (this.releaseOwnLock) this.lock?.(); this.lock = undefined; }
+  releaseSlot(): void {
+    if (this.killUnconfirmed) return;
+    this.slot?.(); this.slot = undefined;
+  }
+  release(): void {
+    if (this.killUnconfirmed) return;
+    try { if (this.releaseOwnLock) this.lock?.(); this.lock = undefined; }
+    finally { this.releaseSlot(); }
+  }
 }

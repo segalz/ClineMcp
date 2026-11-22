@@ -1,3 +1,4 @@
+import "./heavy-test-dir.js";
 import assert from "node:assert/strict";
 import childProcess from "node:child_process";
 import { EventEmitter } from "node:events";
@@ -502,7 +503,7 @@ test("a restore that hits RESTORE_BUDGET_MS mid-loop finishes the current file, 
   t.after(() => { gitMock.mock.restore(); syncBuiltinESMExports(); });
 
   const lifecycle = new FinalCheckLifecycle(
-    { prompt: "Edit", cwd: root, verify: { none: true, reason: "Partial restore fixture" }, timeoutSeconds: 60 },
+    { prompt: "Edit", cwd: root, verify: { none: true, reason: "Partial restore fixture" }, timeoutSeconds: 120 },
     {
       resolveRoot: async () => root, fits: () => true, question: text => text.startsWith("QUESTION:") ? { question: text } : undefined,
       lockDirectory: locks, snapshotOptions: { snapshotBase: snapshots },
@@ -552,7 +553,8 @@ test("a restore that hits RESTORE_BUDGET_MS mid-loop finishes the current file, 
 test("an unconfirmed kill never triggers an automatic restore in sync edits or cancelled lifecycle", async t => {
   const base = await mkdtemp(path.join(os.tmpdir(), "unconfirmed-no-restore-"));
   t.after(() => rm(base, { recursive: true, force: true, maxRetries: 5 }));
-  const root = path.join(base, "repo"), snapshots = path.join(base, "snapshots"), locks = path.join(base, "locks");
+  let root = path.join(base, "repo");
+  const snapshots = path.join(base, "snapshots"), locks = path.join(base, "locks");
   await mkdir(root);
   await writeFile(path.join(root, "a.txt"), "baseline");
   const gitMock = t.mock.method(childProcess, "spawn", (_file: string, args: string[]) => {
@@ -572,7 +574,7 @@ test("an unconfirmed kill never triggers an automatic restore in sync edits or c
   // 1. Cancelled FinalCheckLifecycle with unconfirmed kill: must NOT restore.
   const controller = new AbortController();
   const lifecycle = new FinalCheckLifecycle(
-    { prompt: "Edit", cwd: root, verify: { none: true, reason: "Unconfirmed cancel fixture" }, timeoutSeconds: 60 },
+    { prompt: "Edit", cwd: root, verify: { none: true, reason: "Unconfirmed cancel fixture" }, timeoutSeconds: 120 },
     {
       resolveRoot: async () => root, fits: () => true, question: () => undefined,
       lockDirectory: locks, snapshotOptions: { snapshotBase: snapshots },
@@ -592,6 +594,7 @@ test("an unconfirmed kill never triggers an automatic restore in sync edits or c
   assert.equal(lifecycle.evidence.snapshotDirectory, lifecycle.snapshot.directory);
   lifecycle.release();
 
+  root = await mkdtemp(path.join(base, "sync-"));
   // 2. Sync applyClineEdits with unconfirmed kill: must NOT restore; error carries snapshotDirectory and processesStillAlive.
   await writeFile(path.join(root, "a.txt"), "baseline");
   const prevSnapDir = process.env.CLINE_MCP_SNAPSHOT_DIR;
@@ -625,7 +628,14 @@ test("an unconfirmed kill never triggers an automatic restore in sync edits or c
     }
   );
   assert.equal(await readFile(path.join(root, "a.txt"), "utf8"), "edited-sync", "sync edits must not restore while kill is unconfirmed");
+  for (const lease of [checkoutLockPath(root, locks), path.join(process.env.BRIDGE_HEAVY_DIR!, "slot-2.json")]) {
+    const holder = JSON.parse(await readFile(lease, "utf8"));
+    assert.deepEqual(holder.survivors, [4242]); assert.equal(holder.pid, process.pid);
+  }
+  await assert.rejects(acquire(root, { lockDirectory: locks }), CheckoutBusyError);
 
+  root = await mkdtemp(path.join(base, "async-"));
+  process.env.BRIDGE_HEAVY_DIR = path.join(base, "async-heavy");
   // 3. Async TaskManager.cancel() while running with unconfirmed kill: stays waiting (input_required), retry refused, restore/keep offered, no auto-restore.
   await writeFile(path.join(root, "a.txt"), "baseline");
   let runStarted!: () => void;
@@ -751,7 +761,7 @@ test("timeout during keep preserves the snapshot and does not mark edits kept", 
   t.after(() => { gitMock.mock.restore(); syncBuiltinESMExports(); });
 
   const lifecycle = new FinalCheckLifecycle(
-    { prompt: "Edit", cwd: root, verify: { none: true, reason: "Keep timeout fixture" }, timeoutSeconds: 60 },
+    { prompt: "Edit", cwd: root, verify: { none: true, reason: "Keep timeout fixture" }, timeoutSeconds: 120 },
     {
       resolveRoot: async () => root, fits: () => true, question: text => text.startsWith("QUESTION:") ? { question: text } : undefined,
       lockDirectory: locks, snapshotOptions: { snapshotBase: snapshots },
@@ -818,7 +828,8 @@ test("combined runner confirmation and dedicated hub stop share one settlement b
 test("a child alive outside a drained Job Object is NOT confirmed in verify or runner, and triggers no auto-restore", async t => {
   const base = await mkdtemp(path.join(os.tmpdir(), "job-escape-"));
   t.after(() => rm(base, { recursive: true, force: true, maxRetries: 5 }));
-  const root = path.join(base, "repo"), snapshots = path.join(base, "snapshots"), locks = path.join(base, "locks");
+  let root = path.join(base, "repo");
+  const snapshots = path.join(base, "snapshots"), locks = path.join(base, "locks");
   await mkdir(root);
   await writeFile(path.join(root, "a.txt"), "baseline");
 
@@ -917,6 +928,7 @@ test("a child alive outside a drained Job Object is NOT confirmed in verify or r
   t.after(() => { gitStub.mock.restore(); syncBuiltinESMExports(); });
 
   for (const mode of ["timeout", "pipesHeldOpen"] as const) {
+    root = await mkdtemp(path.join(base, mode));
     await writeFile(path.join(root, "a.txt"), "baseline");
     const alivePid = mode === "timeout" ? 9003 : 9004;
     let tableCalls = 0;

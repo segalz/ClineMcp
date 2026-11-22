@@ -474,6 +474,7 @@ export interface TaskStatusView {
   codeMapSource: CodeMapSource;
   verification?: FinalVerification;
   phase?: FinalCheckLifecycle["phase"];
+  queue?: FinalCheckLifecycle["queue"];
   waitReason?: EditWaitReason;
   evidence?: Record<string, unknown>;
   taskId: string;
@@ -506,7 +507,7 @@ const runnerDefaults: Record<TaskMode, Runner> = {
 const LOCAL_FAILURE_KINDS = new Set([
   "workspace_not_git", "workspace_setup_failed", "workspace_cleanup_failed", "settings_lock_timeout",
   "settings_restore_failed", "launch_failed", "catalog_unavailable", "edits_inspection_failed", "cline_updating",
-  "task_limit", "task_not_found", "task_running", "task_not_waiting", "checkout_busy"
+  "task_limit", "task_not_found", "task_running", "task_not_waiting", "checkout_busy", "machine_busy"
 ]);
 
 function noteFor(task: Task): string | undefined {
@@ -827,7 +828,7 @@ export class TaskManager {
       if (cancelled && (!lifecycle.killUnconfirmed || action === "cancel")) {
         nextState = "cancelled"; nextError = new ClineRunError("cancelled", "The task was cancelled.");
       } else if (lifecycle.phase === "waiting") {
-        nextState = lifecycle.lock ? "input_required" : "failed"; nextError = lifecycle.error;
+        nextState = lifecycle.lock || lifecycle.waitReason === "budget" ? "input_required" : "failed"; nextError = lifecycle.error;
       } else {
         nextState = "done";
         // Collect report-only Git diff/status before releasing the checkout lock.
@@ -868,7 +869,8 @@ export class TaskManager {
         ...(warnings.length ? { warnings } : {})
       };
       task.endedAt = this.wallNow(); task.activeMs += task.endedAt - started;
-      if (nextState !== "input_required") this.releaseCheckout(task);
+      if (nextState === "input_required") lifecycle.releaseSlot();
+      else this.releaseCheckout(task);
       task.error = nextError; task.state = nextState;
     });
   }
@@ -911,6 +913,7 @@ export class TaskManager {
         maxFixRuns: input.maxFixRuns, guard: input.guard, timeoutSeconds: input.timeoutSeconds ?? DEFAULT_TASK_TIMEOUT_SECONDS }, {
         resolveRoot: editsCheckoutRoot, snapshotOptions: this.deps.snapshotOptions,
         lockDirectory: this.deps.runOptions?.checkoutLockDirectory, verify: this.deps.runVerification,
+        onQueue: queue => { if (queue) task.state = "running"; },
         question: parseQuestionFromText,
         fits: prompt => !isPromptTooLarge(prompt, task, getEffectivePreamble("edits", this.deps.runOptions?.promptPreamble ?? ""),
           this.deps.platform ?? process.platform, this.deps.runOptions?.deps),
@@ -1136,6 +1139,7 @@ export class TaskManager {
       resultReady: task.state !== "running" && task.state !== "resuming",
       trace: task.trace,
       ...(task.finalCheck ? { verification: structuredClone(task.finalCheck.verification), phase: task.finalCheck.phase,
+        ...(task.finalCheck.queue ? { queue: { ...task.finalCheck.queue } } : {}),
         waitReason: task.waitReason, evidence: structuredClone(task.evidence) } : {}),
 
     };

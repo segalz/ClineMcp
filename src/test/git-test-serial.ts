@@ -1,3 +1,4 @@
+import "./heavy-test-dir.js";
 import { after } from "node:test";
 import { createHash } from "node:crypto";
 import { mkdir } from "node:fs/promises";

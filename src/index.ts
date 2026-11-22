@@ -141,7 +141,7 @@ server.registerTool(
       "verify is checked before the run (a missing command is refused at once, with no model use) and runs in the requested cwd " +
       "(e.g. a monorepo package), not the repository root. A passing check is final: nothing after it restores the edit. " +
       "If a stopped process may still be running, no repair runs, nothing is restored automatically, and the recovery snapshot is kept (evidence.snapshotDirectory). " +
-      "Internal waits follow the call's budget, so a busy machine slows the call instead of failing it. " +
+      "Edits share machine-wide FIFO slots. If waiting leaves too little time for a run and check, the call returns machine_busy. " +
       "The check's timeout plus 10 s is reserved from timeoutSeconds; if less than 60 s would be left for Cline, the call is refused before the model starts. " +
       "With an MCP progressToken the call sends notifications/progress every 15 s. " +
       "For model-picker log_run pass the returned usage as tokens and write=true.",
@@ -159,11 +159,11 @@ server.registerTool(
       keepOnFailure: z.boolean().optional()
     }
   },
-  async (input, extra) => withProgressHeartbeat(extra, async () => {
+  async (input, extra) => withProgressHeartbeat(extra, async (onHeavyQueue) => {
     await beforeToolCall();
     try {
       const { guard, ...rest } = input;
-      const result = await track(extra.signal, signal => applyClineEdits(rest, signal, { trace: true, ...(guard ? { guard } : {}) }));
+      const result = await track(extra.signal, signal => applyClineEdits(rest, signal, { trace: true, onHeavyQueue, ...(guard ? { guard } : {}) }));
       return await replyJson({
         text: result.text,
         ...(result.model ? { model: result.model } : {}),

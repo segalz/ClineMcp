@@ -1,3 +1,4 @@
+import "./heavy-test-dir.js";
 import assert from "node:assert/strict";
 import childProcess from "node:child_process";
 import { EventEmitter } from "node:events";
@@ -8,6 +9,7 @@ import os from "node:os";
 import path from "node:path";
 import { PassThrough } from "node:stream";
 import test, { after } from "node:test";
+import { acquire, checkoutLockPath } from "../checkoutlock.js";
 import { FinalCheckLifecycle } from "../finalcheck.js";
 import { extractLastJsonlError } from "../parser.js";
 import { ClineRunError, runCline, stopDedicatedHub } from "../runner.js";
@@ -74,6 +76,13 @@ for (const stage of ["before check", "after pass", "explicit opt-out"] as const)
     assert.equal(lifecycle.phase, committed ? "done" : "waiting");
     assert.deepEqual(lifecycle.evidence.processesStillAlive, []);
     assert.equal(lifecycle.evidence.killUnverified, true);
+    lifecycle.release();
+    const locks = path.join(base, "locks");
+    for (const lease of [checkoutLockPath(root, locks), path.join(process.env.BRIDGE_HEAVY_DIR!, "slot-1.json")]) {
+      const holder = JSON.parse(await fs.readFile(lease, "utf8"));
+      assert.equal(holder.pid, process.pid); assert.deepEqual(holder.survivors, []);
+    }
+    await assert.rejects(acquire(root, { lockDirectory: locks }), { kind: "checkout_busy" });
     await lifecycle.execute(signal, "try again");
     assert.equal(runs, 1);
     if (committed) {
@@ -236,13 +245,14 @@ test("S20 (7): publishing the same async edit error twice keeps one hub note", a
 
 test("final check: a passing edit is never restored because its hub stop outlasts the deadline", async t => {
   const root = await checkout(t);
-  const lifecycle = new FinalCheckLifecycle({ prompt: "Edit", cwd: root, timeoutSeconds: 2,
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  const lifecycle = new FinalCheckLifecycle({ prompt: "Edit", cwd: root, timeoutSeconds: 120,
     verify: { none: true, reason: "Test opt-out for the commit point" } }, {
     resolveRoot: async () => root, fits: () => true, question: () => undefined, lockDirectory: path.join(base, "locks"),
     snapshotOptions: { snapshotBase: path.join(base, "snapshots") },
     run: async (_prompt, _signal, _lock, _guard, _remaining, _run, hub) => {
-      // The hub stop takes longer than the whole 2 s budget, but it stops cleanly (confirmed).
-      await hub.environment(root, { deps: { startHub: async () => ({ env: {}, stop: () => new Promise<void>(r => setTimeout(r, 2_500)) }) } } as any);
+      // Advance beyond the active-time deadline while the confirmed stop is in progress.
+      await hub.environment(root, { deps: { startHub: async () => ({ env: {}, stop: async () => { t.mock.timers.tick(120_500); } }) } } as any);
       hub.launched = true;
       return { text: "done", durationMs: 0, guard: { window: 10, totalToolCalls: 0, totalInputTokens: 0,
         filesTouched: [], lastErrors: [], processToolCalls: 0 } } as any;

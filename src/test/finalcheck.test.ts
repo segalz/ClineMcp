@@ -13,6 +13,7 @@ import { applyClineEdits, editPromptFits, editQuestion } from "../edits.js";
 import { ClineRunError } from "../runner.js";
 import { headAndIndexIdentity } from "../snapshot.js";
 import { acquire } from "../checkoutlock.js";
+import { acquireHeavySlot, type QueuePosition } from "../heavyslots.js";
 import { VerificationError } from "../verify.js";
 
 const snapshotDir = await mkdtemp(path.join(os.tmpdir(), "cline-finalcheck-snapshots-"));
@@ -302,4 +303,52 @@ test("overall active-time budget stops a run and survives manual retries", async
   const again = await f.wait(task.taskId, "input_required");
   assert.equal(again.waitReason, "budget"); assert.equal(f.runs.length, launches);
   await f.manager.cancel(task.taskId); await f.clean();
+});
+
+test("sync queue give-up spends no model run, snapshot or checkout lease; invalid budgets and verifiers keep their own errors", async t => {
+  const f = await fixture(t);
+  process.env.BRIDGE_HEAVY_SLOTS = "1";
+  const release = await acquireHeavySlot(f.cwd, () => TEST_WAIT_MS, new AbortController().signal);
+  t.after(release);
+  const input = { prompt: "edit", provider: "p", model: "m", cwd: f.cwd, verify: none, timeoutSeconds: 63 };
+  let queued = false, launches = 0;
+  const options = { checkoutLockDirectory: f.locks, onHeavyQueue: (q?: QueuePosition) => { if (q) queued = true; },
+    deps: { spawn: (() => { launches++; throw new Error("unexpected launch"); }) as never } };
+  await assert.rejects(applyClineEdits({ ...input, timeoutSeconds: 30 }, undefined, options), { kind: "budget_exceeded" });
+  await assert.rejects(applyClineEdits({ ...input, verify: { command: "nonexistent-f10-verifier" } }, undefined, options),
+    { kind: "launch_failed" });
+  assert.equal(queued, false);
+  const before = await readdir(snapshotDir);
+  await assert.rejects(applyClineEdits(input, undefined, options), (error: any) => {
+    assert.equal(error.kind, "machine_busy"); assert.equal(error.attempts, 0);
+    assert.match(error.message, /1 active, 1 queued.*retry/i); return true;
+  });
+  assert.equal(queued, true); assert.equal(launches, 0);
+  assert.deepEqual(await readdir(snapshotDir), before);
+  assert.deepEqual(await readdir(path.join(process.env.BRIDGE_HEAVY_DIR!, "queue")), []);
+  const lock = await acquire(f.cwd, { lockDirectory: f.locks }); lock();
+});
+
+test("async input_required releases only the slot; retry queues, and cancellation cleans up both queued and running edits", async t => {
+  process.env.BRIDGE_HEAVY_SLOTS = "1";
+  const f = await asyncFixture(t, none);
+  const task = f.start();
+  (await f.launched(1)).finish("QUESTION: Continue?");
+  await f.wait(task.taskId, "input_required");
+  const other = await acquireHeavySlot(f.cwd, () => TEST_WAIT_MS, new AbortController().signal);
+  t.after(other);
+  await assert.rejects(acquire(f.cwd, { lockDirectory: f.locks }), { kind: "checkout_busy" });
+  await f.manager.send(task.taskId, "Continue");
+  const status = await until(() => f.manager.status(task.taskId), s => s.phase === "queued");
+  assert.equal(status.state, "running"); assert.deepEqual(status.queue, { position: 1, total: 1 });
+  assert.equal(f.runs.length, 1);
+  await f.manager.cancel(task.taskId); await f.clean();
+  const heavy = process.env.BRIDGE_HEAVY_DIR!;
+  assert.deepEqual(await readdir(path.join(heavy, "queue")), []);
+  other();
+  const next = f.start(); await f.launched(2);
+  assert.equal(JSON.parse(await readFile(path.join(heavy, "slot-1.json"), "utf8")).pid, process.pid);
+  assert.equal((await f.manager.cancel(next.taskId)).state, "cancelled");
+  await assert.rejects(readFile(path.join(heavy, "slot-1.json")), { code: "ENOENT" });
+  const lock = await acquire(f.cwd, { lockDirectory: f.locks }); lock();
 });

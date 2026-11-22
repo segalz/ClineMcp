@@ -198,7 +198,7 @@ export async function applyClineEdits(
 ): Promise<ClineEditsResponse> {
   const verify = verificationSchema.parse(input.verify);
   const lifecycle: FinalCheckLifecycle = new FinalCheckLifecycle({ ...input, guard: options.guard ?? input.guard, verify, timeoutSeconds: input.timeoutSeconds ?? 180 }, {
-    resolveRoot: editsCheckoutRoot, checkoutLock: options.checkoutLock, lockDirectory: options.checkoutLockDirectory,
+    resolveRoot: editsCheckoutRoot, onQueue: options.onHeavyQueue, checkoutLock: options.checkoutLock, lockDirectory: options.checkoutLockDirectory,
     fits: prompt => editPromptFits({ ...input, cwd: lifecycle.workDir, prompt }, options), question: editQuestion,
     run: (prompt, runSignal, lock, guard, remainingSeconds, _run, editHub) => runEdits({ ...input, prompt, cwd: lifecycle.workDir,
       timeoutSeconds: remainingSeconds, guard }, lifecycle.workDir, runSignal,

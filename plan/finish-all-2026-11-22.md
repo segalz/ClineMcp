@@ -33,6 +33,11 @@ Rule from earlier work: the reviewer is always from a different family than the 
 - **F6 ready.** Upstream 0.40 merged into the fork on branch `update-0.40` with no conflicts. The fork has no code of its own, so it equals upstream, and the Opus review has nothing to review. The suite has 1 live failure: agy 1.5.14 lists `gemini-4-neon` and `gemini-pro-orchestrator-neon`, which upstream's docs do not name. Documented in the fork (13d073a); 2124 passed. The new read-only default is opt-in (`AGENT_INTERN_AGY_DEFAULT=plan`), so AGY write mode is unchanged. Merge plus restart wait for the owner.
 - **F8 done: 5 of 6 passed, gate met.** No unranged long reads and no repeated identical reads, so 14.1 and 14.2 are skipped. The one failure was Lightning over-escaping a regex line. A bridge fault found along the way (a guard-stopped run reported `durationMs` 0) was fixed on branch `fix/failed-run-duration`. Details: `plan/cline-bridge-v2/stage14-results.md`.
 - **F10 spec written:** `plan/f10-heavy-queue.md`.
+- **Owner approvals (2026-11-22, 07:45):**
+  - F7 was fast-forward merged to model-picker `main` (e1c57c4) and pushed.
+  - The F8 fix was merged to ClineMcp `main` (50b45c2) and pushed.
+  - F2 was applied to `~/.claude/CLAUDE.md` and `~/.codex/AGENTS.md`; backups are `.bak-2026-11-22`. **F2 done.**
+  - F6 was approved later and fast-forward merged: fork `main` 13d073a (0.40.0), pushed. After the owner restarts, `codex_status` should show v0.40.0.
 - **F3 decided (owner, 2026-11-22):** `ui` and `general` writes stay with AGY. The free bonus stays on coding, debugging and testing. No code change; the decision is written into CLAUDE.md wording (F2).
 
 ## Order

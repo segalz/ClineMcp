@@ -1,3 +1,5 @@
+import type { QueuePosition } from "./heavyslots.js";
+
 export interface ProgressNotification {
   method: "notifications/progress";
   params: {
@@ -19,16 +21,17 @@ export interface ProgressExtra {
  */
 export async function withProgressHeartbeat<T>(
   extra: ProgressExtra | undefined,
-  work: () => Promise<T>,
+  work: (onQueue: (queue?: QueuePosition) => void) => Promise<T>,
   options: { intervalMs?: number } = {}
 ): Promise<T> {
   const progressToken = extra?._meta?.progressToken;
   // Any string (the empty string too) or number is a valid MCP progress token.
   if ((typeof progressToken !== "string" && typeof progressToken !== "number") || typeof extra?.sendNotification !== "function") {
-    return work();
+    return work(() => {});
   }
   const intervalMs = options.intervalMs ?? 15_000;
   const sendNotification = extra.sendNotification;
+  let queue: QueuePosition | undefined;
   let progress = 0;
   let settled = false;
   const startedAt = Date.now();
@@ -42,7 +45,7 @@ export async function withProgressHeartbeat<T>(
         params: {
           progressToken,
           progress,
-          message: `still running, ${elapsedSec} s elapsed`
+          message: queue ? `queued for a heavy-run slot: position ${queue.position} of ${queue.total}` : `still running, ${elapsedSec} s elapsed`
         }
       })).catch(() => {});
     } catch {
@@ -51,7 +54,7 @@ export async function withProgressHeartbeat<T>(
   }, intervalMs);
   timer.unref?.();
   try {
-    return await work();
+    return await work(position => { queue = position; });
   } finally {
     settled = true;
     clearInterval(timer);

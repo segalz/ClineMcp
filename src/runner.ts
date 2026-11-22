@@ -97,6 +97,7 @@ export const guardOptionsSchema = z
 
 export type ClineErrorKind =
   | "checkout_busy"
+  | "machine_busy"
   | "settings_lock_timeout"
   | "settings_restore_failed"
   | "timeout"
@@ -270,6 +271,7 @@ export interface ClineInvocationOptions {
   checkoutRoot?: string;
   /** Override for isolated tests; production uses ~/.cline-mcp/locks. */
   checkoutLockDirectory?: string;
+  onHeavyQueue?: (queue?: import("./heavyslots.js").QueuePosition) => void;
   autoApprove?: boolean;
   cwd?: string;
   systemPrompt?: string;

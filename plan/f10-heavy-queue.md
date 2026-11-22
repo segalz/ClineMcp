@@ -69,6 +69,17 @@ These override the design above where they differ.
    - OpenCode: acquire in `runEdits` just before the checkout `acquire` (`edits.js:202`), release in its `finally`, subject to rule 3.
    - model-picker: an uncached reader next to the Cline status reader in `probes.py`, read once per write pick and once per `backend_status`. When every slot is full and a waiter exists, rank eligible non-bridge units first in both ranking passes, rather than relying on a penalty alone. Keep the fallback selection, and emit one warning even when every eligible choice is a bridge.
 
+## Opus review of step A (Cline, uncommitted, 2026-11-22): REJECT, fix before step B
+
+The design passed: FIFO, admission, budget separation, the `machine_busy` path and cancel are correct. To fix:
+
+1. **Medium: orphan ticket or slot.** `publishHolder` throws when deleting the `.tmp` fails after a successful link (`checkoutlock.ts:218`). `heavyslots.ts:120` then never records `ticket`, and a live-pid orphan at the head of the queue blocks every waiter until a restart. The same happens if the release at line 136 throws. Ignore `rmTemp` errors after a successful link, record `ticket` before cleanup, and make ticket release best-effort with a retry.
+2. **Medium: a retained lease never heals.** After an unconfirmed kill (including `killUnverified` with no survivors), `release()` (`finalcheck.ts:442-447`) and `CheckoutRelease` (`checkoutlock.ts:320`) return early forever, and the reaper never frees the bridge's own pid. Two such events leave the machine at `machine_busy` until a restart. Re-check the survivors on release, keep and restore, and free both leases when all survivors are gone; or let the reaper free an own-pid retained lease whose survivors are all dead.
+3. **Medium: retries need 60 s.** The new pre-slot check (`finalcheck.ts:244`) applies `MIN_FIRST_RUN_SECONDS` to every `execute`. Apply the 60 s floor only when `launches === 0`, and otherwise 1 s, as before.
+4. **Medium: cleanup can throw.** `recordUnconfirmedKill` → `retain` (`finalcheck.ts:142`) and `fileLease` (`checkoutlock.ts:231`) rethrow. One effect is that a passed check turns into `cline_error`. Make retain and release best-effort, and record failures in evidence.
+5. **Low:** `staleCandidates` starts one PowerShell per foreign lease on every 1 s poll. Cache start times by (pid, time) for the length of the wait.
+6. **Low:** `tasks.ts:916` overwrites the `resuming` state with `running` while queued.
+
 ## Out of scope
 
 - Queueing read-only analysis.
