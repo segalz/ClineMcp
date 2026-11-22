@@ -46,6 +46,11 @@ Rule from earlier work: the reviewer is always from a different family than the 
     - after `killUnverified`, the checkout lock is never auto-healed (only an explicit restore/keep or a restart), but the slot is freed at once;
     - survivors-only leases heal on a 30 s re-check, and the lock is freed only after disposal.
   - Two load-flaky code-map tests were fixed in both bridges.
+- **F5 ran at 08:18.** Results by provider:
+  - `freellmapi/*`: all 7 models timed out on the probe. The home gateway is not answering, and `gpt-oss-120b` keeps `write_ok`, since infrastructure errors do not revoke it.
+  - `opencode/*`: all 11 answered the probe. The shared free quota then ran out partway through ("Free usage limit reached"), so the edit track never ran (quota, recorded as such).
+  - A seed bug found along the way: limit messages inside a Markdown analysis error were logged as `crash`. Fixed in model-picker d3c07b2 (on `feat/heavy-queue`), with a test, and the error text is now logged too.
+  - Still to do: re-run `--tracks edit --providers opencode` when the quota is back, about 22 calls, which fits one quota window.
 - **F3 decided (owner, 2026-11-22):** `ui` and `general` writes stay with AGY. The free bonus stays on coding, debugging and testing. No code change; the decision is written into CLAUDE.md wording (F2).
 
 ## Order
