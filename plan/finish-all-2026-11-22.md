@@ -62,9 +62,10 @@ Rule from earlier work: the reviewer is always from a different family than the 
   - **Bug found and fixed along the way (openCodeHelperMcp `fix/catalog-fallback` a192912, not merged):** under load, one helper's `opencode models --verbose` failed once. The catalog then fell back silently to the name rule, which drops every `nvidia/*` model, cached that for 10 minutes, and refused a valid edit.
     - The fix retries the verbose listing once, marks a fallback list `degraded` and caches it for only 30 s, and re-lists when a required model is missing.
     - The failing tests were written first. Cline wrote the fix (Lightning ran out of budget; super-vl passed first try), and Claude reviewed it. The suite passed 352/0, and the re-run live check passed 4/4.
+    - **Merged (owner OK, 2026-11-22):** openCodeHelperMcp `main` fast-forwarded to a192912 and pushed. It loads on the next Claude restart.
 - **Left:**
   1. ~~One restart by the owner~~ done.
-  2. A live check: 4 parallel edits across both bridges with 2 slots, plus `pick(needs_write)` showing the busy warning, plus `codex_status` v0.40.0.
+  2. ~~A live check: 4 parallel edits across both bridges with 2 slots, plus `pick(needs_write)` showing the busy warning, plus `codex_status` v0.40.0.~~ passed.
   3. The F5 `opencode/*` edit track when its quota is back.
 - **F3 decided (owner, 2026-11-22):** `ui` and `general` writes stay with AGY. The free bonus stays on coding, debugging and testing. No code change; the decision is written into CLAUDE.md wording (F2).
 
