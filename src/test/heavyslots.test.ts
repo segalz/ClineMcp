@@ -1,12 +1,14 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { spawn } from "node:child_process";
-import { once } from "node:events";
-import { existsSync, mkdirSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
+import childProcess, { spawn } from "node:child_process";
+import { EventEmitter, once } from "node:events";
+import fs, { existsSync, mkdirSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
+import { syncBuiltinESMExports } from "node:module";
 import path from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
 import "./git-test-serial.js";
 import { TEST_WAIT_MS } from "./test-waits.js";
+import { acquire, CheckoutBusyError } from "../checkoutlock.js";
 import { acquireHeavySlot } from "../heavyslots.js";
 import { withProgressHeartbeat } from "../progress.js";
 
@@ -148,4 +150,129 @@ test("the progress heartbeat reports the queue position and returns to elapsed t
     await until(() => messages.includes("queued for a heavy-run slot: position 2 of 3"));
     update(); await until(() => messages.some(m => m.startsWith("still running")));
   }, { intervalMs: 5 });
+});
+
+test("finding 1: .tmp unlink failure after link leaves no orphan; ticket and slot release retry once and stay best-effort", async t => {
+  process.env.BRIDGE_HEAVY_SLOTS = "1";
+  mkdirSync(dir(), { recursive: true });
+  const holder = await acquireHeavySlot(dir(), () => TEST_WAIT_MS, signal);
+  t.after(() => holder());
+
+  const realUnlink = fs.unlinkSync;
+  let ticketAttempts = 0;
+  let slotAttempts = 0;
+  let failSlotAlways = false;
+  const stub = t.mock.method(fs, "unlinkSync", (target: fs.PathLike) => {
+    const file = String(target);
+    if (file.endsWith(".tmp")) {
+      throw Object.assign(new Error("injected tmp unlink EBUSY"), { code: "EBUSY" });
+    }
+    if (file.includes(`${path.sep}queue${path.sep}`) && ++ticketAttempts === 1) {
+      throw Object.assign(new Error("injected transient ticket unlink EBUSY"), { code: "EBUSY" });
+    }
+    if (file.endsWith("slot-1.json")) {
+      slotAttempts++;
+      if (failSlotAlways || slotAttempts === 1) {
+        throw Object.assign(new Error("injected slot unlink EBUSY"), { code: "EBUSY" });
+      }
+    }
+    return realUnlink(target);
+  });
+  syncBuiltinESMExports();
+  t.after(() => { stub.mock.restore(); syncBuiltinESMExports(); });
+
+  // Ticket publication ignores .tmp unlink failure; throwing from onQueue triggers best-effort ticket release with retry.
+  const injectedQueueError = new Error("injected onQueue failure");
+  await assert.rejects(
+    acquireHeavySlot(dir(), () => TEST_WAIT_MS, signal, q => {
+      if (q) throw injectedQueueError;
+    }),
+    err => err === injectedQueueError
+  );
+  assert.equal(ticketAttempts, 2, "ticket release must retry once after transient EBUSY");
+  assert.deepEqual(readdirSync(path.join(dir(), "queue")).filter(n => n.endsWith(".json")), [], "no orphan ticket left behind");
+
+  // Slot release retries once on transient EBUSY and succeeds.
+  assert.equal(holder(), true);
+  assert.equal(slotAttempts, 2, "slot release must retry once after transient EBUSY");
+  assert.equal(existsSync(path.join(dir(), "slot-1.json")), false);
+
+  // Persistent slot unlink failure never throws and records lastError.
+  const next = await acquireHeavySlot(dir(), () => TEST_WAIT_MS, signal);
+  failSlotAlways = true;
+  slotAttempts = 0;
+  assert.equal(next(), false);
+  assert.equal(slotAttempts, 2, "persistent slot release failure must try at most twice (initial + one retry)");
+  assert.match(next.lastError ?? "", /injected slot unlink EBUSY/);
+
+  // Clean up slot-1.json after restoring fs.unlinkSync.
+  stub.mock.restore(); syncBuiltinESMExports();
+  assert.equal(next(), true);
+  assert.equal(existsSync(path.join(dir(), "slot-1.json")), false);
+});
+
+test("finding 2: stale reaper frees an own-pid retained checkout lock and heavy slot once all survivors exit", async t => {
+  process.env.BRIDGE_HEAVY_SLOTS = "1";
+  const repo = path.join(dir(), "repo");
+  const locks = path.join(dir(), "locks");
+  mkdirSync(repo, { recursive: true });
+  mkdirSync(locks, { recursive: true });
+
+  const survivor = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], { stdio: "ignore", windowsHide: true });
+  const exited = once(survivor, "exit");
+  t.after(async () => {
+    if (survivor.exitCode === null && survivor.signalCode === null) survivor.kill();
+    await exited;
+  });
+  await once(survivor, "spawn");
+
+  const slot = await acquireHeavySlot(repo, () => TEST_WAIT_MS, signal);
+  const lock = await acquire(repo, { lockDirectory: locks });
+  assert.equal(slot.retain([survivor.pid!]), true);
+  assert.equal(lock.retain([survivor.pid!]), true);
+  // Lifecycle releases while survivor is still alive: both stay retained on disk.
+  slot();
+  lock();
+
+  await assert.rejects(acquire(repo, { lockDirectory: locks }), CheckoutBusyError);
+  await assert.rejects(acquireHeavySlot(repo, () => 0, signal), { kind: "machine_busy" });
+
+  // Survivor exits; the same live bridge process can now reap both own-pid retained leases.
+  survivor.kill();
+  await exited;
+
+  const reclaimedLock = await acquire(repo, { lockDirectory: locks });
+  reclaimedLock();
+  const reclaimedSlot = await acquireHeavySlot(repo, () => TEST_WAIT_MS, signal);
+  assert.equal(data("slot-1.json").pid, process.pid);
+  reclaimedSlot();
+});
+
+test("finding 5: staleCandidates caches foreign process start-time lookups by (pid, time) for one wait",
+  { skip: process.platform !== "win32" }, async t => {
+  process.env.BRIDGE_HEAVY_SLOTS = "1";
+  mkdirSync(dir(), { recursive: true });
+  const time = new Date().toISOString();
+  writeFileSync(path.join(dir(), "slot-1.json"), JSON.stringify({
+    bridge: "opencode", kind: "edit", checkout: "b".repeat(64),
+    started_at: time, pid: process.ppid, time, token: "cache-test-token"
+  }));
+
+  let execCalls = 0;
+  const stub = t.mock.method(childProcess, "execFile", ((...args: unknown[]) => {
+    execCalls++;
+    const cb = args.find(arg => typeof arg === "function") as ((err: Error | null, stdout: string) => void) | undefined;
+    const earlier = new Date(Date.now() - 3_600_000).toISOString();
+    queueMicrotask(() => cb?.(null, earlier + "\n"));
+    return Object.assign(new EventEmitter(), { kill: () => true });
+  }) as unknown as typeof childProcess.execFile);
+  syncBuiltinESMExports();
+  t.after(() => { stub.mock.restore(); syncBuiltinESMExports(); });
+
+  const start = Date.now();
+  await assert.rejects(
+    acquireHeavySlot(dir(), () => 2_300 - (Date.now() - start), signal),
+    { kind: "machine_busy" }
+  );
+  assert.equal(execCalls, 1, "start-time query should run once per (pid, time) across multiple 1 s polls");
 });

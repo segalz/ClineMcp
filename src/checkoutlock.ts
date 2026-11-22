@@ -14,9 +14,21 @@ export class CheckoutBusyError extends ClineRunError {
   }
 }
 
-export type FileLease = (() => void) & { retain(survivors: number[]): void };
+export interface RetainOptions {
+  killUnverified?: boolean;
+}
+export type FileLease = (() => boolean) & {
+  forceRelease(): boolean;
+  retain(survivors: number[], options?: RetainOptions): boolean;
+  readonly lastError?: string;
+};
 export type CheckoutRelease = FileLease & { readonly checkoutRoot: string };
-const held = new Map<string, CheckoutRelease>();
+interface HeldCheckout {
+  release: CheckoutRelease;
+  retained: boolean;
+  released: boolean;
+}
+const held = new Map<string, HeldCheckout>();
 const acquiring = new Set<string>();
 
 export function canonicalCheckoutPath(checkoutRoot: string): string {
@@ -104,12 +116,17 @@ export async function processStartMs(pid: number): Promise<number | undefined> {
 /** Slack between the OS start time and the holder's own clock reading. */
 const START_TOLERANCE_MS = 5_000;
 
+/** Cache of OS process start-time lookups keyed by `${pid}:${time}` for the duration of one wait. */
+export type ProcessStartCache = Map<string, number | "denied">;
+
 /** A holder is dead when its PID is gone or inaccessible (protected/other-user process), or when that PID now belongs
  * to a process started after the lock was written (PID reuse). An unreadable start time otherwise keeps the lock busy:
  * a live lock is never reclaimed by age. */
 async function pidOwnerIsDead(
   holder: { pid: unknown; time?: unknown; token?: unknown },
-  startMs?: (pid: number) => number | undefined | Promise<number | undefined>, signal?: AbortSignal
+  startMs?: (pid: number) => number | undefined | Promise<number | undefined>,
+  signal?: AbortSignal,
+  startCache?: ProcessStartCache
 ): Promise<boolean> {
   const pid = Number(holder?.pid);
   if (pidIsGone(pid)) return true;
@@ -121,8 +138,13 @@ async function pidOwnerIsDead(
     return typeof holder.token === "string" && performance.timeOrigin > written + START_TOLERANCE_MS;
   }
   if (!startMs || startMs === processStartMs) {
-    const result = await readProcessStartMs(pid, signal);
-    signal?.throwIfAborted();
+    const key = `${pid}:${holder.time as string}`;
+    let result = startCache?.get(key);
+    if (result === undefined) {
+      result = await readProcessStartMs(pid, signal);
+      signal?.throwIfAborted();
+      if (result !== undefined) startCache?.set(key, result);
+    }
     if (result === "denied") return true;
     return result !== undefined && result > written + START_TOLERANCE_MS;
   }
@@ -135,22 +157,43 @@ async function pidOwnerIsDead(
   }
 }
 
-/** Survivors can start after acquisition. Compare their OS start against the time they were observed. */
-export async function holderIsDead(
-  holder: { pid: unknown; time?: unknown; token?: unknown; survivors?: unknown; survivor_time?: unknown },
-  startMs?: (pid: number) => number | undefined | Promise<number | undefined>, signal?: AbortSignal
+/** True when every recorded survivor PID is gone or reused since observation time. */
+export async function survivorsAreDead(
+  survivors: readonly number[],
+  observedAt: string | undefined,
+  startMs?: (pid: number) => number | undefined | Promise<number | undefined>,
+  signal?: AbortSignal,
+  startCache?: ProcessStartCache
 ): Promise<boolean> {
-  if (!await pidOwnerIsDead(holder, startMs, signal)) return false;
-  if (holder.survivors === undefined) return true;
-  if (!Array.isArray(holder.survivors)) return false;
-  for (const pid of holder.survivors) {
-    if (!await pidOwnerIsDead({ pid, time: holder.survivor_time, token: holder.token }, startMs, signal)) return false;
+  for (const pid of survivors) {
+    if (!await pidOwnerIsDead({ pid, time: observedAt }, startMs, signal, startCache)) return false;
   }
   return true;
 }
 
-export async function deadHolderText(text: string, signal?: AbortSignal): Promise<boolean> {
-  try { return await holderIsDead(JSON.parse(text), undefined, signal); }
+/** Survivors can start after acquisition. Compare their OS start against the time they were observed. */
+export async function holderIsDead(
+  holder: { pid: unknown; time?: unknown; token?: unknown; survivors?: unknown; survivor_time?: unknown; kill_unverified?: unknown },
+  startMs?: (pid: number) => number | undefined | Promise<number | undefined>,
+  signal?: AbortSignal,
+  startCache?: ProcessStartCache
+): Promise<boolean> {
+  const ownerDead = await pidOwnerIsDead(holder, startMs, signal, startCache);
+  if (holder.survivors === undefined) return ownerDead;
+  if (!Array.isArray(holder.survivors)) return false;
+  if (!ownerDead) {
+    // An own-pid retained lease with known survivors heals as soon as every survivor is dead.
+    const ownPid = Number(holder.pid) === process.pid;
+    if (!ownPid || holder.kill_unverified === true || holder.survivors.length === 0) return false;
+  }
+  for (const pid of holder.survivors) {
+    if (!await pidOwnerIsDead({ pid, time: holder.survivor_time, token: holder.token }, startMs, signal, startCache)) return false;
+  }
+  return true;
+}
+
+export async function deadHolderText(text: string, signal?: AbortSignal, startCache?: ProcessStartCache): Promise<boolean> {
+  try { return await holderIsDead(JSON.parse(text), undefined, signal, startCache); }
   catch { signal?.throwIfAborted(); /* An incomplete or unreadable lock is busy, never stale by age alone. */ }
   return false;
 }
@@ -212,34 +255,78 @@ async function claimReclamation(file: string, token: string, root: string, signa
 /** Publish only complete metadata. An interrupted private file is never interpreted as a lease. */
 export function publishHolder(file: string, data: Record<string, unknown>): void {
   const tmp = file + "." + randomUUID() + ".tmp";
+  let linked = false;
   try {
     writeFileSync(tmp, JSON.stringify(data), { flag: "wx", mode: 0o600 });
     linkSync(tmp, file);
-  } finally { rmTemp(tmp); }
+    linked = true;
+  } finally {
+    // .tmp files have no authority: never hide a successful hard link or mask an earlier write/link error.
+    try { rmTemp(tmp); } catch { if (linked) { /* published */ } }
+  }
 }
 
 function rmTemp(file: string): void {
-  try { unlinkSync(file); } catch (err) { if ((err as NodeJS.ErrnoException).code !== "ENOENT") throw err; }
+  try { unlinkSync(file); } catch { /* .tmp has no authority */ }
 }
 
-/** The owner alone releases or annotates a live lease. Never unlink a replacement or a retained lease. */
+/** The owner alone releases or annotates a live lease. Never unlink a replacement or a retained lease unless forced.
+ * Both release (with one retry) and retain are best-effort and never throw. */
 export function fileLease(file: string, token: string): FileLease {
   let retained = false;
-  return Object.assign(() => {
-    if (retained) return;
-    try { if (JSON.parse(readFileSync(file, "utf8")).token === token) unlinkSync(file); }
-    catch (err) { if ((err as NodeJS.ErrnoException).code !== "ENOENT" && !(err instanceof SyntaxError)) throw err; }
-  }, { retain(survivors: number[]) {
-    retained = true;
-    const data = JSON.parse(readFileSync(file, "utf8"));
-    if (data.token !== token) throw new Error("Cannot retain a replaced lease");
-    const tmp = file + "." + randomUUID() + ".tmp";
+  let lastError: string | undefined;
+  const releaseOnce = (): boolean => {
     try {
-      writeFileSync(tmp, JSON.stringify({ ...data, survivors, survivor_time: new Date().toISOString() }),
-        { flag: "wx", mode: 0o600 });
+      if (JSON.parse(readFileSync(file, "utf8")).token === token) unlinkSync(file);
+      return true;
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code === "ENOENT" || err instanceof SyntaxError) return true;
+      lastError = err instanceof Error ? err.message : String(err);
+      return false;
+    }
+  };
+  const releaseWithMode = (force: boolean): boolean => {
+    lastError = undefined;
+    if (retained && !force) return true;
+    if (releaseOnce()) { retained = false; return true; }
+    // One best-effort retry for transient Windows sharing/AV locks.
+    lastError = undefined;
+    if (releaseOnce()) { retained = false; return true; }
+    return false;
+  };
+  const releaseFn = (): boolean => releaseWithMode(false);
+  const forceRelease = (): boolean => releaseWithMode(true);
+  const retain = (survivors: number[], options?: RetainOptions): boolean => {
+    retained = true;
+    lastError = undefined;
+    let tmp: string | undefined;
+    try {
+      const data = JSON.parse(readFileSync(file, "utf8"));
+      if (data.token !== token) {
+        lastError = "Cannot retain a replaced lease";
+        return false;
+      }
+      tmp = file + "." + randomUUID() + ".tmp";
+      const updated: Record<string, unknown> = {
+        ...data,
+        survivors,
+        survivor_time: new Date().toISOString()
+      };
+      if (options?.killUnverified) updated.kill_unverified = true;
+      else delete updated.kill_unverified;
+      writeFileSync(tmp, JSON.stringify(updated), { flag: "wx", mode: 0o600 });
       renameSync(tmp, file);
-    } finally { rmTemp(tmp); }
-  } });
+      return true;
+    } catch (err) {
+      lastError = err instanceof Error ? err.message : String(err);
+      return false;
+    } finally {
+      if (tmp) rmTemp(tmp);
+    }
+  };
+  const lease = Object.assign(releaseFn, { forceRelease, retain });
+  Object.defineProperty(lease, "lastError", { get: () => lastError, enumerable: true });
+  return lease as FileLease;
 }
 
 /** Shared serialized stale reaper for checkout and admission locks. */
@@ -305,7 +392,8 @@ export async function acquire(
   const { signal } = options;
   signal?.throwIfAborted();
   const root = canonicalCheckoutPath(checkoutRoot);
-  if (held.has(root) || acquiring.has(root)) throw new CheckoutBusyError(root);
+  const existing = held.get(root);
+  if (acquiring.has(root) || (existing && (!existing.retained || !existing.released))) throw new CheckoutBusyError(root);
   acquiring.add(root);
   try {
     const file = checkoutLockPath(root, options.lockDirectory);
@@ -314,22 +402,37 @@ export async function acquire(
     const create = () => createHolder(file, token);
     await claimFile(file, token, root, create, signal, options.deadlineMs);
     const owner = fileLease(file, token);
-    let retained = false;
-    const release: CheckoutRelease = Object.assign(() => {
-      if (held.get(root) !== release) return;
-      if (retained) return;
-      try { owner(); } finally { held.delete(root); }
-    }, { checkoutRoot: root, retain(survivors: number[]) {
-      retained = true;
-      owner.retain(survivors);
-    } });
-    held.set(root, release);
-    return release;
+    const entry: HeldCheckout = { release: undefined as unknown as CheckoutRelease, retained: false, released: false };
+    const releaseWithMode = (force: boolean): boolean => {
+      if (held.get(root) !== entry) return true;
+      if (entry.retained && !force) {
+        entry.released = true;
+        return true;
+      }
+      const ok = force ? owner.forceRelease() : owner();
+      if (ok || !entry.retained) held.delete(root);
+      else entry.released = true;
+      return ok;
+    };
+    const releaseFn = (): boolean => releaseWithMode(false);
+    const release = Object.assign(releaseFn, {
+      checkoutRoot: root,
+      forceRelease: (): boolean => releaseWithMode(true),
+      retain(survivors: number[], retainOpts?: RetainOptions): boolean {
+        entry.retained = true;
+        return owner.retain(survivors, retainOpts);
+      }
+    });
+    Object.defineProperty(release, "lastError", { get: () => owner.lastError, enumerable: true });
+    entry.release = release as CheckoutRelease;
+    held.set(root, entry);
+    return release as CheckoutRelease;
   } finally {
     acquiring.delete(root);
   }
 }
 
 export function ownsCheckoutLock(release: CheckoutRelease | undefined, checkoutRoot: string): boolean {
-  return !!release && held.get(canonicalCheckoutPath(checkoutRoot)) === release;
+  const entry = held.get(canonicalCheckoutPath(checkoutRoot));
+  return !!release && entry?.release === release && !entry.released;
 }

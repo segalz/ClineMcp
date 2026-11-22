@@ -21,7 +21,7 @@ import { mkdirSync, readFileSync, readdirSync, renameSync, rmSync, unlinkSync, w
 import os from "node:os";
 import path from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
-import { canonicalCheckoutPath, CheckoutBusyError, claimFile, deadHolderText, fileLease, publishHolder, type FileLease } from "./checkoutlock.js";
+import { canonicalCheckoutPath, CheckoutBusyError, claimFile, deadHolderText, fileLease, publishHolder, type FileLease, type ProcessStartCache } from "./checkoutlock.js";
 import { ClineRunError } from "./runner.js";
 
 export interface QueuePosition { position: number; total: number }
@@ -56,13 +56,13 @@ function updateState(dir: string, slots: number): void {
 }
 
 /** Query processes outside the critical section. Reap only unchanged candidates inside it. */
-async function staleCandidates(dir: string, signal: AbortSignal): Promise<Map<string, string>> {
+async function staleCandidates(dir: string, signal: AbortSignal, startCache: ProcessStartCache): Promise<Map<string, string>> {
   const dead = new Map<string, string>();
   for (const name of [...slotFiles(dir), ...tickets(dir).map(name => path.join("queue", name))]) {
     signal.throwIfAborted();
     const file = path.join(dir, name);
     const text = contents(file);
-    if (text !== undefined && await deadHolderText(text, signal)) dead.set(file, text);
+    if (text !== undefined && await deadHolderText(text, signal, startCache)) dead.set(file, text);
   }
   return dead;
 }
@@ -79,6 +79,7 @@ export async function acquireHeavySlot(root: string, waitMs: () => number, signa
     checkout: createHash("sha256").update(canonicalCheckoutPath(root)).digest("hex"), started_at: time };
   const admission = path.join(dir, "admission.lock");
   let ticket: string | undefined;
+  const startCache: ProcessStartCache = new Map();
   const busy = () => new ClineRunError("machine_busy",
     `Heavy-run slots busy: ${slotFiles(dir).length} active, ${tickets(dir).length} queued. Retry later or send the edit elsewhere.`,
     { attempts: 0 });
@@ -87,7 +88,7 @@ export async function acquireHeavySlot(root: string, waitMs: () => number, signa
   try {
     while (true) {
       waiting.throwIfAborted();
-      const dead = await staleCandidates(dir, waiting);
+      const dead = await staleCandidates(dir, waiting, startCache);
       const admissionToken = randomUUID();
       let admitted = false;
       try {
@@ -99,26 +100,48 @@ export async function acquireHeavySlot(root: string, waitMs: () => number, signa
       if (admitted) {
         try {
           waiting.throwIfAborted();
-          for (const [file, text] of dead) if (contents(file) === text) unlinkSync(file);
+          for (const [file, text] of dead) {
+            if (contents(file) === text) {
+              try { unlinkSync(file); } catch (err) { if ((err as NodeJS.ErrnoException).code !== "ENOENT") throw err; }
+            }
+          }
           const queue = tickets(dir);
           const occupied = slotFiles(dir);
           const index = Array.from({ length: slots }, (_, i) => i + 1).find(i => !occupied.includes(`slot-${i}.json`));
           if (waitMs() < 0) throw busy();
           if (index && occupied.length < slots && (!queue.length || queue[0] === ticket)) {
             const file = path.join(dir, `slot-${index}.json`);
-            publishHolder(file, { ...metadata, started_at: new Date().toISOString() });
             const owner = fileLease(file, token);
             try {
-              if (ticket) { unlinkSync(path.join(dir, "queue", ticket)); ticket = undefined; }
+              publishHolder(file, { ...metadata, started_at: new Date().toISOString() });
+              if (ticket) {
+                const ticketPath = path.join(dir, "queue", ticket);
+                ticket = undefined;
+                fileLease(ticketPath, token)();
+              }
               updateState(dir, slots);
-              return Object.assign(() => { owner(); updateState(dir, slots); }, { retain: owner.retain });
+              const releaseSlot = Object.assign((): boolean => {
+                const ok = owner();
+                updateState(dir, slots);
+                return ok;
+              }, {
+                forceRelease: (): boolean => {
+                  const ok = owner.forceRelease();
+                  updateState(dir, slots);
+                  return ok;
+                },
+                retain: owner.retain
+              });
+              Object.defineProperty(releaseSlot, "lastError", { get: () => owner.lastError, enumerable: true });
+              return releaseSlot as FileLease;
             } catch (error) { owner(); throw error; }
           }
           if (!ticket) {
             const stamp = Math.max(Date.now(), queue.length ? parseInt(queue[queue.length - 1]) + 1 : 0);
             const name = `${stamp}-${process.pid}-${token}.json`;
-            publishHolder(path.join(dir, "queue", name), metadata);
+            // Record ticket before publication/cleanup so finally always reclaims it if anything throws.
             ticket = name;
+            publishHolder(path.join(dir, "queue", name), metadata);
             queue.push(name);
             updateState(dir, slots);
           } else if (dead.size) updateState(dir, slots);

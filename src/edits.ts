@@ -204,6 +204,12 @@ export async function applyClineEdits(
       timeoutSeconds: remainingSeconds, guard }, lifecycle.workDir, runSignal,
       { ...options, checkoutLock: lock, checkoutRoot: lifecycle.root, guard, maxAttempts: 1, editHub })
   });
+  let released = false;
+  const releaseOnce = async () => {
+    if (released) return;
+    released = true;
+    await lifecycle.release();
+  };
   try {
     await lifecycle.execute(signal ?? new AbortController().signal);
     if (lifecycle.phase !== "done") {
@@ -253,17 +259,25 @@ export async function applyClineEdits(
         codeMapSource: lifecycle.codeMapSource }); throw error;
     }
     const headBefore = lifecycle.identity!.head;
-    // The edits passed and are kept: a failing report-only Git call must not turn that into an error.
+    // The edits passed and are kept: a failing report-only Git call or lease cleanup must not turn that into an error.
     const { gitDiff, status, headAfter, warnings: gitWarnings } = await collectEditsGitReport(lifecycle.root, headBefore, "verified edits", signal);
-    const warnings = [...(lifecycle.result!.warnings ?? []), ...lifecycle.hubWarnings, ...gitWarnings];
+    await releaseOnce();
+    const warnings = [...(lifecycle.result!.warnings ?? []), ...lifecycle.hubWarnings, ...lifecycle.cleanupNotes, ...gitWarnings];
     const created = lifecycle.createdFiles;
     if (created?.length) warnings.push(`The edit created ${created.length} new file(s): ${created.slice(0, 20).join(", ")}${created.length > 20 ? ", ..." : ""}. Check each belongs to the task.`);
     return { ...lifecycle.result!, ...(warnings.length ? { warnings } : {}), ...(created?.length ? { createdFiles: created } : {}), usage: lifecycle.usage, cost: lifecycle.cost, durationMs: lifecycle.durationMs,
       gitDiff, status, headBefore, ...(headAfter !== undefined ? { headAfter } : {}), commitWasReverted: false, verification: lifecycle.verification };
   } catch (error) {
-    if (error instanceof ClineRunError && lifecycle.hubWarnings.length) (error.notes ??= []).push(...lifecycle.hubWarnings);
+    await releaseOnce();
+    if (error instanceof ClineRunError) {
+      const extraNotes = [...lifecycle.hubWarnings, ...lifecycle.cleanupNotes];
+      if (extraNotes.length) {
+        const notes = (error.notes ??= []);
+        for (const note of extraNotes) if (!notes.includes(note)) notes.push(note);
+      }
+    }
     throw error;
-  } finally { lifecycle.release(); }
+  } finally { await releaseOnce(); }
 }
 
 export function editQuestion(text: string): { question: string; options?: string[] } | undefined {

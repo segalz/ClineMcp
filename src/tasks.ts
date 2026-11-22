@@ -786,8 +786,8 @@ export class TaskManager {
     task.settled = onSettled;
   }
 
-  private releaseCheckout(task: Task): void {
-    task.finalCheck?.release();
+  private releaseCheckout(task: Task): Promise<void> | void {
+    return task.finalCheck?.release();
   }
 
   /** Holds a bridge call until the task's current run segment settles (done, failed, cancelled or input_required). */
@@ -840,18 +840,22 @@ export class TaskManager {
     })().catch(error => {
       nextError = error; nextState = "failed";
       lifecycle.evidence.cleanupError = redactSecrets(String(error));
-    }).finally(() => {
+    }).finally(async () => {
+      task.endedAt = this.wallNow(); task.activeMs += task.endedAt - started;
+      if (nextState === "input_required") await lifecycle.releaseSlot();
+      else await this.releaseCheckout(task);
       task.waitReason = lifecycle.waitReason; task.evidence = lifecycle.evidence;
       task.question = lifecycle.question ?? (nextState === "input_required" ? lifecycle.killUnconfirmed ? {
         question: "A surviving process may still change files. Restore the baseline or keep unverified changes?",
         options: ["restore", "keep"] } : {
         question: `Edit stopped: ${lifecycle.waitReason}. Retry with guidance, restore baseline, or keep unverified changes?`,
         options: ["retry", "restore", "keep"] } : undefined);
-      const warnings = [...(lifecycle.result?.warnings ?? []), ...lifecycle.hubWarnings, ...(gitReport?.warnings ?? [])];
-      if (nextError instanceof ClineRunError && lifecycle.hubWarnings.length) {
+      const warnings = [...(lifecycle.result?.warnings ?? []), ...lifecycle.hubWarnings, ...lifecycle.cleanupNotes, ...(gitReport?.warnings ?? [])];
+      const extraNotes = [...lifecycle.hubWarnings, ...lifecycle.cleanupNotes];
+      if (nextError instanceof ClineRunError && extraNotes.length) {
         // The same error object can be published again (e.g. restore after a wait): never repeat a note.
         const notes = (nextError.notes ??= []);
-        for (const note of lifecycle.hubWarnings) if (!notes.includes(note)) notes.push(note);
+        for (const note of extraNotes) if (!notes.includes(note)) notes.push(note);
       }
       if (lifecycle.createdFiles?.length) {
         warnings.push(`The edit created ${lifecycle.createdFiles.length} new file(s): ${lifecycle.createdFiles.slice(0, 20).join(", ")}${lifecycle.createdFiles.length > 20 ? ", ..." : ""}. Check each belongs to the task.`);
@@ -868,9 +872,6 @@ export class TaskManager {
         ...(lifecycle.createdFiles?.length ? { createdFiles: [...lifecycle.createdFiles] } : {}),
         ...(warnings.length ? { warnings } : {})
       };
-      task.endedAt = this.wallNow(); task.activeMs += task.endedAt - started;
-      if (nextState === "input_required") lifecycle.releaseSlot();
-      else this.releaseCheckout(task);
       task.error = nextError; task.state = nextState;
     });
   }
@@ -913,7 +914,6 @@ export class TaskManager {
         maxFixRuns: input.maxFixRuns, guard: input.guard, timeoutSeconds: input.timeoutSeconds ?? DEFAULT_TASK_TIMEOUT_SECONDS }, {
         resolveRoot: editsCheckoutRoot, snapshotOptions: this.deps.snapshotOptions,
         lockDirectory: this.deps.runOptions?.checkoutLockDirectory, verify: this.deps.runVerification,
-        onQueue: queue => { if (queue) task.state = "running"; },
         question: parseQuestionFromText,
         fits: prompt => !isPromptTooLarge(prompt, task, getEffectivePreamble("edits", this.deps.runOptions?.promptPreamble ?? ""),
           this.deps.platform ?? process.platform, this.deps.runOptions?.deps),

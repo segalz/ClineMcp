@@ -2,17 +2,19 @@ import assert from "node:assert/strict";
 import "./git-test-serial.js";
 import { TEST_WAIT_MS } from "./test-waits.js";
 import test, { after } from "node:test";
-import { spawnSync } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
+import fs from "node:fs";
 import { mkdtemp, writeFile, readFile, mkdir, rm, readdir } from "node:fs/promises";
+import { syncBuiltinESMExports } from "node:module";
 import os from "node:os";
 import path from "node:path";
-import { EventEmitter } from "node:events";
+import { EventEmitter, once } from "node:events";
 import { FinalCheckLifecycle, buildFixPrompt, verificationSchema, maxFixRunsSchema, startTaskSchema, editActionSchema, type VerifySpec } from "../finalcheck.js";
 import { TaskManager, type TaskStatusView, type TaskManagerDeps } from "../tasks.js";
 import { applyClineEdits, editPromptFits, editQuestion } from "../edits.js";
-import { ClineRunError } from "../runner.js";
+import { ClineRunError, stopDedicatedHub } from "../runner.js";
 import { headAndIndexIdentity } from "../snapshot.js";
-import { acquire } from "../checkoutlock.js";
+import { acquire, CheckoutBusyError } from "../checkoutlock.js";
 import { acquireHeavySlot, type QueuePosition } from "../heavyslots.js";
 import { VerificationError } from "../verify.js";
 
@@ -340,7 +342,7 @@ test("async input_required releases only the slot; retry queues, and cancellatio
   await assert.rejects(acquire(f.cwd, { lockDirectory: f.locks }), { kind: "checkout_busy" });
   await f.manager.send(task.taskId, "Continue");
   const status = await until(() => f.manager.status(task.taskId), s => s.phase === "queued");
-  assert.equal(status.state, "running"); assert.deepEqual(status.queue, { position: 1, total: 1 });
+  assert.equal(status.state, "resuming"); assert.deepEqual(status.queue, { position: 1, total: 1 });
   assert.equal(f.runs.length, 1);
   await f.manager.cancel(task.taskId); await f.clean();
   const heavy = process.env.BRIDGE_HEAVY_DIR!;
@@ -351,4 +353,212 @@ test("async input_required releases only the slot; retry queues, and cancellatio
   assert.equal((await f.manager.cancel(next.taskId)).state, "cancelled");
   await assert.rejects(readFile(path.join(heavy, "slot-1.json")), { code: "ENOENT" });
   const lock = await acquire(f.cwd, { lockDirectory: f.locks }); lock();
+});
+
+test("finding 2: retained leases heal on release, keep and restore once survivors exit or process table confirms clear", async t => {
+  process.env.BRIDGE_HEAVY_SLOTS = "1";
+  const spawnSurvivor = async () => {
+    const proc = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], { stdio: "ignore", windowsHide: true });
+    const exited = once(proc, "exit");
+    t.after(async () => {
+      if (proc.exitCode === null && proc.signalCode === null) proc.kill();
+      await exited;
+    });
+    await once(proc, "spawn");
+    return { proc, exited };
+  };
+
+  for (const mode of ["release", "keep", "restore"] as const) {
+    const f = await fixture(t);
+    const { proc, exited } = await spawnSurvivor();
+    const lifecycle = new FinalCheckLifecycle({ prompt: "Edit", cwd: f.cwd, verify: none }, {
+      resolveRoot: async cwd => cwd, fits: () => true, question: editQuestion, lockDirectory: f.locks,
+      snapshotOptions: { snapshotBase: f.snapshots },
+      run: async () => { throw new ClineRunError("timeout", "timed out", { processesStillAlive: [proc.pid!] }); }
+    });
+    t.after(() => lifecycle.release());
+    await lifecycle.execute(new AbortController().signal);
+
+    // While the survivor lives, release keeps both leases held.
+    await lifecycle.release();
+    await assert.rejects(acquire(f.cwd, { lockDirectory: f.locks }), CheckoutBusyError);
+    await assert.rejects(acquireHeavySlot(f.cwd, () => 0, new AbortController().signal), { kind: "machine_busy" });
+
+    // Once the survivor exits, release / keep / restore frees both checkout lock and slot.
+    proc.kill();
+    await exited;
+    if (mode === "release") await lifecycle.release();
+    else if (mode === "keep") await lifecycle.keep();
+    else assert.equal(await lifecycle.restore(), true);
+
+    const lock = await acquire(f.cwd, { lockDirectory: f.locks }); lock();
+    const slot = await acquireHeavySlot(f.cwd, () => TEST_WAIT_MS, new AbortController().signal); slot();
+  }
+
+  // killUnverified with no recorded survivors: heals only when the process table confirms nothing remains.
+  const f = await fixture(t);
+  let tableState: "unreadable" | "descendant" | "clear" = "unreadable";
+  const lifecycle = new FinalCheckLifecycle({ prompt: "Edit", cwd: f.cwd, verify: none }, {
+    resolveRoot: async cwd => cwd, fits: () => true, question: editQuestion, lockDirectory: f.locks,
+    snapshotOptions: { snapshotBase: f.snapshots },
+    listProcessTable: async () => {
+      if (tableState === "unreadable") return null;
+      if (tableState === "descendant") return [{ pid: 88888, parentPid: process.pid, createdMs: Date.now() }];
+      return [{ pid: process.pid, parentPid: process.ppid, createdMs: Date.now() - 60_000 }];
+    },
+    run: async () => { throw new ClineRunError("timeout", "timed out", { killUnverified: true }); }
+  });
+  t.after(() => lifecycle.release());
+  await lifecycle.execute(new AbortController().signal);
+
+  await lifecycle.release();
+  await assert.rejects(acquire(f.cwd, { lockDirectory: f.locks }), CheckoutBusyError);
+  await assert.rejects(acquireHeavySlot(f.cwd, () => 0, new AbortController().signal), { kind: "machine_busy" });
+
+  tableState = "descendant";
+  await lifecycle.release();
+  await assert.rejects(acquire(f.cwd, { lockDirectory: f.locks }), CheckoutBusyError);
+  await assert.rejects(acquireHeavySlot(f.cwd, () => 0, new AbortController().signal), { kind: "machine_busy" });
+
+  tableState = "clear";
+  await lifecycle.release();
+  const lock = await acquire(f.cwd, { lockDirectory: f.locks }); lock();
+  const slot = await acquireHeavySlot(f.cwd, () => TEST_WAIT_MS, new AbortController().signal); slot();
+});
+
+test("finding 3: pre-slot 60 s floor applies only when launches === 0; repair runs keep the 1 s minimum", async t => {
+  const f = await fixture(t);
+  let clock = 1_000;
+  let calls = 0;
+  const lifecycle = new FinalCheckLifecycle({ prompt: "Edit", cwd: f.cwd, timeoutSeconds: 90, verify: none }, {
+    resolveRoot: async cwd => cwd, fits: () => true, question: editQuestion, lockDirectory: f.locks,
+    snapshotOptions: { snapshotBase: f.snapshots },
+    now: () => clock,
+    run: async () => {
+      calls++;
+      if (calls === 1) { clock += 70_000; return { text: "QUESTION: Continue?", durationMs: 1 } as any; }
+      return { text: "done", durationMs: 1 } as any;
+    }
+  });
+  t.after(() => lifecycle.release());
+
+  await lifecycle.execute(new AbortController().signal);
+  assert.equal(lifecycle.phase, "waiting");
+  assert.equal(lifecycle.waitReason, "cline_question");
+  assert.equal(lifecycle.launches, 1);
+  // Simulate async input_required releasing the slot while keeping the checkout lock; 20 s remains (< 60 s, >= 1 s).
+  await lifecycle.releaseSlot();
+  await lifecycle.execute(new AbortController().signal, "Finish it");
+  assert.equal(calls, 2, "repair run with 20 s left must not be refused by MIN_FIRST_RUN_SECONDS");
+  assert.equal(lifecycle.phase, "done");
+
+  // Repair run with < 1 s left is still refused before taking a slot.
+  const f2 = await fixture(t);
+  let clock2 = 1_000;
+  let calls2 = 0;
+  const lifecycle2 = new FinalCheckLifecycle({ prompt: "Edit", cwd: f2.cwd, timeoutSeconds: 90, verify: none }, {
+    resolveRoot: async cwd => cwd, fits: () => true, question: editQuestion, lockDirectory: f2.locks,
+    snapshotOptions: { snapshotBase: f2.snapshots },
+    now: () => clock2,
+    run: async () => {
+      calls2++;
+      clock2 += 89_500;
+      return { text: "QUESTION: Continue?", durationMs: 1 } as any;
+    }
+  });
+  t.after(() => lifecycle2.release());
+  await lifecycle2.execute(new AbortController().signal);
+  await lifecycle2.releaseSlot();
+  await lifecycle2.execute(new AbortController().signal, "Retry with 500 ms left");
+  assert.equal(calls2, 1);
+  assert.equal(lifecycle2.waitReason, "budget");
+});
+
+test("finding 4: retain and release failures stay best-effort, record evidence/warnings, and never fail a passed check", async t => {
+  // 1. retain failure during an unconfirmed hub stop after a passing check keeps the check passed and records evidence.
+  const f1 = await fixture(t);
+  const realRename = fs.renameSync;
+  const renameStub = t.mock.method(fs, "renameSync", (src: fs.PathLike, dst: fs.PathLike) => {
+    if (String(dst).endsWith(".lock") || String(dst).endsWith("slot-1.json")) {
+      throw Object.assign(new Error("injected retain EPERM"), { code: "EPERM" });
+    }
+    return realRename(src, dst);
+  });
+  syncBuiltinESMExports();
+  t.after(() => { renameStub.mock.restore(); syncBuiltinESMExports(); });
+
+  const lifecycle = new FinalCheckLifecycle({ prompt: "Edit", cwd: f1.cwd, verify: none }, {
+    resolveRoot: async cwd => cwd, fits: () => true, question: editQuestion, lockDirectory: f1.locks,
+    snapshotOptions: { snapshotBase: f1.snapshots },
+    run: async (_p, _s, _l, _g, _r, _n, hub) => {
+      await hub.environment(f1.cwd, { deps: { startHub: async () => ({ env: {}, stop: () => stopDedicatedHub(4321, {
+        hubStarted: async () => true, runHubStop: async () => false, isListening: async () => true, listProcesses: async () => []
+      }) }) } });
+      hub.launched = true;
+      return { text: "done", durationMs: 1 } as any;
+    }
+  });
+  t.after(() => lifecycle.release());
+  await lifecycle.execute(new AbortController().signal);
+  assert.equal(lifecycle.phase, "done", "a retain failure after a passed edit must not turn into cline_error");
+  const retainErrors = lifecycle.evidence.leaseErrors as string[];
+  assert.ok(Array.isArray(retainErrors) && retainErrors.some(e => e.includes("injected retain EPERM")), JSON.stringify(lifecycle.evidence));
+  renameStub.mock.restore(); syncBuiltinESMExports();
+
+  // 2. release failure on a passing applyClineEdits stays passed and surfaces in result warnings.
+  const f2 = await fixture(t);
+  const realUnlink = fs.unlinkSync;
+  const unlinkStub = t.mock.method(fs, "unlinkSync", (target: fs.PathLike) => {
+    if (String(target).endsWith(".lock")) {
+      throw Object.assign(new Error("injected release EPERM"), { code: "EPERM" });
+    }
+    return realUnlink(target);
+  });
+  syncBuiltinESMExports();
+  t.after(() => { unlinkStub.mock.restore(); syncBuiltinESMExports(); });
+
+  const deps = {
+    entryPath: "fake", access: async () => {}, acquireSettingsMutex: async () => async () => {},
+    spawn: (() => {
+      const child = new EventEmitter() as any; child.stdout = new EventEmitter(); child.stderr = new EventEmitter(); child.pid = 999; child.kill = () => {};
+      queueMicrotask(() => {
+        child.stdout.emit("data", Buffer.from('{"type":"run_result","finishReason":"success","text":"done"}\n'));
+        child.emit("close", 0);
+      });
+      return child;
+    }) as any
+  };
+  process.env.CLINE_PROVIDER_SETTINGS_PATH = path.join(f2.base, "providers.json");
+  process.env.CLINE_MCP_STATE_PATH = path.join(f2.base, "state.json");
+  process.env.CLINE_MCP_STATUS_PATH = path.join(f2.base, "status.json");
+  process.env.CLINE_MCP_CATALOG_PATH = path.join(f2.base, "catalog.json");
+  process.env.CLINE_MCP_TRACE_DIR = path.join(f2.base, "traces");
+  const result = await applyClineEdits({ prompt: "Implement", cwd: f2.cwd, verify: none, provider: "p", model: "m", codeMap: false },
+    undefined, { deps: deps as any, checkoutLockDirectory: f2.locks });
+  assert.equal(result.text, "done");
+  assert.ok(result.warnings?.some(w => w.includes("injected release EPERM")), JSON.stringify(result.warnings));
+});
+
+test("finding 6: queued retry keeps resuming state until admitted and transitions to running when the run starts", async t => {
+  process.env.BRIDGE_HEAVY_SLOTS = "1";
+  const f = await asyncFixture(t, none);
+  const task = f.start();
+  (await f.launched(1)).finish("QUESTION: Continue?");
+  await f.wait(task.taskId, "input_required");
+
+  const blocker = await acquireHeavySlot(f.cwd, () => TEST_WAIT_MS, new AbortController().signal);
+  t.after(blocker);
+  const resumed = await f.manager.send(task.taskId, "Continue");
+  assert.equal(resumed.state, "resuming");
+  const queued = await until(() => f.manager.status(task.taskId), s => s.phase === "queued");
+  assert.equal(queued.state, "resuming", "queueing a retry must not overwrite resuming with running");
+  assert.deepEqual(queued.queue, { position: 1, total: 1 });
+
+  blocker();
+  const second = await f.launched(2);
+  const running = await f.manager.status(task.taskId);
+  assert.equal(running.state, "running");
+  assert.equal(running.queue, undefined);
+  second.finish("done");
+  assert.equal((await f.wait(task.taskId, "done")).state, "done");
 });
