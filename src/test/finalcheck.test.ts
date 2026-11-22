@@ -519,6 +519,70 @@ test("survivor timer frees only the slot while async task waits in input_require
   }
 });
 
+test("stale in-flight survivor re-check is ignored after a newer recordUnconfirmedKill adds a live survivor", async t => {
+  process.env.BRIDGE_HEAVY_SLOTS = "1";
+  const f = await fixture(t);
+  const liveChild = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], { stdio: "ignore", windowsHide: true });
+  const exited = once(liveChild, "exit");
+  t.after(async () => {
+    if (liveChild.exitCode === null && liveChild.signalCode === null) liveChild.kill();
+    await exited;
+  });
+  await once(liveChild, "spawn");
+
+  let firstTimerCheckStarted!: () => void;
+  let releaseFirstTimerCheck!: () => void;
+  const started = new Promise<void>(resolve => { firstTimerCheckStarted = resolve; });
+  const gate = new Promise<void>(resolve => { releaseFirstTimerCheck = resolve; });
+  let releaseDone = false;
+  let paused = false;
+  let postGenChecks = 0;
+
+  const lifecycle = new FinalCheckLifecycle({ prompt: "Edit", cwd: f.cwd, verify: none }, {
+    resolveRoot: async cwd => cwd, fits: () => true, question: editQuestion, lockDirectory: f.locks,
+    snapshotOptions: { snapshotBase: f.snapshots },
+    survivorCheckIntervalMs: 15,
+    processStartMs: async pid => {
+      if (pid === process.ppid) {
+        if (!releaseDone) return Date.now() - 60_000;
+        if (!paused) {
+          paused = true;
+          firstTimerCheckStarted();
+          await gate;
+        }
+        return Date.now() + 60_000;
+      }
+      postGenChecks++;
+      return Date.now() - 60_000;
+    },
+    run: async () => { throw new ClineRunError("timeout", "timed out", { processesStillAlive: [process.ppid] }); }
+  });
+  t.after(() => { releaseFirstTimerCheck?.(); return lifecycle.release(); });
+
+  await lifecycle.execute(new AbortController().signal);
+  await lifecycle.release();
+  releaseDone = true;
+
+  // Wait until the timer has an in-flight re-check over the old survivor list ([process.ppid]).
+  await started;
+  // Record a newer kill adding a live survivor before the in-flight check resolves.
+  (lifecycle as unknown as { recordUnconfirmedKill(pids: number[]): void }).recordUnconfirmedKill([liveChild.pid!]);
+  // Let the stale check resolve with "all dead" for the old list.
+  releaseFirstTimerCheck();
+
+  // Wait for at least two fresh timer ticks checking the new live survivor; both slot and checkout lock must stay held.
+  await until(async () => postGenChecks >= 2, Boolean);
+  await assert.rejects(acquire(f.cwd, { lockDirectory: f.locks }), CheckoutBusyError);
+  await assert.rejects(acquireHeavySlot(f.cwd, () => 0, new AbortController().signal), { kind: "machine_busy" });
+
+  // Once the new survivor actually exits, the timer heals both leases cleanly.
+  liveChild.kill();
+  await exited;
+  await until(async () => !fs.existsSync(path.join(process.env.BRIDGE_HEAVY_DIR!, "slot-1.json")), Boolean);
+  const lock = await acquire(f.cwd, { lockDirectory: f.locks }); lock();
+  const slot = await acquireHeavySlot(f.cwd, () => TEST_WAIT_MS, new AbortController().signal); slot();
+});
+
 test("finding 4 (low): task.state publishes immediately before awaiting a slow survivors-only release", async t => {
   const f = await asyncFixture(t, none);
   let releaseStarted!: () => void;

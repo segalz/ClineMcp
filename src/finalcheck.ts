@@ -141,9 +141,9 @@ export class FinalCheckLifecycle {
   private releaseOwnLock = false;
   private disposed = false;
   private survivorsCleared = false;
+  private survivorGeneration = 0;
   private survivorObservedAt?: string;
   private survivorTimer?: ReturnType<typeof setInterval>;
-  private survivorExitListener?: () => void;
   private survivorCheckInFlight = false;
   get killUnconfirmed(): boolean { return this.evidence.processesStillAlive !== undefined; }
   get hasSlot(): boolean { return this.slot !== undefined; }
@@ -170,28 +170,22 @@ export class FinalCheckLifecycle {
       clearInterval(this.survivorTimer);
       this.survivorTimer = undefined;
     }
-    if (this.survivorExitListener) {
-      process.off("exit", this.survivorExitListener);
-      this.survivorExitListener = undefined;
-    }
   }
   private startSurvivorCheck(): void {
     if (this.survivorTimer || this.evidence.killUnverified || this.survivorsCleared) return;
     const survivors = (this.evidence.processesStillAlive as number[] | undefined) ?? [];
     if (survivors.length === 0 || (!this.slot && (!this.disposed || !this.lock))) return;
     const intervalMs = Math.max(1, this.deps.survivorCheckIntervalMs ?? SURVIVOR_RECHECK_INTERVAL_MS);
-    const stop = () => this.stopSurvivorCheck();
-    this.survivorExitListener = stop;
-    process.once("exit", stop);
     this.survivorTimer = setInterval(() => {
       if (this.survivorCheckInFlight) return;
       if (this.evidence.killUnverified || (!this.slot && (!this.disposed || !this.lock))) {
         this.stopSurvivorCheck();
         return;
       }
+      const generation = this.survivorGeneration;
       this.survivorCheckInFlight = true;
       void this.recheckSurvivors().then(allDead => {
-        if (!this.survivorTimer || this.evidence.killUnverified) return;
+        if (!this.survivorTimer || this.evidence.killUnverified || generation !== this.survivorGeneration) return;
         if (allDead) {
           this.survivorsCleared = true;
           this.stopSurvivorCheck();
@@ -208,6 +202,7 @@ export class FinalCheckLifecycle {
   private recordUnconfirmedKill(pids: number[] = [], unverified?: boolean): void {
     const previous = this.evidence.processesStillAlive as number[] | undefined;
     this.evidence.processesStillAlive = [...new Set([...(previous ?? []), ...pids])];
+    this.survivorGeneration++;
     this.survivorsCleared = false;
     if (unverified) this.evidence.killUnverified = true;
     this.survivorObservedAt = new Date().toISOString();
@@ -596,11 +591,13 @@ export class FinalCheckLifecycle {
   private async recheckSurvivors(parent?: AbortSignal): Promise<boolean> {
     if (!this.killUnconfirmed) return true;
     if (this.evidence.killUnverified) return false;
-    const survivors = (this.evidence.processesStillAlive as number[] | undefined) ?? [];
+    const generation = this.survivorGeneration;
+    const survivors = [...((this.evidence.processesStillAlive as number[] | undefined) ?? [])];
     if (survivors.length === 0) return false;
     try {
       const signal = boundedSignal(PROCESS_QUERY_TIMEOUT_MS, parent);
-      return await survivorsAreDead(survivors, this.survivorObservedAt, this.deps.processStartMs, signal);
+      const allDead = await survivorsAreDead(survivors, this.survivorObservedAt, this.deps.processStartMs, signal);
+      return allDead && generation === this.survivorGeneration && !this.evidence.killUnverified;
     } catch {
       return false;
     }
