@@ -628,10 +628,10 @@ test("an unconfirmed kill never triggers an automatic restore in sync edits or c
     }
   );
   assert.equal(await readFile(path.join(root, "a.txt"), "utf8"), "edited-sync", "sync edits must not restore while kill is unconfirmed");
-  for (const lease of [checkoutLockPath(root, locks), path.join(process.env.BRIDGE_HEAVY_DIR!, "slot-2.json")]) {
-    const holder = JSON.parse(await readFile(lease, "utf8"));
-    assert.deepEqual(holder.survivors, [4242]); assert.equal(holder.pid, process.pid);
-  }
+  const lockHolder = JSON.parse(await readFile(checkoutLockPath(root, locks), "utf8"));
+  assert.deepEqual(lockHolder.survivors, [4242]); assert.equal(lockHolder.pid, process.pid);
+  assert.equal(existsSync(path.join(process.env.BRIDGE_HEAVY_DIR!, "slot-1.json")), false, "heavy slot must be freed after killUnverified");
+  assert.equal(existsSync(path.join(process.env.BRIDGE_HEAVY_DIR!, "slot-2.json")), false, "heavy slot must be freed after killUnverified");
   await assert.rejects(acquire(root, { lockDirectory: locks }), CheckoutBusyError);
 
   root = await mkdtemp(path.join(base, "async-"));

@@ -221,7 +221,7 @@ export async function applyClineEdits(
       }
       // Nothing to keep when the request was refused before its snapshot (e.g. a check that cannot start).
       if (input.keepOnFailure && lifecycle.snapshot && !signal?.aborted && lifecycle.waitReason !== "head_changed") {
-        try { await lifecycle.keep(signal); }
+        try { await lifecycle.keep(signal, { releaseUnverifiedLock: false }); }
         catch (error) {
           if (!signal?.aborted) {
             const keepError = error instanceof ClineRunError ? error

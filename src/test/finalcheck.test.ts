@@ -355,7 +355,7 @@ test("async input_required releases only the slot; retry queues, and cancellatio
   const lock = await acquire(f.cwd, { lockDirectory: f.locks }); lock();
 });
 
-test("finding 2: retained leases heal on release, keep and restore once survivors exit or process table confirms clear", async t => {
+test("finding 2: killUnverified keeps the checkout lock until explicit restore/keep, frees the heavy slot with a note; survivors-only heals via interval and stops on keep/restore", async t => {
   process.env.BRIDGE_HEAVY_SLOTS = "1";
   const spawnSurvivor = async () => {
     const proc = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], { stdio: "ignore", windowsHide: true });
@@ -368,62 +368,143 @@ test("finding 2: retained leases heal on release, keep and restore once survivor
     return { proc, exited };
   };
 
-  for (const mode of ["release", "keep", "restore"] as const) {
+  // 1. killUnverified: checkout lock stays retained on release(), heavy slot is freed immediately with a cleanup note,
+  // and only explicit keep() or restore() frees the checkout lock.
+  for (const disposition of ["keep", "restore"] as const) {
+    const f = await fixture(t);
+    const lifecycle = new FinalCheckLifecycle({ prompt: "Edit", cwd: f.cwd, verify: none }, {
+      resolveRoot: async cwd => cwd, fits: () => true, question: editQuestion, lockDirectory: f.locks,
+      snapshotOptions: { snapshotBase: f.snapshots },
+      survivorCheckIntervalMs: 15,
+      run: async () => { throw new ClineRunError("timeout", "timed out", { killUnverified: true }); }
+    });
+    t.after(() => lifecycle.release());
+    await lifecycle.execute(new AbortController().signal);
+
+    await lifecycle.release();
+    // Heavy slot is freed immediately so machine capacity is not stranded.
+    const slot = await acquireHeavySlot(f.cwd, () => TEST_WAIT_MS, new AbortController().signal);
+    slot();
+    // Checkout lock stays retained and never auto-heals.
+    await assert.rejects(acquire(f.cwd, { lockDirectory: f.locks }), CheckoutBusyError);
+    assert.ok(lifecycle.cleanupNotes.some(note => /released.*slot.*checkout lock/i.test(note)), JSON.stringify(lifecycle.cleanupNotes));
+    assert.ok((lifecycle.evidence.cleanupNotes as string[] | undefined)?.some(note => /released.*slot.*checkout lock/i.test(note)));
+
+    // Explicit user keep/restore frees the checkout lock (snapshot stays preserved because kill was unconfirmed).
+    if (disposition === "keep") await lifecycle.keep();
+    else assert.equal(await lifecycle.restore(), true);
+    const lock = await acquire(f.cwd, { lockDirectory: f.locks });
+    lock();
+  }
+
+  // 2. Survivors-only healing via the injected interval (after release() while survivor is still alive).
+  {
     const f = await fixture(t);
     const { proc, exited } = await spawnSurvivor();
     const lifecycle = new FinalCheckLifecycle({ prompt: "Edit", cwd: f.cwd, verify: none }, {
       resolveRoot: async cwd => cwd, fits: () => true, question: editQuestion, lockDirectory: f.locks,
       snapshotOptions: { snapshotBase: f.snapshots },
+      survivorCheckIntervalMs: 20,
       run: async () => { throw new ClineRunError("timeout", "timed out", { processesStillAlive: [proc.pid!] }); }
     });
     t.after(() => lifecycle.release());
     await lifecycle.execute(new AbortController().signal);
 
-    // While the survivor lives, release keeps both leases held.
+    // Calling release() while survivor lives keeps both leases retained and leaves the interval running.
     await lifecycle.release();
     await assert.rejects(acquire(f.cwd, { lockDirectory: f.locks }), CheckoutBusyError);
     await assert.rejects(acquireHeavySlot(f.cwd, () => 0, new AbortController().signal), { kind: "machine_busy" });
 
-    // Once the survivor exits, release / keep / restore frees both checkout lock and slot.
+    // Once survivor exits, the interval force-releases BOTH checkout lock and heavy slot on its own.
     proc.kill();
     await exited;
-    if (mode === "release") await lifecycle.release();
-    else if (mode === "keep") await lifecycle.keep();
-    else assert.equal(await lifecycle.restore(), true);
-
+    await until(async () => !fs.existsSync(path.join(process.env.BRIDGE_HEAVY_DIR!, "slot-1.json")), Boolean);
     const lock = await acquire(f.cwd, { lockDirectory: f.locks }); lock();
     const slot = await acquireHeavySlot(f.cwd, () => TEST_WAIT_MS, new AbortController().signal); slot();
   }
 
-  // killUnverified with no recorded survivors: heals only when the process table confirms nothing remains.
-  const f = await fixture(t);
-  let tableState: "unreadable" | "descendant" | "clear" = "unreadable";
-  const lifecycle = new FinalCheckLifecycle({ prompt: "Edit", cwd: f.cwd, verify: none }, {
-    resolveRoot: async cwd => cwd, fits: () => true, question: editQuestion, lockDirectory: f.locks,
-    snapshotOptions: { snapshotBase: f.snapshots },
-    listProcessTable: async () => {
-      if (tableState === "unreadable") return null;
-      if (tableState === "descendant") return [{ pid: 88888, parentPid: process.pid, createdMs: Date.now() }];
-      return [{ pid: process.pid, parentPid: process.ppid, createdMs: Date.now() - 60_000 }];
-    },
-    run: async () => { throw new ClineRunError("timeout", "timed out", { killUnverified: true }); }
+  // 3. Survivors-only healing via PID reuse (start time past 5 s tolerance) on the injected interval.
+  {
+    const f = await fixture(t);
+    let reused = false;
+    let checks = 0;
+    const lifecycle = new FinalCheckLifecycle({ prompt: "Edit", cwd: f.cwd, verify: none }, {
+      resolveRoot: async cwd => cwd, fits: () => true, question: editQuestion, lockDirectory: f.locks,
+      snapshotOptions: { snapshotBase: f.snapshots },
+      survivorCheckIntervalMs: 15,
+      processStartMs: async () => {
+        checks++;
+        return reused ? Date.now() + 60_000 : Date.now() - 60_000;
+      },
+      run: async () => { throw new ClineRunError("timeout", "timed out", { processesStillAlive: [process.ppid] }); }
+    });
+    t.after(() => lifecycle.release());
+    await lifecycle.execute(new AbortController().signal);
+
+    await until(async () => checks >= 2, Boolean);
+    await assert.rejects(acquire(f.cwd, { lockDirectory: f.locks }), CheckoutBusyError);
+    await assert.rejects(acquireHeavySlot(f.cwd, () => 0, new AbortController().signal), { kind: "machine_busy" });
+
+    reused = true;
+    await until(async () => !fs.existsSync(path.join(process.env.BRIDGE_HEAVY_DIR!, "slot-1.json")), Boolean);
+    const lock = await acquire(f.cwd, { lockDirectory: f.locks }); lock();
+    const slot = await acquireHeavySlot(f.cwd, () => TEST_WAIT_MS, new AbortController().signal); slot();
+    const settledChecks = checks;
+    await new Promise(r => setTimeout(r, 60));
+    assert.equal(checks, settledChecks, "interval must stop once leases are force-released");
+  }
+
+  // 4. The survivor re-check interval stops on keep() and restore().
+  for (const mode of ["keep", "restore"] as const) {
+    const f = await fixture(t);
+    process.env.BRIDGE_HEAVY_DIR = path.join(f.base, "heavy");
+    let checks = 0;
+    const lifecycle = new FinalCheckLifecycle({ prompt: "Edit", cwd: f.cwd, verify: none }, {
+      resolveRoot: async cwd => cwd, fits: () => true, question: editQuestion, lockDirectory: f.locks,
+      snapshotOptions: { snapshotBase: f.snapshots },
+      survivorCheckIntervalMs: 15,
+      processStartMs: async () => { checks++; return Date.now() - 60_000; },
+      run: async () => { throw new ClineRunError("timeout", "timed out", { processesStillAlive: [process.ppid] }); }
+    });
+    t.after(() => lifecycle.release());
+    await lifecycle.execute(new AbortController().signal);
+    await until(async () => checks >= 2, Boolean);
+
+    if (mode === "keep") await lifecycle.keep();
+    else assert.equal(await lifecycle.restore(), true);
+
+    const checksAfterDisposition = checks;
+    await new Promise(r => setTimeout(r, 80));
+    assert.equal(checks, checksAfterDisposition, `survivor re-check interval must stop on ${mode}()`);
+  }
+});
+
+test("finding 4 (low): task.state publishes immediately before awaiting a slow survivors-only release", async t => {
+  const f = await asyncFixture(t, none);
+  let releaseStarted!: () => void;
+  let finishRelease!: () => void;
+  const started = new Promise<void>(resolve => { releaseStarted = resolve; });
+  const gate = new Promise<void>(resolve => { finishRelease = resolve; });
+  const origReleaseSlot = FinalCheckLifecycle.prototype.releaseSlot;
+  const stub = t.mock.method(FinalCheckLifecycle.prototype, "releaseSlot", async function(this: FinalCheckLifecycle, signal?: AbortSignal) {
+    if (this.hasSlowRelease) {
+      releaseStarted();
+      await gate;
+    }
+    return origReleaseSlot.call(this, signal);
   });
-  t.after(() => lifecycle.release());
-  await lifecycle.execute(new AbortController().signal);
+  t.after(() => { finishRelease(); stub.mock.restore(); });
 
-  await lifecycle.release();
-  await assert.rejects(acquire(f.cwd, { lockDirectory: f.locks }), CheckoutBusyError);
-  await assert.rejects(acquireHeavySlot(f.cwd, () => 0, new AbortController().signal), { kind: "machine_busy" });
-
-  tableState = "descendant";
-  await lifecycle.release();
-  await assert.rejects(acquire(f.cwd, { lockDirectory: f.locks }), CheckoutBusyError);
-  await assert.rejects(acquireHeavySlot(f.cwd, () => 0, new AbortController().signal), { kind: "machine_busy" });
-
-  tableState = "clear";
-  await lifecycle.release();
-  const lock = await acquire(f.cwd, { lockDirectory: f.locks }); lock();
-  const slot = await acquireHeavySlot(f.cwd, () => TEST_WAIT_MS, new AbortController().signal); slot();
+  const task = f.start();
+  const run = await f.launched(1);
+  run.fail(new ClineRunError("timeout", "timed out", { processesStillAlive: [process.ppid] }));
+  await started;
+  const view = await f.manager.status(task.taskId, 0);
+  assert.equal(view.state, "input_required", "status must reflect input_required before slow lease release completes");
+  finishRelease();
+  // Clean up via explicit keep so no background interval lingers.
+  await f.manager.send(task.taskId, "", "keep");
+  await f.wait(task.taskId, "done");
 });
 
 test("finding 3: pre-slot 60 s floor applies only when launches === 0; repair runs keep the 1 s minimum", async t => {

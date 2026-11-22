@@ -842,37 +842,63 @@ export class TaskManager {
       lifecycle.evidence.cleanupError = redactSecrets(String(error));
     }).finally(async () => {
       task.endedAt = this.wallNow(); task.activeMs += task.endedAt - started;
-      if (nextState === "input_required") await lifecycle.releaseSlot();
-      else await this.releaseCheckout(task);
-      task.waitReason = lifecycle.waitReason; task.evidence = lifecycle.evidence;
-      task.question = lifecycle.question ?? (nextState === "input_required" ? lifecycle.killUnconfirmed ? {
-        question: "A surviving process may still change files. Restore the baseline or keep unverified changes?",
-        options: ["restore", "keep"] } : {
-        question: `Edit stopped: ${lifecycle.waitReason}. Retry with guidance, restore baseline, or keep unverified changes?`,
-        options: ["retry", "restore", "keep"] } : undefined);
-      const warnings = [...(lifecycle.result?.warnings ?? []), ...lifecycle.hubWarnings, ...lifecycle.cleanupNotes, ...(gitReport?.warnings ?? [])];
-      const extraNotes = [...lifecycle.hubWarnings, ...lifecycle.cleanupNotes];
-      if (nextError instanceof ClineRunError && extraNotes.length) {
-        // The same error object can be published again (e.g. restore after a wait): never repeat a note.
-        const notes = (nextError.notes ??= []);
-        for (const note of extraNotes) if (!notes.includes(note)) notes.push(note);
-      }
-      if (lifecycle.createdFiles?.length) {
-        warnings.push(`The edit created ${lifecycle.createdFiles.length} new file(s): ${lifecycle.createdFiles.slice(0, 20).join(", ")}${lifecycle.createdFiles.length > 20 ? ", ..." : ""}. Check each belongs to the task.`);
-      }
-      task.result = {
-        ...lifecycle.result, text: lifecycle.result?.text ?? "", durationMs: lifecycle.durationMs,
-        codeMapSource: task.codeMapSource ?? lifecycle.codeMapSource,
-        usage: lifecycle.usage, cost: lifecycle.cost, verification: structuredClone(lifecycle.verification),
-        ...(gitReport ? {
-          gitDiff: gitReport.gitDiff, status: gitReport.status,
-          ...(gitReport.headBefore !== undefined ? { headBefore: gitReport.headBefore } : {}),
-          ...(gitReport.headAfter !== undefined ? { headAfter: gitReport.headAfter } : {})
-        } : {}),
-        ...(lifecycle.createdFiles?.length ? { createdFiles: [...lifecycle.createdFiles] } : {}),
-        ...(warnings.length ? { warnings } : {})
+      const slowRelease = nextState === "input_required"
+        ? lifecycle.hasSlowRelease && lifecycle.hasSlot
+        : lifecycle.hasSlowRelease;
+      const publish = () => {
+        task.waitReason = lifecycle.waitReason; task.evidence = lifecycle.evidence;
+        task.question = lifecycle.question ?? (nextState === "input_required" ? lifecycle.killUnconfirmed ? {
+          question: "A surviving process may still change files. Restore the baseline or keep unverified changes?",
+          options: ["restore", "keep"] } : {
+          question: `Edit stopped: ${lifecycle.waitReason}. Retry with guidance, restore baseline, or keep unverified changes?`,
+          options: ["retry", "restore", "keep"] } : undefined);
+        const warnings = [...(lifecycle.result?.warnings ?? []), ...lifecycle.hubWarnings, ...lifecycle.cleanupNotes, ...(gitReport?.warnings ?? [])];
+        const extraNotes = [...lifecycle.hubWarnings, ...lifecycle.cleanupNotes];
+        if (nextError instanceof ClineRunError && extraNotes.length) {
+          // The same error object can be published again (e.g. restore after a wait): never repeat a note.
+          const notes = (nextError.notes ??= []);
+          for (const note of extraNotes) if (!notes.includes(note)) notes.push(note);
+        }
+        if (lifecycle.createdFiles?.length) {
+          warnings.push(`The edit created ${lifecycle.createdFiles.length} new file(s): ${lifecycle.createdFiles.slice(0, 20).join(", ")}${lifecycle.createdFiles.length > 20 ? ", ..." : ""}. Check each belongs to the task.`);
+        }
+        task.result = {
+          ...lifecycle.result, text: lifecycle.result?.text ?? "", durationMs: lifecycle.durationMs,
+          codeMapSource: task.codeMapSource ?? lifecycle.codeMapSource,
+          usage: lifecycle.usage, cost: lifecycle.cost, verification: structuredClone(lifecycle.verification),
+          ...(gitReport ? {
+            gitDiff: gitReport.gitDiff, status: gitReport.status,
+            ...(gitReport.headBefore !== undefined ? { headBefore: gitReport.headBefore } : {}),
+            ...(gitReport.headAfter !== undefined ? { headAfter: gitReport.headAfter } : {})
+          } : {}),
+          ...(lifecycle.createdFiles?.length ? { createdFiles: [...lifecycle.createdFiles] } : {}),
+          ...(warnings.length ? { warnings } : {})
+        };
+        task.error = nextError; task.state = nextState;
       };
-      task.error = nextError; task.state = nextState;
+      if (slowRelease) {
+        // Publish final status immediately before awaiting an async survivor check (which may take seconds).
+        publish();
+        const prevNotes = lifecycle.cleanupNotes.length;
+        if (nextState === "input_required") await lifecycle.releaseSlot();
+        else await this.releaseCheckout(task);
+        if (lifecycle.cleanupNotes.length > prevNotes) {
+          const added = lifecycle.cleanupNotes.slice(prevNotes);
+          if (task.result) {
+            const warnings = (task.result.warnings as string[] | undefined) ?? [];
+            for (const note of added) if (!warnings.includes(note)) warnings.push(note);
+            task.result.warnings = warnings;
+          }
+          if (nextError instanceof ClineRunError) {
+            const notes = (nextError.notes ??= []);
+            for (const note of added) if (!notes.includes(note)) notes.push(note);
+          }
+        }
+      } else {
+        if (nextState === "input_required") await lifecycle.releaseSlot();
+        else await this.releaseCheckout(task);
+        publish();
+      }
     });
   }
 

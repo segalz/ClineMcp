@@ -17,7 +17,7 @@
  * started_at}],queued,updated_at} is an atomic best-effort hint; readers recount.
  */
 import { createHash, randomUUID } from "node:crypto";
-import { mkdirSync, readFileSync, readdirSync, renameSync, rmSync, unlinkSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, readdirSync, renameSync, rmSync, unlinkSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
@@ -25,6 +25,32 @@ import { canonicalCheckoutPath, CheckoutBusyError, claimFile, deadHolderText, fi
 import { ClineRunError } from "./runner.js";
 
 export interface QueuePosition { position: number; total: number }
+
+/** Tickets owned by this process whose removal failed; retried under admission.lock and never allowed to block waiters. */
+const failedTickets = new Map<string, { dir: string; name: string; token: string }>();
+
+function releaseTicket(dir: string, name: string, token: string): boolean {
+  const file = path.join(dir, "queue", name);
+  const ok = fileLease(file, token)();
+  if (ok) failedTickets.delete(file);
+  else failedTickets.set(file, { dir, name, token });
+  return ok;
+}
+
+function retryFailedTickets(dir: string): boolean {
+  let removed = false;
+  for (const [file, entry] of [...failedTickets]) {
+    if (entry.dir !== dir) {
+      if (!existsSync(entry.dir)) failedTickets.delete(file);
+      continue;
+    }
+    if (fileLease(file, entry.token)()) {
+      failedTickets.delete(file);
+      removed = true;
+    }
+  }
+  return removed;
+}
 
 const ticketPattern = /^(\d+)-\d+-[\da-f-]+\.json$/i;
 function tickets(dir: string): string[] {
@@ -100,25 +126,24 @@ export async function acquireHeavySlot(root: string, waitMs: () => number, signa
       if (admitted) {
         try {
           waiting.throwIfAborted();
+          const reapedFailed = retryFailedTickets(dir);
           for (const [file, text] of dead) {
             if (contents(file) === text) {
               try { unlinkSync(file); } catch (err) { if ((err as NodeJS.ErrnoException).code !== "ENOENT") throw err; }
             }
           }
           const queue = tickets(dir);
+          // Never let an un-unlinkable failed ticket of ours sit at the head and block admission.
+          const liveQueue = queue.filter(name => !failedTickets.has(path.join(dir, "queue", name)));
           const occupied = slotFiles(dir);
           const index = Array.from({ length: slots }, (_, i) => i + 1).find(i => !occupied.includes(`slot-${i}.json`));
           if (waitMs() < 0) throw busy();
-          if (index && occupied.length < slots && (!queue.length || queue[0] === ticket)) {
+          if (index && occupied.length < slots && (!liveQueue.length || liveQueue[0] === ticket)) {
             const file = path.join(dir, `slot-${index}.json`);
             const owner = fileLease(file, token);
             try {
               publishHolder(file, { ...metadata, started_at: new Date().toISOString() });
-              if (ticket) {
-                const ticketPath = path.join(dir, "queue", ticket);
-                ticket = undefined;
-                fileLease(ticketPath, token)();
-              }
+              if (ticket && releaseTicket(dir, ticket, token)) ticket = undefined;
               updateState(dir, slots);
               const releaseSlot = Object.assign((): boolean => {
                 const ok = owner();
@@ -142,10 +167,10 @@ export async function acquireHeavySlot(root: string, waitMs: () => number, signa
             // Record ticket before publication/cleanup so finally always reclaims it if anything throws.
             ticket = name;
             publishHolder(path.join(dir, "queue", name), metadata);
-            queue.push(name);
+            liveQueue.push(name);
             updateState(dir, slots);
-          } else if (dead.size) updateState(dir, slots);
-          onQueue?.({ position: queue.indexOf(ticket) + 1, total: queue.length });
+          } else if (dead.size || reapedFailed) updateState(dir, slots);
+          onQueue?.({ position: liveQueue.indexOf(ticket) + 1, total: liveQueue.length });
         } finally { fileLease(admission, admissionToken)(); }
       }
       if (waitMs() <= 0) throw busy();
@@ -156,7 +181,7 @@ export async function acquireHeavySlot(root: string, waitMs: () => number, signa
     if (deadline.aborted) throw busy();
     throw err;
   } finally {
-    if (ticket) { fileLease(path.join(dir, "queue", ticket), token)(); updateState(dir, slots); }
+    if (ticket) { releaseTicket(dir, ticket, token); updateState(dir, slots); }
     onQueue?.();
   }
 }

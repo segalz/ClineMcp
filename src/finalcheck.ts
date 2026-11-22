@@ -1,14 +1,12 @@
-import { PROCESS_TABLE_TIMEOUT_MS, RESTORE_BUDGET_MS, boundedSignal, settlementBudget } from "./waits.js";
+import { PROCESS_QUERY_TIMEOUT_MS, RESTORE_BUDGET_MS, boundedSignal, settlementBudget } from "./waits.js";
 import { z } from "zod";
 import path from "node:path";
 import { realpath } from "node:fs/promises";
 import { acquire, ownsCheckoutLock, survivorsAreDead, type CheckoutRelease, type FileLease } from "./checkoutlock.js";
 import { acquireHeavySlot, type QueuePosition } from "./heavyslots.js";
-import { hubDaemonPidsOnPort, listClineProcesses } from "./procs.js";
-import { listProcessTable, treeDescendants } from "./proctree.js";
 import { takeSnapshot, restoreSnapshot, discardSnapshot, createdFiles, headAndIndexIdentity, type SnapshotHandle, type SnapshotOptions } from "./snapshot.js";
 import { resolveVerificationCommand, runVerification, VerificationError, type VerificationResult } from "./verify.js";
-import { ClineRunError, DedicatedHubSession, loopbackPortListening, redactSecrets, guardOptionsSchema, type ClineResponse } from "./runner.js";
+import { ClineRunError, DedicatedHubSession, redactSecrets, guardOptionsSchema, type ClineResponse } from "./runner.js";
 import type { GuardOptions } from "./guard.js";
 
 /** Extra margin reserved alongside the final check's timeout so each run leaves time to verify.
@@ -16,6 +14,8 @@ import type { GuardOptions } from "./guard.js";
 export const VERIFY_RESERVE_MARGIN_MS = 10_000;
 /** A first edit run shorter than this (after the check's reserve) is refused before the model starts. */
 export const MIN_FIRST_RUN_SECONDS = 60;
+/** How often the owning process re-checks recorded survivors of a survivors-only retained lease. */
+export const SURVIVOR_RECHECK_INTERVAL_MS = 30_000;
 
 const VERIFY_COMMAND_HELP = "Program for the final check, run without a shell. It must already be runnable before the edit "
   + "starts (it is checked up front; a tool the edit would install is refused). On Windows, npm/pnpm/yarn and "
@@ -70,11 +70,9 @@ export interface FinalCheckDeps {
   resolveVerify?: typeof resolveVerificationCommand;
   /** Optional test seam: monotonic clock in ms (default: performance.now). */
   now?: () => number;
-  /** Optional test seams for healing retained leases after an unconfirmed kill. */
+  /** Optional test seams for healing survivors-only retained leases after an unconfirmed kill. */
   processStartMs?: (pid: number) => number | undefined | Promise<number | undefined>;
-  listProcessTable?: typeof listProcessTable;
-  listClineProcesses?: typeof listClineProcesses;
-  isPortListening?: typeof loopbackPortListening;
+  survivorCheckIntervalMs?: number;
 }
 export function aggregateUsage(target: Record<string, unknown>, source?: Record<string, unknown>): void {
   for (const [key, value] of Object.entries(source ?? {})) {
@@ -141,11 +139,23 @@ export class FinalCheckLifecycle {
   /** New, non-ignored files present when the edit finished (absent when there are none). */
   createdFiles?: string[];
   private releaseOwnLock = false;
-  private runStartedWallMs?: number;
   private survivorObservedAt?: string;
-  private hubUnconfirmed = false;
-  private readonly hubPorts = new Set<number>();
+  private survivorTimer?: ReturnType<typeof setInterval>;
+  private survivorExitListener?: () => void;
+  private survivorCheckInFlight = false;
   get killUnconfirmed(): boolean { return this.evidence.processesStillAlive !== undefined; }
+  get hasSlot(): boolean { return this.slot !== undefined; }
+  /** True when releasing retained leases requires an asynchronous OS process-start check. */
+  get hasSlowRelease(): boolean {
+    return this.killUnconfirmed && !this.evidence.killUnverified && Boolean(this.lock || this.slot);
+  }
+  private recordCleanupNote(note: string): void {
+    const clean = redactSecrets(note);
+    if (!this.cleanupNotes.includes(clean)) this.cleanupNotes.push(clean);
+    const notes = this.evidence.cleanupNotes as string[] | undefined;
+    if (!notes) this.evidence.cleanupNotes = [clean];
+    else if (!notes.includes(clean)) notes.push(clean);
+  }
   private recordLeaseError(action: string, error: string): void {
     const note = redactSecrets(`${action}: ${error}`);
     const existing = this.evidence.leaseErrors as string[] | undefined;
@@ -153,11 +163,47 @@ export class FinalCheckLifecycle {
     else if (!existing.includes(note)) existing.push(note);
     if (!this.cleanupNotes.includes(note)) this.cleanupNotes.push(note);
   }
-  private recordUnconfirmedKill(pids: number[] = [], unverified?: boolean, fromHub = false): void {
+  private stopSurvivorCheck(): void {
+    if (this.survivorTimer) {
+      clearInterval(this.survivorTimer);
+      this.survivorTimer = undefined;
+    }
+    if (this.survivorExitListener) {
+      process.off("exit", this.survivorExitListener);
+      this.survivorExitListener = undefined;
+    }
+  }
+  private startSurvivorCheck(): void {
+    if (this.survivorTimer || this.evidence.killUnverified) return;
+    const survivors = (this.evidence.processesStillAlive as number[] | undefined) ?? [];
+    if (survivors.length === 0 || (!this.lock && !this.slot)) return;
+    const intervalMs = Math.max(1, this.deps.survivorCheckIntervalMs ?? SURVIVOR_RECHECK_INTERVAL_MS);
+    const stop = () => this.stopSurvivorCheck();
+    this.survivorExitListener = stop;
+    process.once("exit", stop);
+    this.survivorTimer = setInterval(() => {
+      if (this.survivorCheckInFlight) return;
+      if (this.evidence.killUnverified || (!this.lock && !this.slot)) {
+        this.stopSurvivorCheck();
+        return;
+      }
+      this.survivorCheckInFlight = true;
+      void this.recheckSurvivors().then(allDead => {
+        if (!this.survivorTimer || this.evidence.killUnverified) return;
+        if (allDead) {
+          this.stopSurvivorCheck();
+          this.releaseNow(true);
+        }
+      }).finally(() => {
+        this.survivorCheckInFlight = false;
+      });
+    }, intervalMs);
+    this.survivorTimer.unref?.();
+  }
+  private recordUnconfirmedKill(pids: number[] = [], unverified?: boolean): void {
     const previous = this.evidence.processesStillAlive as number[] | undefined;
     this.evidence.processesStillAlive = [...new Set([...(previous ?? []), ...pids])];
     if (unverified) this.evidence.killUnverified = true;
-    if (fromHub) this.hubUnconfirmed = true;
     this.survivorObservedAt = new Date().toISOString();
     // Persist evidence as soon as the process stop is known, including after a passing check.
     // Retain is best-effort: never throw out of cleanup or turn a passed check into an error.
@@ -172,7 +218,7 @@ export class FinalCheckLifecycle {
         this.recordLeaseError("Failed to retain checkout lock", err instanceof Error ? err.message : String(err));
       }
     }
-    if (this.slot) {
+    if (this.slot && !this.evidence.killUnverified) {
       try {
         if (!this.slot.retain(survivors, retainOptions)) {
           this.recordLeaseError("Failed to retain heavy slot", this.slot.lastError ?? "unknown error");
@@ -181,6 +227,8 @@ export class FinalCheckLifecycle {
         this.recordLeaseError("Failed to retain heavy slot", err instanceof Error ? err.message : String(err));
       }
     }
+    if (this.evidence.killUnverified) this.stopSurvivorCheck();
+    else if (survivors.length > 0) this.startSurvivorCheck();
     this.evidence.warning = "A surviving process may still change files, including after restoration.";
     if (this.snapshot) this.evidence.snapshotDirectory = this.snapshot.directory;
   }
@@ -217,15 +265,7 @@ export class FinalCheckLifecycle {
   }
   async execute(signal: AbortSignal, guidance?: string): Promise<void> {
     if (this.killUnconfirmed) return;
-    this.runStartedWallMs ??= Date.now();
     const hub = new DedicatedHubSession();
-    const originalEnv = hub.environment.bind(hub);
-    hub.environment = async (...args) => {
-      const env = await originalEnv(...args);
-      const port = Number(env?.CLINE_HUB_PORT);
-      if (Number.isInteger(port) && port > 0) this.hubPorts.add(port);
-      return env;
-    };
     // Each execute reports only its own hub-stop failures (an earlier execute already reported its own).
     this.hubWarnings.length = 0;
     // Status can read phase while cleanup is pending. Publish the wait only after the hub has stopped.
@@ -254,7 +294,7 @@ export class FinalCheckLifecycle {
     // must never restore it. An unconfirmed stop only keeps the snapshot and blocks further runs (plan S20, final check).
     const finishAfterPass = async () => {
       await hub.stop(cleanupBudget);
-      if (hub.unconfirmedStop) this.recordUnconfirmedKill(hub.unconfirmedStop.processesStillAlive, true, true);
+      if (hub.unconfirmedStop) this.recordUnconfirmedKill(hub.unconfirmedStop.processesStillAlive, true);
       // The hub can change the checkout until it stops. The final identity guard shares the
       // settlement deadline, and an inconclusive guard retains the recovery snapshot.
       const guardSignal = AbortSignal.any([signal, cleanupBudget.signal]);
@@ -424,7 +464,7 @@ export class FinalCheckLifecycle {
         await hub.stop(cleanupBudget);
         this.hubWarnings.push(...hub.warnings);
         if (hub.unconfirmedStop) {
-          this.recordUnconfirmedKill(hub.unconfirmedStop.processesStillAlive, true, true);
+          this.recordUnconfirmedKill(hub.unconfirmedStop.processesStillAlive, true);
           // A committed (passing) edit stays done: the unconfirmed stop is evidence and a kept snapshot, not a wait.
           if (this.phase !== "done") {
             this.question = undefined;
@@ -461,22 +501,35 @@ export class FinalCheckLifecycle {
       } catch (error) { this.wait("cline_error", error); return false; }
     }
     await this.complete(signal);
-    if (this.killUnconfirmed) await this.release(signal);
+    await this.finishExplicitDisposition(signal, true);
     return true;
   }
-  async keep(parent?: AbortSignal): Promise<void> {
+  async keep(parent?: AbortSignal, options?: { releaseUnverifiedLock?: boolean }): Promise<void> {
     const signal = boundedSignal(RESTORE_BUDGET_MS, parent);
     const unchanged = await this.unchanged(signal);
     signal.throwIfAborted();
     this.verification.kept = true;
+    const releaseUnverifiedLock = options?.releaseUnverifiedLock ?? true;
     if (!unchanged) {
       // Keeping is allowed to end the task, but an identity refusal must retain recovery bytes.
       this.phase = "done"; this.waitReason = undefined; this.question = undefined;
-      if (this.killUnconfirmed) await this.release(signal);
+      await this.finishExplicitDisposition(signal, releaseUnverifiedLock);
       return;
     }
     await this.complete(signal);
-    if (this.killUnconfirmed) await this.release(signal);
+    await this.finishExplicitDisposition(signal, releaseUnverifiedLock);
+  }
+  private async finishExplicitDisposition(signal: AbortSignal, releaseUnverifiedLock: boolean): Promise<void> {
+    this.stopSurvivorCheck();
+    if (!this.killUnconfirmed) return;
+    if (this.evidence.killUnverified) {
+      if (releaseUnverifiedLock) this.releaseNow(true);
+      else this.releaseForUnverifiedKill();
+      return;
+    }
+    if (!this.lock && !this.slot) return;
+    if (await this.recheckSurvivors(signal)) this.releaseNow(true);
+    else if (this.releaseOwnLock) this.releaseLease(this.lock, "checkout lock", false);
   }
   async complete(signal: AbortSignal): Promise<void> {
     // Completion is the commit point; cancellation after this phase waits for disposal.
@@ -519,43 +572,24 @@ export class FinalCheckLifecycle {
     if (releaseOwnLock) this.releaseLease(lock, "checkout lock", force);
     this.releaseSlotNow(force);
   }
-  private async confirmNothingRemainsInProcessTable(signal: AbortSignal): Promise<boolean> {
-    try {
-      const listTable = this.deps.listProcessTable ?? listProcessTable;
-      const table = await listTable(PROCESS_TABLE_TIMEOUT_MS, signal).catch(() => null);
-      if (!table) return false;
-      const descendants = treeDescendants(process.pid, table, { rootStartedMs: this.runStartedWallMs ?? Date.now() });
-      if (descendants.length > 0) return false;
-      if (this.hubUnconfirmed && this.hubPorts.size > 0) {
-        const checkPort = this.deps.isPortListening ?? loopbackPortListening;
-        const listProcs = this.deps.listClineProcesses ?? listClineProcesses;
-        for (const port of this.hubPorts) {
-          if (await checkPort(port, 1_500, signal).catch(() => true)) return false;
-        }
-        const procs = await listProcs(PROCESS_TABLE_TIMEOUT_MS, signal).catch(() => undefined);
-        if (!procs) return false;
-        for (const port of this.hubPorts) {
-          if (hubDaemonPidsOnPort(port, procs).length > 0) return false;
-        }
-      }
-      return true;
-    } catch {
-      return false;
-    }
+  private releaseSlotForUnverifiedKill(): void {
+    if (!this.slot) return;
+    this.releaseSlotNow(true);
+    this.recordCleanupNote("Released the heavy-run slot after an unverified kill while keeping the checkout lock retained.");
   }
-  private async canReleaseRetained(parent?: AbortSignal): Promise<boolean> {
+  private releaseForUnverifiedKill(): void {
+    this.stopSurvivorCheck();
+    this.releaseSlotForUnverifiedKill();
+    if (this.releaseOwnLock) this.releaseLease(this.lock, "checkout lock", false);
+  }
+  private async recheckSurvivors(parent?: AbortSignal): Promise<boolean> {
     if (!this.killUnconfirmed) return true;
+    if (this.evidence.killUnverified) return false;
+    const survivors = (this.evidence.processesStillAlive as number[] | undefined) ?? [];
+    if (survivors.length === 0) return false;
     try {
-      const signal = boundedSignal(PROCESS_TABLE_TIMEOUT_MS, parent);
-      const survivors = (this.evidence.processesStillAlive as number[] | undefined) ?? [];
-      if (survivors.length > 0) {
-        const dead = await survivorsAreDead(survivors, this.survivorObservedAt, this.deps.processStartMs, signal);
-        if (!dead) return false;
-      }
-      if (this.evidence.killUnverified) {
-        if (!await this.confirmNothingRemainsInProcessTable(signal)) return false;
-      }
-      return true;
+      const signal = boundedSignal(PROCESS_QUERY_TIMEOUT_MS, parent);
+      return await survivorsAreDead(survivors, this.survivorObservedAt, this.deps.processStartMs, signal);
     } catch {
       return false;
     }
@@ -565,19 +599,33 @@ export class FinalCheckLifecycle {
       this.releaseSlotNow(false);
       return;
     }
+    if (this.evidence.killUnverified) {
+      this.stopSurvivorCheck();
+      this.releaseSlotForUnverifiedKill();
+      return;
+    }
     if (!this.slot) return;
-    if (await this.canReleaseRetained(signal)) this.releaseSlotNow(true);
+    if (await this.recheckSurvivors(signal)) this.releaseSlotNow(true);
   }
   async release(signal?: AbortSignal): Promise<void> {
     if (!this.killUnconfirmed) {
+      this.stopSurvivorCheck();
       this.releaseNow(false);
       return;
     }
-    if (!this.lock && !this.slot) return;
-    if (await this.canReleaseRetained(signal)) {
+    if (this.evidence.killUnverified) {
+      this.releaseForUnverifiedKill();
+      return;
+    }
+    if (!this.lock && !this.slot) {
+      this.stopSurvivorCheck();
+      return;
+    }
+    if (await this.recheckSurvivors(signal)) {
+      this.stopSurvivorCheck();
       this.releaseNow(true);
     } else if (this.releaseOwnLock) {
-      // Mark the checkout lock released-while-retained so the stale reaper can reclaim it once survivors exit.
+      // Mark the checkout lock released-while-retained; the unref'd interval and stale reaper heal once survivors exit.
       this.releaseLease(this.lock, "checkout lock", false);
     }
   }

@@ -76,12 +76,12 @@ for (const stage of ["before check", "after pass", "explicit opt-out"] as const)
     assert.equal(lifecycle.phase, committed ? "done" : "waiting");
     assert.deepEqual(lifecycle.evidence.processesStillAlive, []);
     assert.equal(lifecycle.evidence.killUnverified, true);
-    lifecycle.release();
+    await lifecycle.release();
     const locks = path.join(base, "locks");
-    for (const lease of [checkoutLockPath(root, locks), path.join(process.env.BRIDGE_HEAVY_DIR!, "slot-1.json")]) {
-      const holder = JSON.parse(await fs.readFile(lease, "utf8"));
-      assert.equal(holder.pid, process.pid); assert.deepEqual(holder.survivors, []);
-    }
+    const lockHolder = JSON.parse(await fs.readFile(checkoutLockPath(root, locks), "utf8"));
+    assert.equal(lockHolder.pid, process.pid); assert.deepEqual(lockHolder.survivors, []);
+    assert.equal(existsSync(path.join(process.env.BRIDGE_HEAVY_DIR!, "slot-1.json")), false, "heavy slot must be released on killUnverified");
+    assert.ok(lifecycle.cleanupNotes.some(note => /released.*slot.*checkout lock/i.test(note)), JSON.stringify(lifecycle.cleanupNotes));
     await assert.rejects(acquire(root, { lockDirectory: locks }), { kind: "checkout_busy" });
     await lifecycle.execute(signal, "try again");
     assert.equal(runs, 1);

@@ -211,6 +211,66 @@ test("finding 1: .tmp unlink failure after link leaves no orphan; ticket and slo
   assert.equal(existsSync(path.join(dir(), "slot-1.json")), false);
 });
 
+test("finding 1b: failed ticket unlink is retried under admission lock and never blocks later waiters", async t => {
+  process.env.BRIDGE_HEAVY_SLOTS = "1";
+  mkdirSync(dir(), { recursive: true });
+  const holder = await acquireHeavySlot(dir(), () => TEST_WAIT_MS, signal);
+  t.after(() => holder());
+
+  const realUnlink = fs.unlinkSync;
+  let blockFailedTicket = true;
+  let stuckTicketName = "";
+  const stub = t.mock.method(fs, "unlinkSync", (target: fs.PathLike) => {
+    const file = String(target);
+    if (blockFailedTicket && file.includes(`${path.sep}queue${path.sep}`) && (!stuckTicketName || file.endsWith(stuckTicketName))) {
+      stuckTicketName = path.basename(file);
+      throw Object.assign(new Error("injected persistent ticket EBUSY"), { code: "EBUSY" });
+    }
+    return realUnlink(target);
+  });
+  syncBuiltinESMExports();
+  t.after(() => { stub.mock.restore(); syncBuiltinESMExports(); });
+
+  // Waiter 1 queues, aborts, and its ticket unlink fails on every attempt -> ticket stays on disk in failedTickets.
+  const abort1 = new AbortController();
+  await assert.rejects(
+    acquireHeavySlot(dir(), () => TEST_WAIT_MS, abort1.signal, q => { if (q) abort1.abort(); }),
+    { name: "AbortError" }
+  );
+  assert.ok(stuckTicketName, "failed ticket name must be captured");
+  assert.ok(existsSync(path.join(dir(), "queue", stuckTicketName)), "failed ticket is still on disk");
+
+  // Free slot-1 while the failed ticket is STILL un-unlinkable at the head of queue/: waiter 2 must NOT be blocked!
+  holder();
+  const second = await acquireHeavySlot(dir(), () => TEST_WAIT_MS, signal);
+  t.after(() => second());
+  assert.equal(data("slot-1.json").pid, process.pid);
+  second();
+
+  // Once unlink recovers, the next acquire retries and removes the failed ticket under admission.lock.
+  blockFailedTicket = false;
+  const third = await acquireHeavySlot(dir(), () => TEST_WAIT_MS, signal);
+  third();
+  assert.deepEqual(readdirSync(path.join(dir(), "queue")).filter(n => n.endsWith(".json")), [], "failed ticket must be removed on later acquire");
+
+  // Also cover failure during slot-acquisition ticket removal (~line 119): ticket stays tracked and is cleaned up next time.
+  const blocker = await acquireHeavySlot(dir(), () => TEST_WAIT_MS, signal);
+  t.after(() => blocker());
+  stuckTicketName = "";
+  blockFailedTicket = true;
+  const queued = acquireHeavySlot(dir(), () => TEST_WAIT_MS, signal, q => { if (q) blocker(); });
+  const acquiredAfterQueue = await queued;
+  assert.ok(stuckTicketName && existsSync(path.join(dir(), "queue", stuckTicketName)), "ticket unlink failed during slot acquisition");
+  acquiredAfterQueue();
+  // Next acquire is not blocked while still un-unlinkable, then removes it once unlink recovers.
+  const fourth = await acquireHeavySlot(dir(), () => TEST_WAIT_MS, signal);
+  fourth();
+  blockFailedTicket = false;
+  const fifth = await acquireHeavySlot(dir(), () => TEST_WAIT_MS, signal);
+  fifth();
+  assert.deepEqual(readdirSync(path.join(dir(), "queue")).filter(n => n.endsWith(".json")), []);
+});
+
 test("finding 2: stale reaper frees an own-pid retained checkout lock and heavy slot once all survivors exit", async t => {
   process.env.BRIDGE_HEAVY_SLOTS = "1";
   const repo = path.join(dir(), "repo");
@@ -237,9 +297,16 @@ test("finding 2: stale reaper frees an own-pid retained checkout lock and heavy 
   await assert.rejects(acquire(repo, { lockDirectory: locks }), CheckoutBusyError);
   await assert.rejects(acquireHeavySlot(repo, () => 0, signal), { kind: "machine_busy" });
 
-  // Survivor exits; the same live bridge process can now reap both own-pid retained leases.
+  // Survivor exits; another process still refuses to reap a lease whose owner PID is alive,
+  // while the owning bridge process can reap both own-pid retained leases.
   survivor.kill();
   await exited;
+
+  const foreign = await worker(t);
+  foreign.child.send("go");
+  await foreign.wait("queued");
+  foreign.child.kill();
+  await foreign.exited;
 
   const reclaimedLock = await acquire(repo, { lockDirectory: locks });
   reclaimedLock();
