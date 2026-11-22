@@ -270,6 +270,7 @@ export class FinalCheckLifecycle {
         if (repair) this.verification.fixRuns++;
         this.result = undefined;
         let response: ClineResponse | undefined, failure: unknown;
+        const runStarted = now();
         try {
           response = await this.deps.run(prompt, controller.signal, this.lock!, { ...this.input.guard, maxToolCalls: calls, maxInputTokens: tokens },
             remainingSeconds, this.launches, hub);
@@ -287,7 +288,8 @@ export class FinalCheckLifecycle {
         this.budgetInputTokens += metrics?.guard?.budgetInputTokens ?? metrics?.guard?.totalInputTokens ?? 0;
         aggregateUsage(this.usage, metrics?.usage ?? (metrics?.guard ? { inputTokens: metrics.guard.totalInputTokens } : undefined));
         if (typeof metrics?.cost === "number") this.cost += metrics.cost;
-        this.durationMs += metrics?.durationMs ?? 0;
+        // A failed run (guard stop, timeout) carries no durationMs of its own; count its wall time.
+        this.durationMs += metrics?.durationMs ?? Math.round(now() - runStarted);
         check();
         if (!await this.unchanged(controller.signal, wait)) return;
         check();

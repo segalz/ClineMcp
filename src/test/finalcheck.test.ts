@@ -114,6 +114,23 @@ test("a first run left under a minute after the check's reserve is refused befor
   lifecycle.release();
 });
 
+test("a run stopped by the guard still reports its measured duration", async t => {
+  // Live use 2026-11-22 (Stage 14 run 6): a loop_detected run of tens of seconds reported durationMs 0.
+  const f = await fixture(t);
+  const lifecycle = new FinalCheckLifecycle({ prompt: "Implement", cwd: f.cwd, verify }, {
+    resolveRoot: async cwd => cwd, fits: () => true, question: editQuestion, lockDirectory: f.locks,
+    snapshotOptions: { snapshotBase: f.snapshots },
+    run: async () => {
+      await new Promise(resolve => setTimeout(resolve, 60));
+      throw new ClineRunError("loop_detected", "Stopped by the bridge: 3 failed edits");
+    }
+  });
+  await lifecycle.execute(new AbortController().signal);
+  assert.equal(lifecycle.waitReason, "guard");
+  assert.ok(lifecycle.durationMs >= 50, String(lifecycle.durationMs));
+  lifecycle.release();
+});
+
 test("sync failure restores by default, keepOnFailure retains changes, and none reports its reason", async t => {
   for (const keepOnFailure of [false, true]) {
     const f = await fixture(t);
