@@ -51,6 +51,14 @@ Rule from earlier work: the reviewer is always from a different family than the 
   - `opencode/*`: all 11 answered the probe. The shared free quota then ran out partway through ("Free usage limit reached"), so the edit track never ran (quota, recorded as such).
   - A seed bug found along the way: limit messages inside a Markdown analysis error were logged as `crash`. Fixed in model-picker d3c07b2 (on `feat/heavy-queue`), with a test, and the error text is now logged too.
   - Still to do: re-run `--tracks edit --providers opencode` when the quota is back, about 22 calls, which fits one quota window.
+- **F10 merged (owner OK, 2026-11-22):**
+  - ClineMcp and openCodeHelperMcp were fast-forwarded to `main` (8c68773, d5fea09).
+  - model-picker got a merge commit d70991b with F7; it had no conflicts and its suite passed 3807.
+- **F11 bookkeeping done.** `open-items.md` rows 9-14 are closed (none left open), the after-bridges plan is marked closed, and memory is updated.
+- **Left:**
+  1. One restart by the owner (loads F10 and agent-intern 0.40).
+  2. A live check: 4 parallel edits across both bridges with 2 slots, plus `pick(needs_write)` showing the busy warning, plus `codex_status` v0.40.0.
+  3. The F5 `opencode/*` edit track when its quota is back.
 - **F3 decided (owner, 2026-11-22):** `ui` and `general` writes stay with AGY. The free bonus stays on coding, debugging and testing. No code change; the decision is written into CLAUDE.md wording (F2).
 
 ## Order

@@ -1,5 +1,7 @@
 # After the bridges fix: what is left so the bridges get used more and better
 
+**Status: closed (2026-11-22).** Everything here was done and merged. The last open parts (C3, open items 12-14, the re-seed) were finished under `plan/finish-all-2026-11-22.md`.
+
 Written 2026-11-21, after `plan/fix-plan-2026-11-18.md` (S1-S20, Gates 1-6, final Codex check) was merged to `main`
 in ClineMcp (cbc29ca) and openCodeHelperMcp (aeeb4e4). The point of that work was to make the two free bridges
 reliable enough to carry most analysis and checked edits. This plan lists what still stands between "the bridges
