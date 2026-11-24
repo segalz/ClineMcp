@@ -46,6 +46,8 @@ Version 2, 2026-11-24. Written by Claude Opus 5.5 after reading the source. Revi
    - no new shell use.
 
    If all hold, it commits (`linux-port: <id> <summary>`) and pushes. If CI then fails on Windows or arm64, run `git revert --no-edit HEAD && git push`. That counts as a failed attempt; feed the CI log tail into the next attempt. Never force-push.
+
+   **Flaky first** (added 2026-11-25). Before any revert, compare the CI failures with the known-flaky list in `baseline.md`. If every new failure is a known-flaky test, run `gh run rerun <run id> --failed` once. Only a failure that repeats on the rerun, or a failure that is not on the list, leads to a revert. A revert caused by a flake does not count as a failed attempt for the executor.
 8. **Stop rule:** at most 3 attempts per CODE step, then escalate (section 6). Never weaken, skip, or edit a test to get green.
 9. **Executors:** no git, no installs, no network. They never touch `main`.
 10. **Secrets:** API keys live only in the supervisor VM's environment. Never in the repo, CI, logs, or reports.
@@ -250,6 +252,30 @@ File: `src/test/guard-runner.test.ts` only.
 Change nothing else. Do not rename the tests.
 Check: `bash scripts/linux-check.sh dist/test/guard-runner.test.js` must be green on the VM. CI `windows-latest` must stay green.
 Done when the Linux failures are only Gate 6 (G3), settings (G1) and snapshot symlink (Stage 7).
+
+**S1.3 · SUP · Fix the `guard-runner` cleanup flake (ENOTEMPTY).** Risk low. Decision by Claude, 2026-11-25.
+
+Why:
+- `src/test/guard-runner.test.ts` deletes its temp root once, at file end (`after(() => rm(root, …))`, ~33).
+- Three `TaskManager` tests never shut their manager down, so a resumed run is still writing its trace folder while the delete runs. That gives ENOTEMPTY on `traces-7/<task>-run-2`. It was seen on CI run 45501791658 in both Linux jobs, and on the VM about 1 run in 40.
+- This is a test-cleanup race, not a product bug.
+
+File: `src/test/guard-runner.test.ts` only.
+1. Line ~33: replace `after(() => rm(root, { recursive: true, force: true }));` with
+   `after(() => rm(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }));`
+2. In each of these three tests:
+   - "tasks: second trip in resumed run stops in input_required again without auto-resume" (~559)
+   - "tasks: normal task run completes untouched" (~639)
+   - "P2 resume budget: reserves room for guard notice in minimum check and compacts guard report when prompt is tight" (~718)
+
+   make two changes:
+   - change the test function from `async () => {` to `async (t) => {`;
+   - directly after the line `const m = new TaskManager({ ... });`, add `t.after(() => m.shutdown());`. This is the same pattern the file already uses at ~471-472.
+
+Change nothing else.
+Check, to build once and repeat:
+`bash scripts/linux-check.sh dist/test/guard-runner.test.js && for i in $(seq 30); do node --test dist/test/guard-runner.test.js > /dev/null || { echo "failed on run $i"; exit 1; }; done`
+It must pass all 30 runs on the VM, and CI `windows-latest` must stay green.
 
 ---
 
