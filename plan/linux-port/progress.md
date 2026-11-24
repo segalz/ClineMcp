@@ -6,10 +6,10 @@ Updated by the supervisor (Grok Bot) after every step.
 | Step | Type | Risk | Status | Executor / model | Attempts | 1st try | Escalation | CI reverts | Minutes | Notes |
 |------|------|------|--------|------------------|----------|---------|------------|------------|---------|-------|
 | S0.1 | OWNER | low | done | — | — | — | — | — | — | push approved and pushed 2026-11-24 |
-| S0.2 | Claude | low | in-progress | — | — | — | — | — | — | scripts + .gitattributes pushed 2026-11-24; CI workflow NOT pushed (push token lacks `workflow` scope): supervisor adds it verbatim from S0.2, or Claude after the owner grants the scope |
-| S0.3 | SUP | low | pending | — | — | — | — | — | — | VM: Node 22, cline, opencode + free-model access (supervisor sets it up) |
-| S0.4 | SUP | med | pending | — | — | — | — | — | — | baseline.md |
-| S0.5 | SUP | med | pending | — | — | — | — | — | — | discovery.md (JS launcher? daemon argv?) |
+| S0.2 | Claude | low | in-progress | — | — | — | — | — | — | scripts + .gitattributes pushed 2026-11-24; CI workflow NOT pushed: owner token and supervisor token both lack the `workflow` scope (supervisor checked 2026-11-24). Needs the owner/Claude with `workflow` scope |
+| S0.3 | SUP | low | in-progress | — | — | — | — | — | 15 | Node v22.23.5 (nvm), git, build-essential, cline 3.0.75, opencode-ai 1.19.6, `npm ci` OK. OpenCode free model works (`opencode/deepseek-v4.1-flash-free`). Cline: no free model without login/key (cline-free/* → Unauthorized) → BLOCKED on owner: Cline account login or NVIDIA_API_KEY. See discovery.md |
+| S0.4 | SUP | med | in-progress | — | — | — | — | — | 20 | Linux VM: 587 tests, 533 pass, 6 fail, 11 cancelled → 8 class (a), 3 class (b) (G3, G1, new: git check-ignore beyond symlink). CI not run (no workflow) → windows GATE not evaluated. See baseline.md |
+| S0.5 | SUP | med | done | — | — | — | — | — | 10 | JS launcher at `<prefix>/lib/node_modules/cline/bin/cline` (spawns native `bin/.cline`); `@cline/llms` present; daemon argv has `--cline-hub-daemon --cwd --port`, own SID (setsid). Both gates PASS |
 | S1.1 | SUP | low | pending | — | — | — | — | — | — | skip class (a) tests |
 | S2.1 | TEST | low | pending | — | — | — | — | — | — | linux-entry.test.ts |
 | S2.2 | CODE | med | pending | | | | | | | resolveClineEntry on Linux |
