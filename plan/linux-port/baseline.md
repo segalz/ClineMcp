@@ -83,6 +83,6 @@ All W1-W9 above were runner environment (class (c)), fixed by CI revision 2. **G
 
 | # | Where | Test | Signature | Status |
 |---|-------|------|-----------|--------|
-| F1 | any OS | `src/test/guard-runner.test.ts` file-level after-hook (~33) | `ENOTEMPTY: directory not empty, rmdir '…/traces-7/<id>-run-2'` | fixed by S1.3; keep listed until S1.3 CI is green |
+| F1 | any OS | `src/test/guard-runner.test.ts` file-level after-hook (~33) | `ENOTEMPTY: directory not empty, rmdir '…/traces-7/<id>-run-2'` | fixed by S1.3 (`9e65540`, CI 45503968481 green); stays listed for reference |
 | F2 | windows-latest | S12: a restore whose rename is refused while a reader holds providers.json open is retried | seen once, run 45501587786 | watch; if it fails twice more, stop and report to the owner |
 
