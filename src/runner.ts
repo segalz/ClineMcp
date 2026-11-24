@@ -10,6 +10,7 @@ import { access, mkdir, rm } from "node:fs/promises";
 import net from "node:net";
 import os from "node:os";
 import path from "node:path";
+import { existsSync, realpathSync } from "node:fs";
 import { z } from "zod";
 import { LineSplitter, TraceRecorder, type TraceInfo } from "./trace.js";
 import { createGuard, buildGuardTripMessage, type Guard, type GuardOptions, type GuardReport, type GuardVerdict } from "./guard.js";
@@ -633,11 +634,38 @@ export function windowsCommandLineLength(executable: string, args: string[]): nu
 }
 
 /** The Cline CLI entry script the runner launches (and whose install holds the model catalog). */
-export function resolveClineEntry(entryPath?: string): string | undefined {
+export interface ResolveEntryOptions {
+  platform?: NodeJS.Platform;
+  env?: NodeJS.ProcessEnv;
+  execPath?: string;
+  exists?: (p: string) => boolean;
+  realpath?: (p: string) => string;
+}
+
+export function resolveClineEntry(entryPath?: string, opts: ResolveEntryOptions = {}): string | undefined {
+  const {
+    platform = process.platform,
+    env = process.env,
+    execPath = process.execPath,
+    exists = existsSync,
+    realpath = realpathSync
+  } = opts;
   if (entryPath !== undefined) return entryPath;
-  return process.platform === "win32" && process.env.APPDATA
-    ? path.join(process.env.APPDATA, "npm", "node_modules", "cline", "bin", "cline")
-    : undefined;
+  if (env.CLINE_MCP_CLINE_ENTRY) return env.CLINE_MCP_CLINE_ENTRY;
+  if (platform === "win32") {
+    return env.APPDATA ? path.win32.join(env.APPDATA, "npm", "node_modules", "cline", "bin", "cline") : undefined;
+  }
+  const a = path.posix.join(path.posix.dirname(path.posix.dirname(execPath)), "lib", "node_modules", "cline", "bin", "cline");
+  if (exists(a)) return a;
+  for (const dir of (env.PATH ?? "").split(":")) {
+    if (!dir) continue;
+    const c = path.posix.join(dir, "cline");
+    if (!exists(c)) continue;
+    let r: string;
+    try { r = realpath(c); } catch { continue; }
+    if (r.endsWith("/node_modules/cline/bin/cline")) return r;
+  }
+  return undefined;
 }
 
 export const MISSING_SELECTION_MESSAGE =
