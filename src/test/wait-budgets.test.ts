@@ -388,7 +388,7 @@ test("slow 12 s process-table read confirms a timed-out check when no Job Object
   assert.equal(result.killUnverified, undefined);
 });
 
-test("Windows Job Object still runs process-table confirmation and confirms an unreadable table when no pipes are held open", async t => {
+test("Windows Job Object still runs process-table confirmation and confirms an unreadable table when no pipes are held open", { skip: process.platform !== "win32" && "Windows-only: exercises Windows Job Object confirmation; POSIX never creates the job and the real tree check never settles under mocked timers" }, async t => {
   t.mock.timers.enable({ apis: ["Date", "setTimeout"], now: 1_000 });
   let tableCalls = 0;
   let verifyStarted!: () => void;
@@ -703,7 +703,7 @@ test("DedicatedHubSession.stop counts a Job Object kill as confirmed even after 
   }
 });
 
-test("verify exitGrace gets its full 500 ms inside the settle margin when the check exits at its deadline", async t => {
+test("verify exitGrace gets its full 500 ms inside the settle margin when the check exits at its deadline", { skip: process.platform !== "win32" && "Windows-only: an assigned Windows Job Object stands in for the tree check; on POSIX the real process-group check runs on a fake pid under mocked timers and never settles" }, async t => {
   t.mock.timers.enable({ apis: ["Date", "setTimeout"], now: 1_000 });
   let started!: () => void;
   const launched = new Promise<void>(resolve => { started = resolve; });
@@ -825,7 +825,7 @@ test("combined runner confirmation and dedicated hub stop share one settlement b
 
 // ---- Drained Job Object is not proof alone + three small fixes (fail on HEAD 69185cc) ----
 
-test("a child alive outside a drained Job Object is NOT confirmed in verify or runner, and triggers no auto-restore", async t => {
+test("a child alive outside a drained Job Object is NOT confirmed in verify or runner, and triggers no auto-restore", { skip: process.platform !== "win32" && "Windows-only: drained Windows Job Object scenario; POSIX uses process groups, not jobs" }, async t => {
   const base = await mkdtemp(path.join(os.tmpdir(), "job-escape-"));
   t.after(() => rm(base, { recursive: true, force: true, maxRetries: 5 }));
   let root = path.join(base, "repo");
@@ -973,7 +973,7 @@ test("a child alive outside a drained Job Object is NOT confirmed in verify or r
   }
 });
 
-test("drained Job Object + unreadable process table: confirmed without pipesHeldOpen, unconfirmed with pipesHeldOpen", async t => {
+test("drained Job Object + unreadable process table: confirmed without pipesHeldOpen, unconfirmed with pipesHeldOpen", { skip: process.platform !== "win32" && "Windows-only: drained Windows Job Object scenario; POSIX uses process groups, not jobs" }, async t => {
   const drainedJob = (): WindowsJob => {
     let alive = true, assigned = false, confirmed = false;
     return {

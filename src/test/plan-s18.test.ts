@@ -260,7 +260,7 @@ test("S18 review: quoted-key redaction keeps JSON structure and type annotations
   assert.ok(!redactSecrets('"api_key": Bearer mysecret123456').includes("mysecret123456"));
 });
 
-test("S18 review: a job that closes when the check exits does not trigger a needless tree check", async t => {
+test("S18 review: a job that closes when the check exits does not trigger a needless tree check", { skip: process.platform !== "win32" && "Windows-only: relies on a Windows Job Object closing to skip the tree check; POSIX has no job, so the process-group tree check always runs" }, async t => {
   const { runVerification } = await import("../verify.js");
   const cwd = await mkdtemp(path.join(envDir, "verify-job-")); t.after(() => rm(cwd, { recursive: true, force: true }));
   let checked = 0;
