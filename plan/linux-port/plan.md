@@ -162,9 +162,27 @@ Type: OWNER, SUP (supervisor), TEST (supervisor applies a failing test), CODE (e
             node-version: 22
             cache: npm
         - run: git config --global user.email ci@example.invalid && git config --global user.name ci
+        # Tests expect an installed Cline CLI, as on the owner's machines. Windows: install where the bridge looks (%APPDATA%\npm).
+        - name: Install Cline CLI (Windows)
+          if: runner.os == 'Windows'
+          shell: pwsh
+          run: npm install -g cline@3.0.75 --prefix "$env:APPDATA\npm"
+        - name: Install Cline CLI (Linux)
+          if: runner.os == 'Linux'
+          run: npm install -g cline@3.0.75
         - run: npm ci
-        - run: npm test
+        # The hosted Windows runner's %TEMP% is an 8.3 short path (C:\Users\RUNNER~1\...); use the long runner temp folder.
+        - name: Test (Windows)
+          if: runner.os == 'Windows'
+          run: npm test
+          env:
+            TEMP: ${{ runner.temp }}
+            TMP: ${{ runner.temp }}
+        - name: Test
+          if: runner.os != 'Windows'
+          run: npm test
   ```
+  CI revision 2 (2026-11-24): the first run failed on `windows-latest` before any code change, for two runner reasons: no Cline CLI, and an 8.3 short `%TEMP%`. Cline is pinned to the supervisor VM's version (3.0.75). Known latent Windows issue, out of scope here: path identity (for example the checkout lock) can differ when one caller passes an 8.3 short path and another the long path.
 Done when: committed on `linux-support` and pushed (after S0.1), and the first CI run has finished. Red jobs are expected and recorded in S0.4. Grok Bot takes over from S0.3.
 
 **S0.3 · SUP · Prepare the VM and free-model access (the supervisor does this itself).**

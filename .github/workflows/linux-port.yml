@@ -20,5 +20,22 @@ jobs:
           node-version: 22
           cache: npm
       - run: git config --global user.email ci@example.invalid && git config --global user.name ci
+      # Tests expect an installed Cline CLI, as on the owner's machines. Windows: install where the bridge looks (%APPDATA%\npm).
+      - name: Install Cline CLI (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: npm install -g cline@3.0.75 --prefix "$env:APPDATA\npm"
+      - name: Install Cline CLI (Linux)
+        if: runner.os == 'Linux'
+        run: npm install -g cline@3.0.75
       - run: npm ci
-      - run: npm test
+      # The hosted Windows runner's %TEMP% is an 8.3 short path (C:\Users\RUNNER~1\...); use the long runner temp folder.
+      - name: Test (Windows)
+        if: runner.os == 'Windows'
+        run: npm test
+        env:
+          TEMP: ${{ runner.temp }}
+          TMP: ${{ runner.temp }}
+      - name: Test
+        if: runner.os != 'Windows'
+        run: npm test
