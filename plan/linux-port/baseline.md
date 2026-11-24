@@ -79,3 +79,10 @@ All W1-W9 above were runner environment (class (c)), fixed by CI revision 2. **G
 - CI run https://github.com/segalz/ClineMcp/actions/runs/45492036371: windows-latest **success** (586 pass, 0 fail, unchanged); ubuntu-24.04 and ubuntu-24.04-arm 540 pass / 5 fail / 0 cancelled.
 - The remaining Linux failures: #4 (b, G3 → Stage 4), #5 (b, G1 → Stage 2), #6 (b, check-ignore beyond symlink → Stage 7), #1-#2 (guard-runner, unclear, waiting for the owner).
 
+## Known-flaky list (plan rule 7, "Flaky first")
+
+| # | Where | Test | Signature | Status |
+|---|-------|------|-----------|--------|
+| F1 | any OS | `src/test/guard-runner.test.ts` file-level after-hook (~33) | `ENOTEMPTY: directory not empty, rmdir '…/traces-7/<id>-run-2'` | fixed by S1.3; keep listed until S1.3 CI is green |
+| F2 | windows-latest | S12: a restore whose rename is refused while a reader holds providers.json open is retried | seen once, run 45501587786 | watch; if it fails twice more, stop and report to the owner |
+
