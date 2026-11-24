@@ -54,4 +54,21 @@ Two causes seen on the hosted runner. Neither comes from `linux-support`, which 
 | W8 | `plan-s15.test.ts` | S15 Gate 2: CLINE_MCP_SNAPSHOT_DIR sets the default snapshot base | `C:\Users\runneradmin\...\snapshots\<id>` `true !== false` | E2 → (c)? |
 | W9 | `settings.test.ts` | built stdio bridge startup restores a temporary journal and logs failed recovery | stderr `... Cline CLI entry ... not readable (ENOENT)` | E1 → (c) |
 
-**GATE (CI `windows-latest` green apart from explained class (c)): FAIL, not cleared.** W1, W3 and W9 are clearly environment. W2 and W4-W8 point at 8.3 short-path aliasing, which may also be a latent Windows bug in lock/path identity (it would be on `main` too). Stage 0 stops here and the owner decides (see progress.md).
+**First-run GATE: failed (superseded by CI revision 2 below).** W1, W3 and W9 are clearly environment. W2 and W4-W8 point at 8.3 short-path aliasing, which may also be a latent Windows bug in lock/path identity (it would be on `main` too). Stage 0 stops here and the owner decides (see progress.md).
+
+## CI revision 2 (S0.2, Claude) — gate re-check
+
+Workflow `c79ba86` (runner fixes: Cline CLI 3.0.75 installed on the runner; Windows tests run with `TEMP`/`TMP` = the long runner temp folder). Run: https://github.com/segalz/ClineMcp/actions/runs/45488824177
+
+| Job | Result | tests / pass / fail / cancelled / skipped |
+|-----|--------|--------------------------------------------|
+| windows-latest | **success** | 587 / 586 / 0 / 0 / 1 |
+| ubuntu-24.04 | failure | 587 / 533 / 6 / 11 / 37 (the same as the VM baseline) |
+| ubuntu-24.04-arm | failure | 587 / 533 / 6 / 11 / 37 (the same as the VM baseline) |
+
+All W1-W9 above were runner environment (class (c)), fixed by CI revision 2. **GATE (windows-latest green): PASS.** Stage 0 closed 2026-11-24.
+
+## Reclassification during S1.1 (supervisor re-check)
+
+- #8 (`verify exitGrace …`): **confirmed (a).** A diagnostic copy in `dist/` (deleted afterwards, nothing tracked changed) shows that on POSIX no Job Object is created, so `runVerification` runs the real `confirmTreeDead` on the test's fake pid 12345 under mocked timers and never settles. With an injected tree check the same scenario passes (`passed: true`, `timedOut: false`). The test models the Windows job path.
+- #1 and #2 (`guard-runner.test.ts`): **moved from (a) to "unclear", not skipped.** The test is platform-aware: its `mockKillTree` expects `SIGTERM` on POSIX. On Linux the runner calls it twice, `SIGTERM` and then the `SIGKILL` escalation 500 ms later, because the mock child never exits. The test expects exactly one call. So this is not Windows-only behaviour. Either the test expectation or the escalation-while-guard-tripped behaviour is wrong. Escalated to the owner/Claude (rule: never skip a non-(a) test).
