@@ -8,16 +8,20 @@ Supervisor VM: Linux x86_64 (Debian 13), 2026-11-24. Names and ids only; no keys
 - npm global prefix on this VM: `/home/box/.local` (set by `NPM_CONFIG_PREFIX`), so `npm root -g` = `/home/box/.local/lib/node_modules`.
 - `cline` 3.0.75, `opencode-ai` 1.19.6 (`npm install -g cline opencode-ai`).
 
-### Working free models
+### Working free models (owner's choice, 2026-11-24)
 
-| Executor | Model id | Proof |
-|----------|----------|-------|
-| Cline | `-P nvidia -m nvidia/nemotron-3.5-super-vl-120b-a12b` | plan's Cline command line (`--json --auto-approve true --thinking high`) in a scratch folder → `run_result` `finishReason: completed`, answered PONG |
-| OpenCode | `nvidia/nvidia/nemotron-3.5-super-vl-120b-a12b` | `opencode run` → `PONG` |
-| OpenCode | `nvidia/poolside/laguna-xs-2.1` | `opencode run` → `PONG` |
-| OpenCode | `opencode/deepseek-v4.1-flash-free` | `opencode run` → `PONG` (no secret needed) |
+| Executor | Role | Model id | Proof |
+|----------|------|----------|-------|
+| Cline | **primary** | `-P cline -m cline-free/nemotron-3.5-super-vl` | plan's headless Cline command line in a scratch folder → `finishReason: completed`, PONG |
+| Cline | alternate | `-P cline -m nvidia/nemotron-3.5-lightning-free` | same → `completed`, PONG |
+| Cline | fallback | `-P nvidia -m nvidia/nemotron-3.5-super-vl-120b-a12b` | same → `completed`, PONG |
+| OpenCode | **primary** | `nvidia/nvidia/nemotron-3.5-super-vl-120b-a12b` | `opencode run` → `PONG` |
+| OpenCode | alternate | `nvidia/poolside/laguna-xs-2.1` | `opencode run` → `PONG` |
+| OpenCode | fallback | `opencode/deepseek-v4.1-flash-free` | `opencode run` → `PONG` (no secret needed) |
 
-NVIDIA access: the owner put `NVIDIA_API_KEY` into the supervisor VM's secret store (2026-11-24). Both CLIs read it from the environment; it is not saved in any config file or in this repo.
+Access (no secrets in this repo):
+- Cline: a Cline account device login, approved by the owner on 2026-11-24. The session lives only in the supervisor VM's Cline config. `cline-free/nemotron-3.5-super-vl` is the only `cline-free/*` id in the installed catalog (`@cline/llms`).
+- NVIDIA: `NVIDIA_API_KEY` in the supervisor VM's secret store, read from the environment only.
 
 ### Cline without a secret (history: why NVIDIA was needed)
 
@@ -26,7 +30,7 @@ NVIDIA access: the owner put `NVIDIA_API_KEY` into the supervisor VM's secret st
 - OpenCode's free models refuse other clients: through Cline's OpenAI-compatible provider the endpoint answers "Free usage limit reached. Free models work in OpenCode". Not used further; that config was removed.
 - OpenCode's `nvidia/*` models from the plan's list are not available without `NVIDIA_API_KEY` (`opencode models` lists no `nvidia/` provider).
 
-Resolved: the owner chose option 2 (`NVIDIA_API_KEY` in the secret store). Cline `-P nvidia` now works (table above).
+Resolved: the owner approved both: a Cline account login (now the Cline primary, `cline-free/*`) and `NVIDIA_API_KEY` (Cline fallback, OpenCode primary). See the table above.
 
 ## S0.5 — Discovery of the Linux Cline install
 
