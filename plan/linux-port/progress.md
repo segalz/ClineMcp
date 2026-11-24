@@ -14,8 +14,8 @@ Updated by the supervisor (Grok Bot) after every step.
 | S1.2 | SUP | low | done | — | 1 | y | — | — | 5 | `589fe70`: guard-runner expects [SIGTERM, SIGKILL] on POSIX. VM check green (9/9). CI 45494383407: windows 586/0 fail; ubuntu + arm 542 pass / 3 fail = Gate 6 (G3), settings (G1), snapshot symlink (Stage 7) only |
 | S2.1 | TEST | low | done | — | — | — | — | — | 2 | `8d28953`; RED as expected (tsc TS2554: resolveClineEntry takes 0-1 args) |
 | S2.2 | CODE | med | done | Cline / cline-free/nemotron-3.5-super-vl | 1 | y | none | 0 | 4 | `52abbf9`. Diff: runner.ts only (import, ResolveEntryOptions, function), per spec. Linux check 78/78. Full VM suite 551 pass / 2 fail (G1 settings test now green). CI 45496762631: windows 593/0 fail; ubuntu+arm only Gate 6 + snapshot symlink. Review note: the old doc comment now sits above the interface (cosmetic) |
-| S2.3 | TEST | med | pending | — | — | — | — | — | — | linux-launch.test.ts |
-| S2.4 | CODE | low | pending | | | | | | | launch node <entry> |
+| S2.3 | TEST | med | done | — | — | — | — | — | 2 | `bda9c55`; RED for the right reason on Linux (spawned `cline`, expected node execPath) |
+| S2.4 | CODE | low | done (owner to confirm CI) | OpenCode / nvidia/nvidia/nemotron-3.5-super-vl-120b-a12b | 2 | y (VM) | none | 1 | 3 | Both attempts produced the same exact 2-statement diff; Linux check 62/62; full VM suite 552 pass / 2 fail (Gate 6, snapshot symlink). Attempt 1 `5c6ff86`: CI windows + arm red on a guard-runner.test.js after-hook `ENOTEMPTY` (trace dir cleanup race) → reverted `af2ff67` per rule 7. The reverted state ALSO failed in CI (run 45501587786: ubuntu same ENOTEMPTY; windows S12 providers.json flake), so the flake is not caused by S2.4. Attempt 2 `6ae87d2`: CI 45501791658 windows **success** (593/0 fail), ubuntu + arm: Gate 6, snapshot symlink + the same guard-runner hook flake. Not reverted again: escalated as unclear |
 | S3.1 | TEST | low | pending | — | — | — | — | — | — | linux-procs-parse.test.ts |
 | S3.2 | CODE | low | pending | | | | | | | formatCommandLine, parseProcStatusUid |
 | S3.3 | TEST | med | pending | — | — | — | — | — | — | linux-procs.test.ts |
@@ -37,3 +37,7 @@ Updated by the supervisor (Grok Bot) after every step.
 ## Experiment summary (fill at the end)
 - CODE steps: — · alone 1st try: — · alone within 3: — · after supervisor rewrite: — · needed Claude: —
 - Failure patterns:
+
+## Open items (supervisor)
+- 2026-11-25: flaky after-hook in `src/test/guard-runner.test.ts` (~line 18, `rm` of the temp root): `ENOTEMPTY … traces-7/<id>-run-2` while a trace writer is still writing. Seen in CI on ubuntu, arm and windows, with and without S2.4; locally ~1/40 runs. Locked test file → needs a Claude/owner fix (for example await the trace recorder or `rm` with `maxRetries`). Until then it can turn any CI job red at random.
+- 2026-11-25: windows-latest flake once: `S12: a restore whose rename is refused while a reader holds providers.json open is retried` (run 45501587786, reverted state). Watch it.
