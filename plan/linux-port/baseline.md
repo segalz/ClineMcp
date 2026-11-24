@@ -24,9 +24,34 @@ The other 7 "cancelled" tests in `wait-budgets.test.ts` (lines ~466, 535, 652, 7
 
 Summary: class (a) 8 (#1-3, #7-10), class (b) 3 (#4 G3, #5 G1, #6 new), class (c) 0.
 
-## CI (GitHub Actions)
+## CI (GitHub Actions) — first run
 
-**No CI run exists.** `.github/workflows/linux-port.yml` is still not on `linux-support`: the supervisor's GitHub token also lacks the `workflow` scope (scopes: `repo, gist, read:org, delete_repo`), so it cannot push workflow files.
+Workflow added by Claude in `69a9262` (matches plan S0.2 byte for byte). Run: https://github.com/segalz/ClineMcp/actions/runs/45483808438 (Node 22, `npm ci`, `npm test`).
 
-- CI ubuntu-24.04 / ubuntu-24.04-arm / windows-latest: not run.
-- **GATE (CI `windows-latest` green): NOT EVALUATED → open.** Stage 0 stops here until the workflow is pushed and its first run is read.
+| Job | Result | tests / pass / fail / cancelled / skipped |
+|-----|--------|--------------------------------------------|
+| ubuntu-24.04 | failure | 587 / 533 / 6 / 11 / 37 |
+| ubuntu-24.04-arm | failure | 587 / 533 / 6 / 11 / 37 |
+| windows-latest | **failure** | 587 / 576 / 9 / 0 / 2 |
+
+Both Linux jobs fail on exactly the same tests as the VM (#1-#10 above, plus the same 7 collateral cancellations). arm64 adds nothing new.
+
+### windows-latest failures (first error line, suspected class)
+
+Two causes seen on the hosted runner. Neither comes from `linux-support`, which has no source change yet:
+- **E1, no Cline CLI on the runner:** `the Cline CLI entry C:\Users\runneradmin\AppData\Roaming\npm\node_modules\cline\bin\cline is not readable (ENOENT)` / `Cline CLI is missing or being updated`.
+- **E2, 8.3 short TEMP path:** the runner's `%TEMP%` is `C:\Users\RUNNER~1\...`, while the code resolves the long name `C:\Users\runneradmin\...`, so path-equality checks differ.
+
+| # | File | Test | First error line | Suspected cause / class |
+|---|------|------|------------------|--------------------------|
+| W1 | `checkoutlock.test.ts` | sync edits refuses a held checkout before launching Cline | `"busy" validation ... Received false ... ClineRunError: Cline CLI is missing or being updated` | E1 → (c) |
+| W2 | `checkoutlock.test.ts` | async edits retains its lock across waiting and resume, blocks sync/async writers, and releases on completion | `assert.ok(ownsCheckoutLock(lease, root))` falsy | E2 → (c)? (lock identity under short vs long path) |
+| W3 | `codemap.test.ts` | edits integration reads the current checkout | env line has `...\runneradmin\...`, expected `...\RUNNER~1\...` | E2 → (c) |
+| W4 | `codemap.test.ts` | structural provenance and exact roots reach sync and async workspace/edits, including resumes | `includes("structural root=<smallRepo>")` falsy | E2 → (c) |
+| W5 | `finalcheck.test.ts` | async exhausted verification waits with retained edits; restore, keep and one manual repair | `Missing expected rejection.` | E1/E2, unconfirmed |
+| W6 | `finalcheck.test.ts` | async input_required releases only the slot; retry queues, and cancellation cleans up both queued and running edits | `Missing expected rejection.` | E1/E2, unconfirmed |
+| W7 | `finalcheck.test.ts` | survivor timer frees only the slot while async task waits in input_required; checkout lock stays held until keep/restore | `Missing expected rejection (CheckoutBusyError).` | E2 (lock identity), unconfirmed |
+| W8 | `plan-s15.test.ts` | S15 Gate 2: CLINE_MCP_SNAPSHOT_DIR sets the default snapshot base | `C:\Users\runneradmin\...\snapshots\<id>` `true !== false` | E2 → (c)? |
+| W9 | `settings.test.ts` | built stdio bridge startup restores a temporary journal and logs failed recovery | stderr `... Cline CLI entry ... not readable (ENOENT)` | E1 → (c) |
+
+**GATE (CI `windows-latest` green apart from explained class (c)): FAIL, not cleared.** W1, W3 and W9 are clearly environment. W2 and W4-W8 point at 8.3 short-path aliasing, which may also be a latent Windows bug in lock/path identity (it would be on `main` too). Stage 0 stops here and the owner decides (see progress.md).

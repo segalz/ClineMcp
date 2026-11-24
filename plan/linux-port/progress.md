@@ -6,9 +6,9 @@ Updated by the supervisor (Grok Bot) after every step.
 | Step | Type | Risk | Status | Executor / model | Attempts | 1st try | Escalation | CI reverts | Minutes | Notes |
 |------|------|------|--------|------------------|----------|---------|------------|------------|---------|-------|
 | S0.1 | OWNER | low | done | — | — | — | — | — | — | push approved and pushed 2026-11-24 |
-| S0.2 | Claude | low | in-progress | — | — | — | — | — | — | scripts + .gitattributes pushed 2026-11-24; CI workflow NOT pushed: owner token and supervisor token both lack the `workflow` scope (supervisor checked 2026-11-24). Needs the owner/Claude with `workflow` scope |
+| S0.2 | Claude | low | done | — | — | — | — | — | — | scripts + .gitattributes 2026-11-24; workflow `69a9262` (exact match to S0.2). First run 45483808438: ubuntu fail, arm fail, windows fail |
 | S0.3 | SUP | low | done | — | — | — | — | — | 25 | Node v22.23.5 (nvm), git, build-essential, cline 3.0.75, opencode-ai 1.19.6, `npm ci` OK. Cline primary `cline-free/nemotron-3.5-super-vl` (Cline account login, owner-approved), fallback `nvidia` / `nvidia/nemotron-3.5-super-vl-120b-a12b`. OpenCode primary `nvidia/nvidia/nemotron-3.5-super-vl-120b-a12b`, fallback `opencode/deepseek-v4.1-flash-free`. See discovery.md |
-| S0.4 | SUP | med | in-progress | — | — | — | — | — | 20 | Linux VM: 587 tests, 533 pass, 6 fail, 11 cancelled → 8 class (a), 3 class (b) (G3, G1, new: git check-ignore beyond symlink). CI not run (no workflow) → windows GATE not evaluated. See baseline.md |
+| S0.4 | SUP | med | escalated | — | — | — | — | — | 40 | VM + CI ubuntu/arm: 6 fail + 11 cancelled (8 (a), 3 (b)). **GATE FAIL:** windows-latest 9 fail (no Cline CLI on the runner; 8.3 `RUNNER~1` TEMP path). Stopped, waiting for the owner. See baseline.md |
 | S0.5 | SUP | med | done | — | — | — | — | — | 10 | JS launcher at `<prefix>/lib/node_modules/cline/bin/cline` (spawns native `bin/.cline`); `@cline/llms` present; daemon argv has `--cline-hub-daemon --cwd --port`, own SID (setsid). Both gates PASS |
 | S1.1 | SUP | low | pending | — | — | — | — | — | — | skip class (a) tests |
 | S2.1 | TEST | low | pending | — | — | — | — | — | — | linux-entry.test.ts |
