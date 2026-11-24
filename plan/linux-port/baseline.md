@@ -9,7 +9,7 @@ Commit `d2c4f86` (branch `linux-support`), 2026-11-24.
 
 | # | File | Test | First error line | Class |
 |---|------|------|------------------|-------|
-| 1 | `src/test/guard-runner.test.ts` | runner: repeated edit failures trip loop guard, kill process once, attach report, no retry | `killTree called exactly once` (expected 1, actual 2) | (a) — POSIX sends SIGTERM then SIGKILL after the grace period by design (`runner.ts` ~1262-1266); "exactly once" is the Windows taskkill behaviour |
+| 1 | `src/test/guard-runner.test.ts` | runner: repeated edit failures trip loop guard, kill process once, attach report, no retry | `killTree called exactly once` (expected 1, actual 2) | unclear (was (a); see "Reclassification during S1.1") — POSIX sends SIGTERM then SIGKILL after the grace period by design (`runner.ts` ~1262-1266); "exactly once" is the Windows taskkill behaviour |
 | 2 | `src/test/guard-runner.test.ts` | runner: budget_exceeded trips when maxToolCalls exceeded | `Expected values to be strictly equal` (expected 1, actual 2) | (a) — same SIGTERM→SIGKILL escalation |
 | 3 | `src/test/plan-s18.test.ts` | S18 review: a job that closes when the check exits does not trigger a needless tree check | `Expected values to be strictly equal` (expected 0, actual 1) | (a) — Windows Job Object semantics; with no Job Object on POSIX the tree check is the only confirmation |
 | 4 | `src/test/plan-s20.test.ts` | Gate 6: a failed hub stop with an unreadable process list is not confirmed | `Expected values to be strictly equal` (+ undefined, - false) | (b) — known, G3, fixed by Stage 4. Do not skip. |
@@ -22,7 +22,7 @@ Commit `d2c4f86` (branch `linux-support`), 2026-11-24.
 
 The other 7 "cancelled" tests in `wait-budgets.test.ts` (lines ~466, 535, 652, 712, 760, 1199, 1321) are collateral: they were cancelled because #7 hung the file. With #7-#10 excluded (`--test-skip-pattern`, investigation only, nothing edited) the rest of that file passes: `pass 21 · fail 0 · cancelled 0 · skipped 2` (the two existing Windows-only skips).
 
-Summary: class (a) 8 (#1-3, #7-10), class (b) 3 (#4 G3, #5 G1, #6 new), class (c) 0.
+Summary (initial): class (a) 8 (#1-3, #7-10); after S1.1 re-check: (a) 6, unclear 2 (#1-2), class (b) 3 (#4 G3, #5 G1, #6 new), class (c) 0.
 
 ## CI (GitHub Actions) — first run
 
@@ -72,3 +72,10 @@ All W1-W9 above were runner environment (class (c)), fixed by CI revision 2. **G
 
 - #8 (`verify exitGrace …`): **confirmed (a).** A diagnostic copy in `dist/` (deleted afterwards, nothing tracked changed) shows that on POSIX no Job Object is created, so `runVerification` runs the real `confirmTreeDead` on the test's fake pid 12345 under mocked timers and never settles. With an injected tree check the same scenario passes (`passed: true`, `timedOut: false`). The test models the Windows job path.
 - #1 and #2 (`guard-runner.test.ts`): **moved from (a) to "unclear", not skipped.** The test is platform-aware: its `mockKillTree` expects `SIGTERM` on POSIX. On Linux the runner calls it twice, `SIGTERM` and then the `SIGKILL` escalation 500 ms later, because the mock child never exits. The test expects exactly one call. So this is not Windows-only behaviour. Either the test expectation or the escalation-while-guard-tripped behaviour is wrong. Escalated to the owner/Claude (rule: never skip a non-(a) test).
+
+## After S1.1 (`eabf7ca`)
+
+- VM `bash scripts/linux-check.sh`: 587 / 540 pass / 5 fail / 0 cancelled / 42 skipped.
+- CI run https://github.com/segalz/ClineMcp/actions/runs/45492036371: windows-latest **success** (586 pass, 0 fail, unchanged); ubuntu-24.04 and ubuntu-24.04-arm 540 pass / 5 fail / 0 cancelled.
+- The remaining Linux failures: #4 (b, G3 → Stage 4), #5 (b, G1 → Stage 2), #6 (b, check-ignore beyond symlink → Stage 7), #1-#2 (guard-runner, unclear, waiting for the owner).
+
