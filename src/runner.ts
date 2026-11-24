@@ -1072,7 +1072,7 @@ async function runClineCore(input: AskClineInput, signal: AbortSignal | undefine
         throw new ClineRunError("launch_failed", "Unable to locate the local Cline CLI.");
       }
 
-      const executable = (process.platform === "win32" || deps.entryPath) ? process.execPath : "cline";
+      const executable = windowsEntry ? process.execPath : "cline";
       const backoffMs = deps.backoffMs ?? 2500;
       const updateBackoffMs = deps.updateBackoffMs ?? 2000;
       const maxAttempts = Math.max(1, options.maxAttempts ?? 2);
@@ -1142,9 +1142,7 @@ async function runClineCore(input: AskClineInput, signal: AbortSignal | undefine
         if (cwd) args.push("--cwd", cwd);
         args.push((options.promptPreamble ?? "") + effectiveInput.prompt);
 
-        const spawnArgs = (process.platform === "win32" || deps.entryPath) && windowsEntry
-          ? [windowsEntry, ...args]
-          : args;
+        const spawnArgs = windowsEntry ? [windowsEntry, ...args] : args;
         if (platform === "win32") {
           const length = windowsCommandLineLength(executable, spawnArgs);
           if (length > WINDOWS_COMMAND_LINE_LIMIT) {
