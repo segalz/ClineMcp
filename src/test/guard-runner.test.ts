@@ -30,7 +30,7 @@ process.env.CLINE_PROVIDER_SETTINGS_PATH = path.join(root, "providers.json");
 process.env.CLINE_MCP_CATALOG_PATH = path.join(root, "catalog.json");
 process.env.CLINE_MCP_STATE_PATH = path.join(root, "state.json");
 process.env.CLINE_MCP_TRACE_DIR = path.join(root, "traces");
-after(() => rm(root, { recursive: true, force: true }));
+after(() => rm(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }));
 
 let counter = 0;
 const traceBase = () => path.join(root, `traces-${++counter}`);
@@ -556,9 +556,10 @@ test("tasks: run ending in loop_detected transitions to input_required with brid
   assert.equal(finalRes.log_run_hint?.ok, true);
 });
 
-test("tasks: second trip in resumed run stops in input_required again without auto-resume", async () => {
+test("tasks: second trip in resumed run stops in input_required again without auto-resume", async (t) => {
   const c = controllable();
   const m = new TaskManager({ runners: { ask: c.runner }, traceBase: traceBase() });
+  t.after(() => m.shutdown());
 
   const started = m.start({
     mode: "ask",
@@ -636,9 +637,10 @@ test("tasks: second trip in resumed run stops in input_required again without au
   assert.equal(s3.run, 3);
 });
 
-test("tasks: normal task run completes untouched", async () => {
+test("tasks: normal task run completes untouched", async (t) => {
   const c = controllable();
   const m = new TaskManager({ runners: { ask: c.runner }, traceBase: traceBase() });
+  t.after(() => m.shutdown());
 
   const started = m.start({ mode: "ask", prompt: "clean run", ...sel });
   await c.runs[0].finish("All clean without trips.");
@@ -716,9 +718,10 @@ test("P2 resume content: resumed context includes tool + target, last errors (<=
   );
 });
 
-test("P2 resume budget: reserves room for guard notice in minimum check and compacts guard report when prompt is tight", async () => {
+test("P2 resume budget: reserves room for guard notice in minimum check and compacts guard report when prompt is tight", async (t) => {
   const c = controllable();
   const m = new TaskManager({ runners: { ask: c.runner }, traceBase: traceBase() });
+  t.after(() => m.shutdown());
 
   // Start with a large original prompt
   const started = m.start({
