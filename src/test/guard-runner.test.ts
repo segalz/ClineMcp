@@ -217,10 +217,11 @@ test("runner: repeated edit failures trip loop guard, kill process once, attach 
     return child;
   };
 
+  const killSignals: Array<NodeJS.Signals | undefined> = [];
   const mockKillTree = (pid: number, sig?: NodeJS.Signals) => {
     killTreeCalls++;
+    killSignals.push(sig);
     assert.equal(pid, 98765);
-    assert.equal(sig, process.platform === "win32" ? "SIGKILL" : "SIGTERM");
   };
 
   let caughtError: any;
@@ -249,7 +250,9 @@ test("runner: repeated edit failures trip loop guard, kill process once, attach 
   assert.equal(caughtError.kind, "loop_detected");
   assert.equal(caughtError.attempts, 1, "never retried (attempts = 1)");
   assert.equal(spawnCalls, 1, "process spawned only once");
-  assert.equal(killTreeCalls, 1, "killTree called exactly once");
+  // Windows: one taskkill /F. POSIX: SIGTERM to the group, then SIGKILL after the grace period (this fake never exits).
+  assert.deepEqual(killSignals, process.platform === "win32" ? ["SIGKILL"] : ["SIGTERM", "SIGKILL"], "kill sequence");
+  assert.equal(killTreeCalls, killSignals.length);
 
   // 2. Short message formatted
   assert.match(caughtError.message, /Stopped by the bridge: 3 failed edits on src\/app\.ts within 10 tool calls/);
@@ -287,6 +290,7 @@ test("runner: repeated edit failures trip loop guard, kill process once, attach 
 test("runner: budget_exceeded trips when maxToolCalls exceeded", async () => {
   let spawnCalls = 0;
   let killTreeCalls = 0;
+  const killSignals: Array<NodeJS.Signals | undefined> = [];
   const tBase = traceBase();
 
   const mockSpawn = (_exe: string, _args: string[]) => {
@@ -364,7 +368,7 @@ test("runner: budget_exceeded trips when maxToolCalls exceeded", async () => {
         guard: { maxToolCalls: 2 },
         deps: {
           spawn: mockSpawn as any,
-          killTree: () => { killTreeCalls++; },
+          killTree: (_pid: number, sig?: NodeJS.Signals) => { killTreeCalls++; killSignals.push(sig); },
           entryPath: "fake/path/cline",
           traceBase: tBase,
           access: async () => {}
@@ -379,7 +383,9 @@ test("runner: budget_exceeded trips when maxToolCalls exceeded", async () => {
   assert.equal(caughtError.kind, "budget_exceeded");
   assert.equal(caughtError.attempts, 1);
   assert.equal(spawnCalls, 1);
-  assert.equal(killTreeCalls, 1);
+  // Windows: one taskkill /F. POSIX: SIGTERM to the group, then SIGKILL after the grace period (this fake never exits).
+  assert.deepEqual(killSignals, process.platform === "win32" ? ["SIGKILL"] : ["SIGTERM", "SIGKILL"], "kill sequence");
+  assert.equal(killTreeCalls, killSignals.length);
   assert.match(caughtError.message, /tool-call budget exceeded/);
   assert.equal(caughtError.guard?.kind, "budget_exceeded");
   assert.equal(caughtError.guard?.totalToolCalls, 3);
