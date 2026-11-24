@@ -11,6 +11,7 @@ Updated by the supervisor (Grok Bot) after every step.
 | S0.4 | SUP | med | done | — | — | — | — | — | 45 | VM + CI ubuntu/arm: 6 fail + 11 cancelled. First-run windows failures were runner env (c), fixed by CI rev 2. **GATE PASS** (windows 586/0 fail). See baseline.md |
 | S0.5 | SUP | med | done | — | — | — | — | — | 10 | JS launcher at `<prefix>/lib/node_modules/cline/bin/cline` (spawns native `bin/.cline`); `@cline/llms` present; daemon argv has `--cline-hub-daemon --cwd --port`, own SID (setsid). Both gates PASS |
 | S1.1 | SUP | low | in-progress | — | — | — | — | — | 25 | 5 class (a) tests skipped off Windows (plan-s18 job-closes; wait-budgets ×4 Job Object). Linux now 5 fail: 3 (b) (G3, G1, check-ignore) + 2 guard-runner "unclear", NOT skipped, escalated. CI 45492036371: windows success, ubuntu/arm 540/5 fail/0 cancelled (same as VM). Done-condition (class (b) only) not met until the owner/Claude decides on guard-runner |
+| S1.2 | SUP | low | pending | — | — | — | — | — | — | guard-runner: expect [SIGTERM, SIGKILL] on POSIX (Claude decision 2026-11-24: the runner is right, the tests were Windows-only in their count) |
 | S2.1 | TEST | low | pending | — | — | — | — | — | — | linux-entry.test.ts |
 | S2.2 | CODE | med | pending | | | | | | | resolveClineEntry on Linux |
 | S2.3 | TEST | med | pending | — | — | — | — | — | — | linux-launch.test.ts |

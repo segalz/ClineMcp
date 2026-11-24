@@ -224,6 +224,33 @@ GATES:
 
 **S1.1 · SUP.** For each class (a) test, add `{ skip: process.platform !== "win32" && "Windows-only: <reason>" }`. Never skip a class (b) test. Commit and push. Done when Linux failures are class (b) only.
 
+**S1.2 · SUP · Align two `guard-runner` kill-count assertions with the POSIX kill escalation.** Risk low. Decision by Claude, 2026-11-24.
+Why: on POSIX the runner sends SIGTERM to the process group, then SIGKILL after the grace period if the process has not exited (`src/runner.ts` ~1263-1268). This is intended: a process that ignores SIGTERM must still die. The fake child in these two tests never exits, so the escalation correctly fires once more. The tests expect exactly one kill, which is the Windows (`taskkill /F`) behaviour. The runner is right and the tests are wrong. Do not change the runner, and do not skip the tests (they guard loop and budget behaviour on Linux too).
+File: `src/test/guard-runner.test.ts` only.
+1. Test "runner: repeated edit failures trip loop guard, kill process once, attach report, no retry" (~116-252):
+   - Replace the `mockKillTree` function (~220-224) with:
+     ```ts
+     const killSignals: Array<NodeJS.Signals | undefined> = [];
+     const mockKillTree = (pid: number, sig?: NodeJS.Signals) => {
+       killTreeCalls++;
+       killSignals.push(sig);
+       assert.equal(pid, 98765);
+     };
+     ```
+   - Replace `assert.equal(killTreeCalls, 1, "killTree called exactly once");` (~252) with:
+     ```ts
+     // Windows: one taskkill /F. POSIX: SIGTERM to the group, then SIGKILL after the grace period (this fake never exits).
+     assert.deepEqual(killSignals, process.platform === "win32" ? ["SIGKILL"] : ["SIGTERM", "SIGKILL"], "kill sequence");
+     assert.equal(killTreeCalls, killSignals.length);
+     ```
+2. Test "runner: budget_exceeded trips when maxToolCalls exceeded" (~287-385):
+   - After `let killTreeCalls = 0;` (~289) add `const killSignals: Array<NodeJS.Signals | undefined> = [];`.
+   - Replace `killTree: () => { killTreeCalls++; },` (~367) with `killTree: (_pid: number, sig?: NodeJS.Signals) => { killTreeCalls++; killSignals.push(sig); },`.
+   - Replace `assert.equal(killTreeCalls, 1);` (~382) with the same two assertions as in point 1.
+Change nothing else. Do not rename the tests.
+Check: `bash scripts/linux-check.sh dist/test/guard-runner.test.js` must be green on the VM. CI `windows-latest` must stay green.
+Done when the Linux failures are only Gate 6 (G3), settings (G1) and snapshot symlink (Stage 7).
+
 ---
 
 ### Stage 2 — Find the Cline CLI on Linux (G1, G4)
