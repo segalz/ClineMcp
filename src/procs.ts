@@ -49,3 +49,14 @@ export function hubDaemonPidsOnPort(port: number, processes: readonly ProcessInf
   return processes.filter(({ commandLine }) => commandLine.includes("--cline-hub-daemon") && pattern.test(commandLine))
     .map(({ pid }) => pid);
 }
+
+/** Formats a NUL-separated command line into a space-separated string, quoting parts that contain whitespace. */
+export function formatCommandLine(raw: string): string {
+  return raw.split("\0").filter((part) => part.length > 0).map((part) => (/\s/.test(part) ? `"${part}"` : part)).join(" ");
+}
+
+/** Extracts the UID from /proc/<pid>/status contents, or undefined when no Uid line is present. */
+export function parseProcStatusUid(status: string): number | undefined {
+  const match = /^Uid:\s+(\d+)/m.exec(status);
+  return match ? Number(match[1]) : undefined;
+}
