@@ -39,6 +39,14 @@ export async function resolveVerificationCommand(command: string, args: string[]
   const bare = !hasDirectory && !path.extname(command);
   if (process.platform !== "win32") {
     // POSIX spawns resolve through PATH; check that the target is a runnable file so directories or non-executables are refused up front.
+    // As on Windows, a bare npm/npx is the installed npm, never a project-local copy.
+    if (bare && command !== "npm" && command !== "npx") {
+      for (let dir = path.resolve(cwd); ; dir = path.dirname(dir)) {
+        const local = path.join(dir, "node_modules", ".bin", command);
+        if (await isRunnablePosix(local)) return { command: local, args };
+        if (path.dirname(dir) === dir || await exists(path.join(dir, ".git"))) break;
+      }
+    }
     const found = hasDirectory ? await isRunnablePosix(path.resolve(cwd, command))
       : (await Promise.all(pathDirectories().map(dir => isRunnablePosix(path.join(dir, command))))).some(Boolean);
     if (!found) throw new VerificationError("verification_launch_failed", "Verification executable was not found on PATH.");
