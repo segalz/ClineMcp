@@ -97,7 +97,7 @@ for (const stage of ["before check", "after pass", "explicit opt-out"] as const)
   });
 }
 
-test("S20 (2): a failed daemon kill is unconfirmed even after its port closes", { skip: process.platform !== "win32" }, async () => {
+test("S20 (2): a failed daemon kill is unconfirmed even after its port closes", { skip: process.platform !== "win32" && process.platform !== "linux" }, async () => {
   const result = await stopDedicatedHub(4321, { hubStarted: async () => true, runHubStop: async () => false,
     listProcesses: async () => [{ pid: 123, commandLine: "cline --cline-hub-daemon --port 4321" }],
     killTree: async () => false, isListening: async () => false });

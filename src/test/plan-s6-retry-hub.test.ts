@@ -112,7 +112,7 @@ test("S6: the process scan runs only when the hub still listens after `hub stop`
       listProcesses: async () => { calls.push("scan"); return []; },
       removeFiles: async () => { calls.push("remove files"); }
     });
-    const expected = stillListening && process.platform === "win32" ? ["hub stop", "scan", "remove files"] : ["hub stop", "remove files"];
+    const expected = stillListening && (process.platform === "win32" || process.platform === "linux") ? ["hub stop", "scan", "remove files"] : ["hub stop", "remove files"];
     assert.deepEqual(calls, expected, `still listening after hub stop: ${stillListening}`);
   }
 });

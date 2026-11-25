@@ -139,7 +139,7 @@ test("S6b: a hub that cannot be stopped is noted on the run's error too", async 
 
 // --- stopDedicatedHub: failed stop, late-binding hub (Neon 3, Astra 5) ---
 
-test("S6b: when `hub stop` fails for a hub that started, the process scan still runs", { skip: process.platform !== "win32" }, async () => {
+test("S6b: when `hub stop` fails for a hub that started, the process scan still runs", { skip: process.platform !== "win32" && process.platform !== "linux" }, async () => {
   const calls: string[] = [];
   await stopDedicatedHub(4321, {
     hubStarted: async () => true,
