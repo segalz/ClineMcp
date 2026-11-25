@@ -1,14 +1,25 @@
 import { PROCESS_TABLE_TIMEOUT_MS } from "./waits.js";
 import { spawn } from "node:child_process";
+import { readdir, readFile } from "node:fs/promises";
 
 export interface ProcessInfo {
   pid: number;
   commandLine: string;
 }
 
+export interface ProcListDeps {
+  platform?: NodeJS.Platform;
+  readdir?: (dir: string) => Promise<string[]>;
+  readFile?: (file: string) => Promise<string>;
+  uid?: number;
+  selfPid?: number;
+}
+
 /** Lists cline.exe processes with their command lines (Windows only; empty elsewhere). Undefined when the list could not be read. */
-export async function listClineProcesses(timeoutMs = PROCESS_TABLE_TIMEOUT_MS, signal?: AbortSignal): Promise<ProcessInfo[] | undefined> {
-  if (process.platform !== "win32") return [];
+export async function listClineProcesses(timeoutMs = PROCESS_TABLE_TIMEOUT_MS, signal?: AbortSignal, deps: ProcListDeps = {}): Promise<ProcessInfo[] | undefined> {
+  const platform = deps.platform ?? process.platform;
+  if (platform === "linux") return listLinuxClineProcesses(timeoutMs, signal, deps);
+  if (platform !== "win32") return [];
   if (timeoutMs <= 0 || signal?.aborted) return undefined;
   const script = "Get-CimInstance Win32_Process -Filter \"Name='cline.exe'\" | "
     + "ForEach-Object { [string]$_.ProcessId + [char]9 + $_.CommandLine }";
@@ -39,6 +50,49 @@ export async function listClineProcesses(timeoutMs = PROCESS_TABLE_TIMEOUT_MS, s
         return tab > 0 && Number.isInteger(pid) && pid > 0 ? [{ pid, commandLine: line.slice(tab + 1) }] : [];
       }));
     });
+  });
+}
+
+async function listLinuxClineProcesses(timeoutMs: number, signal: AbortSignal | undefined, deps: ProcListDeps): Promise<ProcessInfo[] | undefined> {
+  if (timeoutMs <= 0 || signal?.aborted) return undefined;
+  const readdirFn = deps.readdir ?? readdir;
+  const readFileFn = deps.readFile ?? (f => readFile(f, "utf8"));
+  const uid = deps.uid ?? process.getuid?.();
+  const selfPid = deps.selfPid ?? process.pid;
+  return new Promise<ProcessInfo[] | undefined>((resolve) => {
+    let settled = false;
+    const timer = setTimeout(() => { finish(undefined); }, Math.min(PROCESS_TABLE_TIMEOUT_MS, timeoutMs));
+    timer.unref?.();
+    const stop = () => { finish(undefined); };
+    const finish = (value: ProcessInfo[] | undefined) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      signal?.removeEventListener("abort", stop);
+      resolve(value);
+    };
+    signal?.addEventListener("abort", stop, { once: true });
+    (async () => {
+      let names: string[];
+      try { names = await readdirFn("/proc"); } catch { finish(undefined); return; }
+      const result: ProcessInfo[] = [];
+      for (const name of names) {
+        if (!/^\d+$/.test(name)) continue;
+        const pid = Number(name);
+        if (pid === selfPid) continue;
+        let raw: string;
+        try { raw = await readFileFn(`/proc/${pid}/cmdline`); } catch { continue; }
+        const line = formatCommandLine(raw);
+        if (line.length === 0 || !line.includes("cline")) continue;
+        if (uid !== undefined) {
+          let status: string;
+          try { status = await readFileFn(`/proc/${pid}/status`); } catch { continue; }
+          if (parseProcStatusUid(status) !== uid) continue;
+        }
+        result.push({ pid, commandLine: line });
+      }
+      finish(result.sort((a, b) => a.pid - b.pid));
+    })();
   });
 }
 
