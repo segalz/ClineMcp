@@ -430,7 +430,7 @@ import test from "node:test";
 import { formatCommandLine, parseProcStatusUid } from "../procs.js";
 
 test("formatCommandLine joins NUL-separated argv and quotes args with whitespace", () => {
-  assert.equal(formatCommandLine("node\0/x/cline/bin/cline\0--cline-hub-daemon\0--cwd\0/tmp/my dir\0--port\0123\0"),
+  assert.equal(formatCommandLine("node\0/x/cline/bin/cline\0--cline-hub-daemon\0--cwd\0/tmp/my dir\0--port\x00123\0"),
     'node /x/cline/bin/cline --cline-hub-daemon --cwd "/tmp/my dir" --port 123');
   assert.equal(formatCommandLine(""), "");
   assert.equal(formatCommandLine("a\0\0b\0"), "a b");
@@ -457,9 +457,9 @@ import { hubDaemonPidsOnPort, listClineProcesses } from "../procs.js";
 import { hubDaemonPidsFor } from "../workspace.js";
 
 const files: Record<string, string> = {
-  "/proc/42/cmdline": "node\0/x/cline/bin/cline\0--cline-hub-daemon\0--cwd\0/tmp/my dir\0--port\0123\0",
+  "/proc/42/cmdline": "node\0/x/cline/bin/cline\0--cline-hub-daemon\0--cwd\0/tmp/my dir\0--port\x00123\0",
   "/proc/42/status": "Name:\tnode\nUid:\t1000\t1000\t1000\t1000\n",
-  "/proc/43/cmdline": "node\0/x/cline/bin/cline\0--cline-hub-daemon\0--port\0124\0",
+  "/proc/43/cmdline": "node\0/x/cline/bin/cline\0--cline-hub-daemon\0--port\x00124\0",
   "/proc/43/status": "Name:\tnode\nUid:\t0\t0\t0\t0\n",
   "/proc/1/cmdline": "/sbin/init\0",
   "/proc/1/status": "Name:\tinit\nUid:\t0\t0\t0\t0\n"
@@ -609,8 +609,27 @@ test("posix: a bare tool resolves to the nearest node_modules/.bin, PATH still w
     await assert.rejects(resolveVerificationCommand("nosuchtool-xyz", [], root), (e: any) => e?.kind === "verification_launch_failed");
   } finally { process.env.PATH = savedPath; }
 });
+test("posix: bare npm/npx skip the project-local node_modules/.bin, as on Windows", { skip: process.platform === "win32" && "POSIX behaviour" }, async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "verify-npm-"));
+  const bin = path.join(root, "node_modules", ".bin");
+  const pathDir = path.join(root, "pathdir");
+  await mkdir(path.join(root, ".git"));
+  await mkdir(bin, { recursive: true });
+  await mkdir(pathDir);
+  for (const dir of [bin, pathDir]) {
+    for (const name of ["npm", "npx"]) {
+      await writeFile(path.join(dir, name), "#!/bin/sh\nexit 0\n"); await chmod(path.join(dir, name), 0o755);
+    }
+  }
+  const savedPath = process.env.PATH;
+  process.env.PATH = pathDir;
+  try {
+    assert.deepEqual(await resolveVerificationCommand("npm", ["test"], root), { command: "npm", args: ["test"] });
+    assert.deepEqual(await resolveVerificationCommand("npx", ["tsc"], root), { command: "npx", args: ["tsc"] });
+  } finally { process.env.PATH = savedPath; }
+});
 ```
-RED on Linux: `mytool` is not on PATH today. Skipped on Windows.
+RED on Linux: `mytool` is not on PATH today. The npm/npx test already passes today; it guards S5.2 (added 2026-11-25 from Claude's review of the same step in openCodeHelperMcp). Skipped on Windows.
 
 **S5.2 · CODE.** Risk low. Files allowed: `src/verify.ts`, only inside the POSIX branch of `resolveVerificationCommand`.
 Current code (~40-46):
@@ -625,7 +644,8 @@ Current code (~40-46):
 ```
 Required change: insert these lines directly after the opening `if (process.platform !== "win32") {` and its comment, before `const found`:
 ```ts
-    if (bare) {
+    // As on Windows, a bare npm/npx is the installed npm, never a project-local copy.
+    if (bare && command !== "npm" && command !== "npx") {
       for (let dir = path.resolve(cwd); ; dir = path.dirname(dir)) {
         const local = path.join(dir, "node_modules", ".bin", command);
         if (await isRunnablePosix(local)) return { command: local, args };
