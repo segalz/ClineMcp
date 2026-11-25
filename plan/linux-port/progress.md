@@ -36,8 +36,8 @@ Updated by the supervisor (Grok Bot) after every step.
 | S8.2 | SUP | low | done | — | — | — | — | — | 10 | self-review below ("S8.2 self-review") → owner forwards to Claude |
 | S9.1 | SUP | high | done | — | — | — | — | — | 15 | `26cccaa` + `df6e6fc` (cline_ping needs provider/model: harness fix). VM only, never in CI. Model from `SMOKE_PROVIDER`/`SMOKE_MODEL` (default cline / cline-free/nemotron-3.5-super-vl); runs used nvidia / nvidia/nemotron-3.5-super-vl-120b-a12b with the key from the env only (logs checked: no key) |
 | S9.2 | SUP | high | done | — | — | — | — | — | 6 | Run 1 = harness input error (cline_ping schema), not a product failure → no Stage 7 pair. Runs 2 and 3: SMOKE PASS twice in a row (ping, list_models with free models, ask_cline, ask_cline_workspace + worktree removed, apply_cline_edits + verify passed); hub-daemon count back to its start value after every call |
-| S10 | OWNER | med | pending | — | — | — | — | — | — | real arm64 server smoke |
-| S11 | OWNER | — | pending | — | — | — | — | — | — | merge decision |
+| S10 | OWNER | med | pending | — | — | — | — | — | — | real arm64 server smoke. Owner only, not started |
+| S11 | OWNER | — | pending | — | — | — | — | — | — | merge decision. Owner only, not started |
 
 ## S8.2 self-review of `git diff main...linux-support` (for Claude's second review)
 Changed src: `runner.ts` (resolveClineEntry Linux discovery S2.2, launch `node <entry>` S2.4, hub-stop fallback S4.2), `procs.ts` (S3.2/S3.4), `verify.ts` (S5.2), `rules.ts` (S6.2), `snapshot.ts` (S7.2/S7.4). Plus tests, `scripts/` (check-locked, linux-check, linux-smoke) and the workflow.
@@ -60,6 +60,7 @@ Reviewed the Stage 7 pair (`e132161`, `8511618`, `7111cb5`), the S5.2 npm/npx te
 - CODE steps: 9 (S2.2 Cline, S2.4 OpenCode, S3.2 Cline, S3.4 OpenCode, S4.2 Cline, S5.2 OpenCode, S6.2 Cline, S7.2 OpenCode, S7.4 Cline) · alone 1st try: 8 (all but S3.4) · alone within 3: 9 · after supervisor rewrite: 0 · needed Claude: 0
 - Planner errors (not executor failures): S3.1/S3.3 octal escape in the plan text (fixed by Claude `eb932e0`); S1.2 test expectations (Claude).
 - Stages 8-9: full green x2 + CI; smoke green x2 (S9.2). Stopped before S10/S11 (owner).
+- Claude second review (085b1bc): approved, no new steps. F3 accepted into baseline.md. S10/S11 are owner-only and not started.
 - Failure patterns: S3.4 attempt 1 (OpenCode) re-indented Windows code and built a timeout that did not really win the race; fixed on attempt 2 with that feedback. CI flakes: F1 (fixed by S1.3), F2 (2 sightings), proposed F3 (1 sighting).
 
 ## Open items (supervisor)
