@@ -61,7 +61,7 @@ try {
   const call = (name, args) => client.callTool({ name, arguments: args }, undefined, { timeout: 900_000 });
 
   let before = await hubCount();
-  const ping = await call("cline_ping", {});
+  const ping = await call("cline_ping", { provider, model });
   await settle(before, "cline_ping");
   check(!ping.isError, "cline_ping answered", ping);
 
