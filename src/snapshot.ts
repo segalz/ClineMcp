@@ -610,3 +610,27 @@ export async function headAndIndexIdentity(checkoutRoot: string, signal?: AbortS
   // index's stat cache without changing what is staged, which used to refuse restores as "index changed".
   return { head, indexHash: hash(await git(root, ["ls-files", "--stage", "-z"], signal)) };
 }
+
+/** Manifest paths ("/"-separated, relative to root) whose parent directories are not links; git check-ignore exits 128 on a path beyond a symbolic link. */
+export async function pathsNotBeyondLinks(root: string, paths: readonly string[]): Promise<string[]> {
+  const cache = new Map<string, boolean>();
+  const kept: string[] = [];
+  for (const file of paths) {
+    const parts = file.split("/");
+    let drop = false;
+    const parents: string[] = [];
+    for (let i = 0; i < parts.length - 1; i++) {
+      parents.push(parts[i]);
+      const prefix = parents.join("/");
+      let isLink = cache.get(prefix);
+      if (isLink === undefined) {
+        try { isLink = (await lstat(path.join(root, ...parents))).isSymbolicLink(); }
+        catch { isLink = false; }
+        cache.set(prefix, isLink);
+      }
+      if (isLink) { drop = true; break; }
+    }
+    if (!drop) kept.push(file);
+  }
+  return kept;
+}
