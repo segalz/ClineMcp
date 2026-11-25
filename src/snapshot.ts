@@ -508,8 +508,10 @@ export async function restoreSnapshot(handle: SnapshotHandle, parent?: AbortSign
   try {
     current = (await files(root, signal)).regular;
     // check-ignore respects tracked files. A newly ignored baseline path must not be overwritten.
-    ignored = new Set(handle.manifest.length ? (await git(root, ["check-ignore", "-z", "--stdin"], signal,
-      handle.manifest.map(entry => entry.path).join("\0") + "\0", [0, 1])).toString("utf8").split("\0") : []);
+    // A path beyond a linked directory makes check-ignore exit 128; such paths are refused below as links.
+    const checkable = await pathsNotBeyondLinks(root, handle.manifest.map(entry => entry.path));
+    ignored = new Set(checkable.length ? (await git(root, ["check-ignore", "-z", "--stdin"], signal,
+      checkable.join("\0") + "\0", [0, 1])).toString("utf8").split("\0") : []);
   } catch (err) {
     if (signal.aborted) return finishPartial();
     throw err;
