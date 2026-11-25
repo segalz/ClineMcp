@@ -13,6 +13,6 @@ export function buildEnvironmentLine(cwd: string, mode: "workspace" | "edits", p
   const location = mode === "workspace" ? "a disposable Git worktree of the repository" : "the repository checkout";
   const os = platform === "win32"
     ? "The OS is Windows. Shell commands run in Windows PowerShell 5.1 with the working directory already set: do not cd, separate commands with ';' (never '&&' or '||'), and do not use Unix tools (find, grep, sed, head, tail, cat); use Select-String, Get-ChildItem, Get-Content and Select-Object -First N instead."
-    : `The OS is ${platform}.`;
+    : `The OS is ${platform === "linux" ? "Linux" : platform}. Shell commands run in bash with the working directory already set: do not cd.`;
   return `Environment: the working directory is ${cwd} (${location}). Use paths relative to it, or absolute paths under it. ${os}`;
 }
