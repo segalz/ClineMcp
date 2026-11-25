@@ -21,13 +21,17 @@ Updated by the supervisor (Grok Bot) after every step.
 | S3.2 | CODE | low | done | Cline / cline-free/nemotron-3.5-super-vl | 1 | y | none | 0 | 3 | `ae849f8`: two helpers appended, per spec. Linux check 2/2 |
 | S3.3 | TEST | med | done | — | — | — | — | — | 2 | `96e29ea`; RED as expected (TS2554: expected 0-2 arguments, got 3) |
 | S3.4 | CODE | med | done | OpenCode / nvidia/nvidia/nemotron-3.5-super-vl-120b-a12b | 2 | n | none | 0 | 10 | Attempt 1 rejected in review, not committed: re-indented the Windows close handler, and the timeout/abort did not really win the race. Attempt 2 `bbfd42e` per spec (real Promise race, Windows lines untouched). Linux check 7 pass / 0 fail / 1 skip (class (a)); real /proc test passes. CI 45557834790: windows 598/0 fail; ubuntu + arm 558 pass / 2 fail = the known Gate 6 (Stage 4) + snapshot link (Stage 7) only |
-| S4.1 | TEST | low | pending | — | — | — | — | — | — | linux-hubstop.test.ts + 3 test edits |
-| S4.2 | CODE | low | pending | | | | | | | hub-stop fallback on Linux |
-| S5.1 | TEST | low | pending | — | — | — | — | — | — | linux-verify-bin.test.ts |
-| S5.2 | CODE | low | pending | | | | | | | node_modules/.bin on POSIX |
-| S6.1 | TEST | low | pending | — | — | — | — | — | — | rules.test.ts expectations |
-| S6.2 | CODE | low | pending | | | | | | | Linux env line |
-| S7.x | TEST/CODE | ? | pending | | | | | | | from baseline class (b) |
+| S4.1 | TEST | low | done | — | — | — | — | — | 4 | `d5ba0e6`: new linux-hubstop.test.ts + the 3 one-line test edits, per plan. RED exactly the 5 expected (new test, 3 edited, plan-s20 Gate 6) |
+| S4.2 | CODE | low | done | Cline / cline-free/nemotron-3.5-super-vl | 1 | y | none | 0 | 2 | `b03311f`: one line (runner.ts ~777, plan said ~749). Linux check 49 pass / 0 fail / 1 skip. CI 45559270437: ubuntu+arm only the known snapshot item (Stage 7); windows failed only on flaky F2 (2nd sighting, green on all later runs) |
+| S5.1 | TEST | low | done | — | — | — | — | — | 2 | `a7f2c8d` (new plan text, 2 tests); RED as expected (mytool test only; npm/npx test passes today, as the plan says) |
+| S5.2 | CODE | low | done | OpenCode / nvidia/nvidia/nemotron-3.5-super-vl-120b-a12b | 1 | y | none | 0 | 1 | `ef7c846`: exactly the 7 inserted lines (with the npm/npx exception). Linux check 7 pass / 0 fail / 1 skip. CI 45559484857: windows green; arm also hit `plan-s3-confirmed-kill.test.js:127` "S3: a timed-out run ... confirms the tree is dead" (timing, not on the list); rule 7 rerun → it passed (only the known Stage 7 item left). Proposed F3, see baseline.md |
+| S6.1 | TEST | low | done | — | — | — | — | — | 2 | `79fa872`: rules.test.ts linux/darwin strings per plan, Windows assertion kept. RED as expected |
+| S6.2 | CODE | low | done | Cline / cline-free/nemotron-3.5-super-vl | 1 | y | none | 0 | 11 | `f7f5a01`: one line, per spec. Linux check 3/3. CI 45560871194: windows green; ubuntu+arm only the known Stage 7 snapshot item |
+| S7.x | TEST/CODE | — | done | — | — | — | — | — | — | baseline class (b): #4 → Stage 4, #5 → Stage 2, #6 (snapshot check-ignore beyond a symlink, G8) → S7.1-S7.4 below. Not process killing/timing → no Claude escalation |
+| S7.1 | TEST | low | done | — | — | — | — | — | 5 | `e132161` (supervisor-written): new linux-snapshot-ignore.test.ts for helper `pathsNotBeyondLinks`. RED (TS2305) |
+| S7.2 | CODE | low | done | OpenCode / nvidia/nvidia/nemotron-3.5-super-vl-120b-a12b | 1 | y | none | 0 | 10 | `8511618`: helper appended at the end of snapshot.ts. (The supervisor session was interrupted mid-run; the one OpenCode run finished on its own and its result was checked.) Linux check: new test green. CI 45562830684: windows green; ubuntu+arm only the baseline #6 test (fixed by S7.4) |
+| S7.3 | TEST | low | done | — | — | — | — | — | 0 | the existing baseline #6 test `snapshot.test.ts` "restore reports integrity/link/ignored failures..." is the red test (Git check-ignore failed.) |
+| S7.4 | CODE | low | done | Cline / cline-free/nemotron-3.5-super-vl | 1 | y | none | 0 | 6 | `7111cb5`: restoreSnapshot passes only pathsNotBeyondLinks(...) to check-ignore. Linux check 9 pass / 0 fail. VM full suite x2: 605 tests, 566 pass, 0 fail, 39 skip. CI 45563718403: ALL GREEN (windows 600/0 fail; ubuntu + arm 566/0 fail) |
 | S8.1 | SUP | med | pending | — | — | — | — | — | — | full green x2 + CI |
 | S8.2 | SUP | low | pending | — | — | — | — | — | — | self-review → Claude |
 | S9.1 | SUP | high | pending | — | — | — | — | — | — | linux-smoke.mjs |
@@ -36,9 +40,10 @@ Updated by the supervisor (Grok Bot) after every step.
 | S11 | OWNER | — | pending | — | — | — | — | — | — | merge decision |
 
 ## Experiment summary (fill at the end)
-- CODE steps: — · alone 1st try: — · alone within 3: — · after supervisor rewrite: — · needed Claude: —
-- Failure patterns:
+- CODE steps: 9 (S2.2 Cline, S2.4 OpenCode, S3.2 Cline, S3.4 OpenCode, S4.2 Cline, S5.2 OpenCode, S6.2 Cline, S7.2 OpenCode, S7.4 Cline) · alone 1st try: 8 (all but S3.4) · alone within 3: 9 · after supervisor rewrite: 0 · needed Claude: 0
+- Planner errors (not executor failures): S3.1/S3.3 octal escape in the plan text (fixed by Claude `eb932e0`); S1.2 test expectations (Claude).
+- Failure patterns: S3.4 attempt 1 (OpenCode) re-indented Windows code and built a timeout that did not really win the race; fixed on attempt 2 with that feedback. CI flakes: F1 (fixed by S1.3), F2 (2 sightings), proposed F3 (1 sighting).
 
 ## Open items (supervisor)
-- 2026-11-25: flaky after-hook in `src/test/guard-runner.test.ts` (~line 18, `rm` of the temp root): `ENOTEMPTY … traces-7/<id>-run-2` while a trace writer is still writing. Seen in CI on ubuntu, arm and windows, with and without S2.4; locally ~1/40 runs. Locked test file → needs a Claude/owner fix (for example await the trace recorder or `rm` with `maxRetries`). Until then it can turn any CI job red at random.
-- 2026-11-25: windows-latest flake once: `S12: a restore whose rename is refused while a reader holds providers.json open is retried` (run 45501587786, reverted state). Watch it.
+- 2026-11-25: flaky after-hook in `src/test/guard-runner.test.ts` (~line 18, `rm` of the temp root): `ENOTEMPTY … traces-7/<id>-run-2` while a trace writer is still writing. Seen in CI on ubuntu, arm and windows, with and without S2.4; locally ~1/40 runs. Resolved by S1.3 (Claude).
+- 2026-11-25: windows-latest flake once: `S12: a restore whose rename is refused while a reader holds providers.json open is retried` (run 45501587786, reverted state) and again in run 45559270437. Watch it (F2).

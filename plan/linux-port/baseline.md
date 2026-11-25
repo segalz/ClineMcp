@@ -84,5 +84,5 @@ All W1-W9 above were runner environment (class (c)), fixed by CI revision 2. **G
 | # | Where | Test | Signature | Status |
 |---|-------|------|-----------|--------|
 | F1 | any OS | `src/test/guard-runner.test.ts` file-level after-hook (~33) | `ENOTEMPTY: directory not empty, rmdir '…/traces-7/<id>-run-2'` | fixed by S1.3 (`9e65540`, CI 45503968481 green); stays listed for reference |
-| F2 | windows-latest | S12: a restore whose rename is refused while a reader holds providers.json open is retried | seen once, run 45501587786 | watch; if it fails twice more, stop and report to the owner |
-
+| F2 | windows-latest | S12: a restore whose rename is refused while a reader holds providers.json open is retried | seen in run 45501587786 and again in run 45559270437 (S4.2 commit, 2026-11-25); green on all later runs | watch; 1 more failure → stop and report to the owner |
+| F3 (proposed, needs Claude) | ubuntu-24.04-arm | `plan-s3-confirmed-kill.test.js:127` S3: a timed-out run with budget to spare still confirms the tree is dead before it settles | timing; failed once in run 45559484857 (S5.2 commit), passed on the rule 7 rerun; green on every later run | proposed |
