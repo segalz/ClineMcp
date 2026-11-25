@@ -774,7 +774,7 @@ export async function stopDedicatedHub(port: number, deps: HubStopDeps, budget?:
       ? await bounded(deps.runHubStop(remaining(PROCESS_QUERY_TIMEOUT_MS), budget?.signal)).catch(() => false)
       : undefined;
     if (stopped !== false && !await isListening()) return;
-    if (process.platform === "win32") {
+    if (process.platform === "win32" || process.platform === "linux") {
       const listProcesses = deps.listProcesses ?? listClineProcesses;
       const processes = await bounded(listProcesses(remaining(PROCESS_TABLE_TIMEOUT_MS), budget?.signal)).catch(() => undefined);
       // The stop failed and the process list cannot be read: the daemon is not confirmed dead (plan S20, Gate 6).
