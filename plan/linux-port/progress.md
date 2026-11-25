@@ -47,6 +47,15 @@ Changed src: `runner.ts` (resolveClineEntry Linux discovery S2.2, launch `node <
 - **Never touching other users' processes.** Each candidate's `status` real UID must equal `process.getuid()`; if `status` can't be read the process is skipped. `selfPid` is excluded. The kill list is narrowed further by `hubDaemonPidsOnPort` (argv must contain `--cline-hub-daemon` and `--port <port>`). With a `hidepid` /proc mount, other users' PIDs are not even listed.
 - Points for Claude: (1) the `CLINE_MCP_CLINE_ENTRY` override on Windows; (2) the PID-reuse window; (3) `pathsNotBeyondLinks` runs on all OSes (S7.x pair written by the supervisor, please review it); (4) proposed flaky F3 in baseline.md.
 
+## Claude second review (2026-11-25)
+Reviewed the Stage 7 pair (`e132161`, `8511618`, `7111cb5`), the S5.2 npm/npx text in openCodeHelperMcp (`3ce66b6`), and the four points above. CI is green on both HEADs (ClineMcp 45570047453 at `5f73fd3`, openCodeHelperMcp 45566572060 at `52dd01c`). Verdict: approved, no new steps.
+- **Stage 7 pair (G8): approved.** `pathsNotBeyondLinks` keeps only paths whose parent folders are not links, so `git check-ignore` no longer exits 128 and fails the whole restore. The paths it drops are still refused one by one: `restoreEntry` → `safeFile` (`src/snapshot.ts` ~101-117) throws on any link in the path, so restore never writes through a link. A missing parent is kept, which is correct. On Windows, Node's `lstat` reports a junction as a symbolic link, so the behaviour is the same. Leftover race: if a parent turns into a link between the scan and `check-ignore`, the restore fails as it did before. Accepted.
+- **(1) `CLINE_MCP_CLINE_ENTRY` on Windows: intended** (plan S2.2 step 2). Only the owner sets the server environment, and an empty value is ignored.
+- **(2) PID reuse: accepted.** The same window exists on Windows. It is narrowed by the real-UID check and the `--cline-hub-daemon --port <port>` argv match taken at scan time. Kept as a known limitation, with no change in this port.
+- **(3) `pathsNotBeyondLinks` on all OSes: accepted** (see the Stage 7 note above).
+- **(4) F3: accepted onto the known-flaky list** (`plan-s3-confirmed-kill.test.js:127`, arm, run 45559484857). It is a kill-and-timing test, so its rule is stricter: one more failure means stop and send it to Claude, without a rerun. F2 keeps its rule (one more failure means stop).
+- S3.4: rejecting attempt 1 in review was right. Re-indented Windows code plus a race that does not really race is exactly what the review is for.
+
 ## Experiment summary (fill at the end)
 - CODE steps: 9 (S2.2 Cline, S2.4 OpenCode, S3.2 Cline, S3.4 OpenCode, S4.2 Cline, S5.2 OpenCode, S6.2 Cline, S7.2 OpenCode, S7.4 Cline) · alone 1st try: 8 (all but S3.4) · alone within 3: 9 · after supervisor rewrite: 0 · needed Claude: 0
 - Planner errors (not executor failures): S3.1/S3.3 octal escape in the plan text (fixed by Claude `eb932e0`); S1.2 test expectations (Claude).
