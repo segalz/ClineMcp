@@ -38,6 +38,9 @@ Updated by the supervisor (Grok Bot) after every step.
 | S9.2 | SUP | high | done | — | — | — | — | — | 6 | Run 1 = harness input error (cline_ping schema), not a product failure → no Stage 7 pair. Runs 2 and 3: SMOKE PASS twice in a row (ping, list_models with free models, ask_cline, ask_cline_workspace + worktree removed, apply_cline_edits + verify passed); hub-daemon count back to its start value after every call |
 | S10 | OWNER | med | pending | — | — | — | — | — | — | real arm64 server smoke. Owner only, not started |
 | S11 | OWNER | — | pending | — | — | — | — | — | — | merge decision. Owner only, not started |
+| S12.1 | TEST | low | done | — | — | — | — | — | 2 | `dae43ed` (plan 420957f text exact); RED as expected: late-start test sees stops === 0; the no-hub guard test passes. Linux check 19 tests, 18 pass, 1 fail |
+| S12.2 | CODE | low | pending | | | | | | | Linux-only late-start poll in stopDedicatedHub |
+| S8.1 (after S12) | SUP | med | pending | — | — | — | — | — | — | full green x2 + CI |
 
 ## S8.2 self-review of `git diff main...linux-support` (for Claude's second review)
 Changed src: `runner.ts` (resolveClineEntry Linux discovery S2.2, launch `node <entry>` S2.4, hub-stop fallback S4.2), `procs.ts` (S3.2/S3.4), `verify.ts` (S5.2), `rules.ts` (S6.2), `snapshot.ts` (S7.2/S7.4). Plus tests, `scripts/` (check-locked, linux-check, linux-smoke) and the workflow.
