@@ -737,6 +737,95 @@ The owner gets:
 
 Merge to `main` only on the owner's explicit yes.
 
+### Stage 12 — A hub that starts late on a slow machine (G9, added 2026-11-26 by Claude)
+
+**What was found.** On the owner's old laptop (`zvi-old-lap`, WSL Ubuntu 24.04, i7-5500U, USB disk), the S9 smoke failed:
+- After `cline_ping` once, and after `ask_cline` once, a `cline --cline-hub-daemon --port <p>` process stayed alive and listening.
+- Its discovery file `/tmp/cline-mcp-hubs/hub-<uuid>.json` was still there.
+- A manual `cline hub stop` with that discovery path and port stopped it in 2 s.
+- **Measured:** `cline hub start` needs **3.2 s** there to write its discovery file and listen.
+- `stopDedicatedHub` (`src/runner.ts` ~762-771) waits only **300 ms** for a hub that is not detected yet, and then returns without stopping. The daemon comes up later and is left behind. It was never seen on the fast supervisor VM.
+
+**S12.1 · TEST.** Risk low. New file `src/test/linux-hub-latestart.test.ts`:
+```ts
+import assert from "node:assert/strict";
+import test from "node:test";
+import { stopDedicatedHub } from "../runner.js";
+
+test("linux: a hub that starts late (slow machine) is still found and stopped",
+  { skip: process.platform !== "linux" && "Linux only" }, async () => {
+  const startedAt = Date.now() + 1_500;
+  let stops = 0;
+  const result = await stopDedicatedHub(4556, {
+    hubStarted: async () => Date.now() >= startedAt,
+    isListening: async () => Date.now() >= startedAt && stops === 0,
+    runHubStop: async () => { stops++; return true; },
+    removeFiles: async () => {}
+  });
+  assert.equal(stops, 1);
+  assert.equal(result, undefined);
+});
+
+test("linux: when no hub ever starts, the stop still returns within the late-start window",
+  { skip: process.platform !== "linux" && "Linux only" }, async () => {
+  const t0 = Date.now();
+  let stops = 0;
+  const result = await stopDedicatedHub(4557, {
+    hubStarted: async () => false,
+    isListening: async () => false,
+    runHubStop: async () => { stops++; return true; },
+    removeFiles: async () => {}
+  });
+  assert.equal(stops, 0);
+  assert.equal(result, undefined);
+  assert.ok(Date.now() - t0 < 12_000, `took ${Date.now() - t0} ms`);
+});
+```
+RED on Linux: the first test sees `stops === 0`, because the hub is detected only after 1.5 s. The second test passes today and guards S12.2. Both are skipped on Windows.
+
+**S12.2 · CODE.** Risk low. Files allowed: `src/runner.ts` only.
+1. Add next to the other timing constants: `export const HUB_LATE_START_MS = 10_000;`
+2. In `stopDedicatedHub`, current code (~762-771):
+   ```ts
+       if (!await hubDetected()) {
+         await new Promise<void>(resolve => {
+           const wait = remaining(300);
+           if (wait <= 0 || budget?.signal.aborted) { resolve(); return; }
+           const wake = () => { clearTimeout(timer); budget?.signal.removeEventListener("abort", wake); resolve(); };
+           const timer = setTimeout(wake, wait);
+           budget?.signal.addEventListener("abort", wake, { once: true });
+         });
+         if (!await hubDetected()) return;
+       }
+   ```
+   Required change: keep this block exactly as it is for Windows, and on any other platform poll instead:
+   ```ts
+       if (!await hubDetected()) {
+         if (process.platform === "win32") {
+           /* the existing block above, unchanged: one 300 ms wait, then return when still not detected */
+         } else {
+           // A slow machine starts the daemon seconds after the CLI ends (3.2 s measured on zvi-old-lap).
+           const until = now() + HUB_LATE_START_MS;
+           let found = false;
+           while (!found && now() < until && !budget?.signal.aborted && remaining(Infinity) > 0) {
+             await new Promise<void>(resolve => {
+               const wait = remaining(Math.min(250, Math.max(0, until - now())));
+               if (wait <= 0 || budget?.signal.aborted) { resolve(); return; }
+               const wake = () => { clearTimeout(timer); budget?.signal.removeEventListener("abort", wake); resolve(); };
+               const timer = setTimeout(wake, wait);
+               budget?.signal.addEventListener("abort", wake, { once: true });
+             });
+             found = await hubDetected();
+           }
+           if (!found) return;
+         }
+       }
+   ```
+   Paste the existing Windows block literally in place of the comment. Nothing else changes.
+
+Linux check: `bash scripts/linux-check.sh dist/test/linux-hub-latestart.test.js dist/test/linux-hubstop.test.js dist/test/plan-s16-hub-reuse.test.js dist/test/plan-s6-retry-hub.test.js`.
+After S12.2: repeat S8.1 (the suite twice and CI on all three jobs). Claude reruns the S9 smoke on `zvi-old-lap` (the owner's box) as the acceptance test.
+
 ## 5. Order
 
 S0.1 → S0.2 → S0.3 → S0.4 → S0.5 → S1 → S2 → S3 → S4 → S5 → S6 → S7 → S8 → S9 → S10 → S11. Stages 5 and 6 do not depend on S0.5.
