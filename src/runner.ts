@@ -40,6 +40,8 @@ import {
   type ProviderState
 } from "./status.js";
 
+export const HUB_LATE_START_MS = 10_000;
+
 export type ThinkingLevel = "none" | "low" | "medium" | "high" | "xhigh";
 
 export interface AskClineInput {
@@ -760,14 +762,31 @@ export async function stopDedicatedHub(port: number, deps: HubStopDeps, budget?:
   const alive: number[] = [];
   try {
     if (!await hubDetected()) {
-      await new Promise<void>(resolve => {
-        const wait = remaining(300);
-        if (wait <= 0 || budget?.signal.aborted) { resolve(); return; }
-        const wake = () => { clearTimeout(timer); budget?.signal.removeEventListener("abort", wake); resolve(); };
-        const timer = setTimeout(wake, wait);
-        budget?.signal.addEventListener("abort", wake, { once: true });
-      });
-      if (!await hubDetected()) return;
+      if (process.platform === "win32") {
+        await new Promise<void>(resolve => {
+          const wait = remaining(300);
+          if (wait <= 0 || budget?.signal.aborted) { resolve(); return; }
+          const wake = () => { clearTimeout(timer); budget?.signal.removeEventListener("abort", wake); resolve(); };
+          const timer = setTimeout(wake, wait);
+          budget?.signal.addEventListener("abort", wake, { once: true });
+        });
+        if (!await hubDetected()) return;
+      } else {
+        // A slow machine starts the daemon seconds after the CLI ends (3.2 s measured on zvi-old-lap).
+        const until = now() + HUB_LATE_START_MS;
+        let found = false;
+        while (!found && now() < until && !budget?.signal.aborted && remaining(Infinity) > 0) {
+          await new Promise<void>(resolve => {
+            const wait = remaining(Math.min(250, Math.max(0, until - now())));
+            if (wait <= 0 || budget?.signal.aborted) { resolve(); return; }
+            const wake = () => { clearTimeout(timer); budget?.signal.removeEventListener("abort", wake); resolve(); };
+            const timer = setTimeout(wake, wait);
+            budget?.signal.addEventListener("abort", wake, { once: true });
+          });
+          found = await hubDetected();
+        }
+        if (!found) return;
+      }
     }
     check();
     const stopped = deps.runHubStop
