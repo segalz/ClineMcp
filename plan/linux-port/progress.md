@@ -39,8 +39,8 @@ Updated by the supervisor (Grok Bot) after every step.
 | S10 | OWNER | med | pending | — | — | — | — | — | — | real arm64 server smoke. Owner only, not started |
 | S11 | OWNER | — | pending | — | — | — | — | — | — | merge decision. Owner only, not started |
 | S12.1 | TEST | low | done | — | — | — | — | — | 2 | `dae43ed` (plan 420957f text exact); RED as expected: late-start test sees stops === 0; the no-hub guard test passes. Linux check 19 tests, 18 pass, 1 fail |
-| S12.2 | CODE | low | pending | | | | | | | Linux-only late-start poll in stopDedicatedHub |
-| S8.1 (after S12) | SUP | med | pending | — | — | — | — | — | — | full green x2 + CI |
+| S12.2 | CODE | low | done | OpenCode / opencode/deepseek-v4.1-flash-free (fallback) | 1 | y | none | 0 | 1 | `aa73118`: HUB_LATE_START_MS after the imports (runner.ts has no own timing constants; waits.ts not allowed) + the Linux/non-Windows poll; the Windows block is the same 8 lines, only re-indented. Primary NVIDIA model unavailable this session (NVIDIA_API_KEY not in the box env after the reset; the first OpenCode call died with "Unexpected server error" before any model ran, not counted), so the plan fallback model was used. Linux check 19/19 |
+| S8.1 (after S12) | SUP | med | done | — | — | — | — | — | 8 | VM full suite twice in a row at aa73118: 607 tests, 568 pass, 0 fail, 39 skip (both). CI 45828481762 green on all 3 jobs (windows 600 pass / 0 fail / 7 skip; ubuntu + arm 568 / 0 / 39). No flaky failures (F2/F3 not seen) |
 
 ## S8.2 self-review of `git diff main...linux-support` (for Claude's second review)
 Changed src: `runner.ts` (resolveClineEntry Linux discovery S2.2, launch `node <entry>` S2.4, hub-stop fallback S4.2), `procs.ts` (S3.2/S3.4), `verify.ts` (S5.2), `rules.ts` (S6.2), `snapshot.ts` (S7.2/S7.4). Plus tests, `scripts/` (check-locked, linux-check, linux-smoke) and the workflow.
@@ -60,7 +60,7 @@ Reviewed the Stage 7 pair (`e132161`, `8511618`, `7111cb5`), the S5.2 npm/npx te
 - S3.4: rejecting attempt 1 in review was right. Re-indented Windows code plus a race that does not really race is exactly what the review is for.
 
 ## Experiment summary (fill at the end)
-- CODE steps: 9 (S2.2 Cline, S2.4 OpenCode, S3.2 Cline, S3.4 OpenCode, S4.2 Cline, S5.2 OpenCode, S6.2 Cline, S7.2 OpenCode, S7.4 Cline) · alone 1st try: 8 (all but S3.4) · alone within 3: 9 · after supervisor rewrite: 0 · needed Claude: 0
+- CODE steps: 10 (S2.2 Cline, S2.4 OpenCode, S3.2 Cline, S3.4 OpenCode, S4.2 Cline, S5.2 OpenCode, S6.2 Cline, S7.2 OpenCode, S7.4 Cline, S12.2 OpenCode) · alone 1st try: 9 (all but S3.4) · alone within 3: 10 · after supervisor rewrite: 0 · needed Claude: 0
 - Planner errors (not executor failures): S3.1/S3.3 octal escape in the plan text (fixed by Claude `eb932e0`); S1.2 test expectations (Claude).
 - Stages 8-9: full green x2 + CI; smoke green x2 (S9.2). Stopped before S10/S11 (owner).
 - Claude second review (085b1bc): approved, no new steps. F3 accepted into baseline.md. S10/S11 are owner-only and not started.
