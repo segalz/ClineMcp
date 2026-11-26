@@ -59,12 +59,19 @@ Reviewed the Stage 7 pair (`e132161`, `8511618`, `7111cb5`), the S5.2 npm/npx te
 - **(4) F3: accepted onto the known-flaky list** (`plan-s3-confirmed-kill.test.js:127`, arm, run 45559484857). It is a kill-and-timing test, so its rule is stricter: one more failure means stop and send it to Claude, without a rerun. F2 keeps its rule (one more failure means stop).
 - S3.4: rejecting attempt 1 in review was right. Re-indented Windows code plus a race that does not really race is exactly what the review is for.
 
+## Claude acceptance of Stage 12 (2026-11-26)
+- **S9 smoke rerun on zvi-old-lap (slow laptop, WSL Ubuntu 24.04) at `b147d1f`: SMOKE PASS**, all 6 checks (ping, list_models, ask_cline, ask_cline_workspace + worktree removed, apply_cline_edits). Provider `openai` via the home freellm gateway, model `auto`.
+- **G9 fixed:** after the run there is no `--cline-hub-daemon` process and no hub discovery file in `/tmp/cline-mcp-hubs`. Before Stage 12 every run left both behind (the hub needs ~3.2 s to start on this laptop).
+- **G10 (low, cosmetic, not a step):** each run still leaves one empty `hub-<uuid>.json.lock` directory in `/tmp/cline-mcp-hubs`. No process and no port is held; `/tmp` is cleared when WSL restarts. Kept as a known limitation.
+- **F2 decision: not a blocker, no code change in this port.** The test (`src/test/plan-s12-settings.test.ts:111`) is Windows-only and comes from `main`; `src/settings.ts` is not changed by this branch. It holds the file open for 300 ms against a 1 s retry budget (`TRANSIENT_IO_BUDGET_MS`), so a slow `windows-latest` runner can miss the window. Rule from now on: an F2 failure on windows only, with everything else green, is a known flake; one rerun of that job is allowed. Fixing the test margin belongs to a separate change on `main`, not to the Linux port.
+- Linux port: all supervisor stages are done. Left: S10/S11 (owner only).
+
 ## Experiment summary (fill at the end)
 - CODE steps: 10 (S2.2 Cline, S2.4 OpenCode, S3.2 Cline, S3.4 OpenCode, S4.2 Cline, S5.2 OpenCode, S6.2 Cline, S7.2 OpenCode, S7.4 Cline, S12.2 OpenCode) · alone 1st try: 9 (all but S3.4) · alone within 3: 10 · after supervisor rewrite: 0 · needed Claude: 0
 - Planner errors (not executor failures): S3.1/S3.3 octal escape in the plan text (fixed by Claude `eb932e0`); S1.2 test expectations (Claude).
 - Stages 8-9: full green x2 + CI; smoke green x2 (S9.2). Stopped before S10/S11 (owner).
 - Claude second review (085b1bc): approved, no new steps. F3 accepted into baseline.md. S10/S11 are owner-only and not started.
-- Failure patterns: S3.4 attempt 1 (OpenCode) re-indented Windows code and built a timeout that did not really win the race; fixed on attempt 2 with that feedback. CI flakes: F1 (fixed by S1.3), F2 (2 sightings), proposed F3 (1 sighting).
+- Failure patterns: S3.4 attempt 1 (OpenCode) re-indented Windows code and built a timeout that did not really win the race; fixed on attempt 2 with that feedback. CI flakes: F1 (fixed by S1.3), F2 (3 sightings, Windows-only, pre-existing on main; known flake, see the Stage 12 acceptance), F3 (1 sighting, accepted).
 
 ## Open items (supervisor)
 - 2026-11-25: flaky after-hook in `src/test/guard-runner.test.ts` (~line 18, `rm` of the temp root): `ENOTEMPTY … traces-7/<id>-run-2` while a trace writer is still writing. Seen in CI on ubuntu, arm and windows, with and without S2.4; locally ~1/40 runs. Resolved by S1.3 (Claude).
